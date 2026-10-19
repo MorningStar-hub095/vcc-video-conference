@@ -67,34 +67,65 @@ TCP/UDP 双通道传输、音频采集编码、视频编解码与屏幕共享。
 
 | 部分 | 语言 | 行数 |
 |---|---|---|
-| 客户端（不含第三方源码） | C++ / Qt | ~12,400 |
-| 服务端 | C++ | ~8,000 |
+| 客户端自研代码 | C++ / Qt | ~8,750 |
+| 服务端 | C++ | ~2,800 |
+| 随仓库分发的第三方源码（Opus / Speex / WebRTC） | C | ~25,600 |
+
+> 第三方源码（BSD-3-Clause）的清单与许可说明见 [NOTICE](NOTICE) 第 2.1 节。
 
 ## 目录结构
 
 ```
-vcc-client/                 客户端
-├── ckernel.{h,cpp}         内核：信号槽调度、协议编解码、房间状态
-├── vccdialog.{h,cpp,ui}    主界面（创建/加入房间）
-├── logindialog.{h,cpp,ui}  登录/注册界面
-├── roomdialog.{h,cpp,ui}   房间内界面（成员列表、控制按钮）
-├── usershow.{h,cpp,ui}     视频画面显示控件
-├── main.cpp                入口
-├── netapi/                 自研网络协议栈
-│   ├── net/                TcpClient / TcpServer / UdpNet
-│   ├── mediator/           TCP/UDP 中介器抽象
-│   └── net/packdef.h       协议包定义（唯一事实来源）
-├── AudioApi/               音频采集、编码、播放
-├── VideoApi/               视频采集、屏幕共享、人脸检测
-├── VideoRender/            H.264 编解码与 OpenGL 渲染
-├── md5/                    口令散列
-└── opengl/                 OpenGL 渲染（历史保留）
+vcc-video-conference/
+├── vcc-client/              客户端
+│   ├── ckernel.{h,cpp}      内核：信号槽调度、协议编解码、房间状态
+│   ├── vccdialog.{h,cpp,ui} 主界面（创建/加入房间）
+│   ├── logindialog.{h,cpp,ui} 登录/注册界面
+│   ├── roomdialog.{h,cpp,ui}   房间内界面（成员列表、控制按钮）
+│   ├── usershow.{h,cpp,ui}     视频画面显示控件
+│   ├── main.cpp              入口
+│   ├── netapi/               自研网络协议栈
+│   │   ├── net/              TcpClient / TcpServer / UdpNet
+│   │   ├── mediator/         TCP/UDP 中介器抽象
+│   │   └── net/packdef.h     协议包定义（唯一事实来源）
+│   ├── AudioApi/             音频采集、编码、播放
+│   ├── VideoApi/             视频采集、屏幕共享、人脸检测
+│   ├── VideoRender/          H.264 编解码与 OpenGL 渲染
+│   ├── md5/                  口令散列
+│   └── opengl/               OpenGL 渲染（历史保留）
+│
+├── server/                   服务端
+│   ├── PlayerHallServer.pro
+│   ├── src/TCPKernel.cpp     网络内核
+│   ├── src/clogic.cpp        业务逻辑（6 类请求处理器）
+│   ├── src/Mysql.cpp         数据库封装
+│   ├── src/bcrypt_wrapper.cpp 口令 bcrypt 散列
+│   └── include/packdef.h     协议定义（与客户端严格对齐）
+│
+└── tools/
+    └── make_placeholder_assets.py  生成 UI 占位图
+```
 
-服务端代码/PlayerHallServer/
-├── src/TCPKernel.cpp       网络内核
-├── src/clogic.cpp          业务逻辑（6 类请求处理器）
-├── src/CMysql.cpp          数据库封装
-└── include/packdef.h       协议定义（与客户端严格对齐）
+### 关于界面素材
+
+原项目带有 193 张表情与 37 张 UI 图，**版权归属不明，已全部从本仓库移除**。
+
+其中 4 张被 `logindialog.ui` / `vccdialog.ui` 通过 `resource.qrc` 实际引用
+（登录页背景、三个按钮图标）。为保证克隆后**编译通过且界面不空白**，
+这 4 张替换为同名同尺寸的自绘中性占位图（合计约 5 KB）：
+
+| 文件 | 尺寸 | 用途 |
+|---|---|---|
+| `vcc-client/images/register.png` | 478×854 | 登录页品牌背景（显示区 220×400） |
+| `vcc-client/images/sett.png` | 975×975 | 设置按钮图标 |
+| `vcc-client/images/++.png` | 2048×2048 | 「+」号按钮图标（引用 3 处） |
+| `vcc-client/tx/4.png` | 79×77 | 摄像头按钮图标 |
+
+想换成自己的素材，重跑脚本生成新的即可：
+
+```bash
+pip install Pillow
+python tools/make_placeholder_assets.py
 ```
 
 ## 构建
@@ -144,9 +175,12 @@ release/vcc-client.exe
 ### 编译服务端
 
 ```bash
-cd 服务端代码/PlayerHallServer
+cd server
+qmake PlayerHallServer.pro
+make
+
 # 数据库连接信息通过环境变量注入，不写入源码：
-#   DB_IP / DB_PORT / DB_USER / DB_PWD / DB_NAME
+#   DB_IP / DB_USER / DB_PWD / DB_NAME
 ```
 
 ## 配置
@@ -164,9 +198,9 @@ port=8000
 | 变量 | 说明 | 默认值 |
 |---|---|---|
 | `DB_IP` | 数据库地址 | `localhost` |
-| `DB_USER` | 数据库用户 | 无（必填） |
-| `DB_PWD` | 数据库口令 | 空（必填） |
-| `DB_NAME` | 数据库名 | 见部署配置 |
+| `DB_USER` | 数据库用户 | `vcc`（**须覆盖**） |
+| `DB_PWD` | 数据库口令 | 空（**须注入**） |
+| `DB_NAME` | 数据库名 | `vcc`（**须覆盖**） |
 
 ## 安全说明
 

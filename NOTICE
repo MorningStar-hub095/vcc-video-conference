@@ -22,29 +22,50 @@ Copyright (c) 2026 <你的名字>
 
 ## 二、第三方组件与许可证
 
-本仓库**不含**第三方源码。所有第三方组件需由使用者自行获取与编译。
+### 2.1 仓库内已包含的第三方源码（vendored）
 
-### 编译期依赖（需自行下载放到指定位置）
+以下组件的源码**已随本仓库分发**，位于 `vcc-client/AudioApi/` 下。
+它们各自的文件头均内嵌了原始版权声明与完整许可证条款，符合各自许可证的分发要求：
+
+| 目录 | 行数 | 组件 | 许可证 | 上游 |
+|---|---|---|---|---|
+| `AudioApi/opus/` | 3,176 | Opus | BSD-3-Clause | Xiph.Org / Skype |
+| `AudioApi/speex/` | 1,970 | Speex | BSD-3-Clause | Xiph.Org / Jean-Marc Valin |
+| `AudioApi/WebRtcMoudle/` | 16,364 | WebRTC AEC/NS/AGC | BSD-3-Clause | The WebRTC project |
+| `AudioApi/WebRtc_Vad/` | 3,857 | WebRTC VAD | BSD-3-Clause | The WebRTC project |
+
+> **注意**：BSD 系列许可证要求「保留原始版权声明」。本仓库**未修改**上述任何
+> 第三方源文件的代码内容，因此文件头的版权声明与许可条款完整有效。
+> 后续若有修改，须在对应文件内补注修改说明。
+
+### 2.2 需使用者自行获取的依赖（不含源码）
+
+以下组件**不随本仓库分发**，请按表中方式自行下载并放到指定位置：
 
 | 组件 | 版本 | 许可证 | 用途 | 获取方式 |
 |---|---|---|---|---|
 | Qt | 5.12.11 | LGPL v3 / GPL v3 / 商业 | GUI 框架 | <https://www.qt.io/> |
 | FFmpeg | 4.2.2 | LGPL v2.1+（部分组件为 GPL v2） | 音视频编解码 | <https://ffmpeg.org/download.html> |
 | SDL2 | 2.0.10 | zlib License | 音频采集与播放 | <https://www.libsdl.org/> |
-| WebRTC VAD | — | BSD-3-Clause | 语音活动检测 | WebRTC 项目 |
-| Opus | 1.x | BSD-3-Clause | 语音编码 | <https://opus-codec.org/> |
-| Speex | — | BSD-3-Clause | 语音编码（历史代码保留） | <https://www.speex.org/> |
 | OpenCV | 4.2.0 | Apache-2.0 | 人脸检测与视频帧处理 | <https://opencv.org/> |
-| MySQL | 5.6 / 8.0 | GPL v2 | 数据库（服务端） | <https://www.mysql.com/> |
+| MySQL C++ Connector | — | GPL v2 / FOSS Exception | 数据库连接（服务端） | <https://dev.mysql.com/> |
 
-### 服务端依赖
+放置位置：
+
+```
+vcc-client/
+├── ffmpeg-4.2.2/          # 需含 include/ lib/ bin/
+└── SDL2-2.0.10/          # 需含 include/ lib/x86/SDL2.lib
+```
+
+### 2.3 服务端依赖
 
 | 组件 | 许可证 | 用途 |
 |---|---|---|
+| MySQL | GPL v2 | 数据库 |
 | Nginx | BSD-2-Clause | mTLS 网关 |
 | stunnel | GPL v2 | mTLS 隧道 |
 | Docker / Docker Compose | Apache-2.0 | 部署编排 |
-| MySQL C++ Connector | GPL v2 / FOSS Exception | 数据库连接 |
 
 **关于 FFmpeg 的许可说明**：FFmpeg 默认构建为 LGPL，但若启用了
 `--enable-gpl` 或 `--enable-nonfree` 选项则整体转为 GPL v2。
@@ -53,20 +74,29 @@ Copyright (c) 2026 <你的名字>
 
 **关于 OpenCV 的许可说明**：OpenCV 4.x 采用 Apache-2.0 许可，可自由用于商业与非商业用途。
 
-### 数据库连接驱动
-
-服务端使用 MySQL Connector/C++（也可用 Connector/C 二进制），
+**关于数据库连接驱动**：服务端使用 MySQL Connector/C++，
 该组件为 GPL 或带 FOSS Exception 的双许可，使用时须遵守其条款。
 
 ## 三、字体与图标
 
-界面使用的图标为项目自绘的简单几何图形或占位图，
-未包含任何第三方图标库（如 Font Awesome、Material Icons 等）。
+界面使用的图标为**项目自绘的简单几何图形**，未包含任何第三方图标库
+（如 Font Awesome、Material Icons 等）。
 
 ## 四、素材版权
 
-仓库中如包含演示用图片、头像、表情等素材，
-均为学习过程中的临时占位内容，或来自明确标注许可的公开资源。
+原项目带有 193 张表情与 37 张 UI 图，版权归属不明，**已全部从本仓库移除**。
+
+其中 4 张被 UI 通过 `resource.qrc` 实际引用，为保证克隆后可编译且界面不空白，
+已替换为 `tools/make_placeholder_assets.py` 生成的**同名同尺寸自绘中性占位图**
+（合计约 110 KB），不含任何第三方素材：
+
+| 文件 | 尺寸 | 原用途 |
+|---|---|---|
+| `vcc-client/images/register.png` | 478×854 | 登录页品牌背景 |
+| `vcc-client/images/sett.png` | 975×975 | 设置按钮图标 |
+| `vcc-client/images/++.png` | 2048×2048 | 「+」号按钮图标 |
+| `vcc-client/tx/4.png` | 79×77 | 摄像头按钮图标 |
+
 若您发现任何素材存在侵权情形，请通过仓库 Issues 联系我们，我们会在核实后立即移除。
 
 ## 五、免责声明

@@ -41,6 +41,16 @@ MSYS2/
 vcc-client/ffmpeg-4.2.2/
 vcc-client/SDL2-2.0.10/
 
+# ---------- 原始素材（不入库）----------
+# 原项目带 193 张表情 + 37 张 UI 图，版权归属不明，全部排除。
+# 但 logindialog.ui / vccdialog.ui 共 6 处通过 resource.qrc 引用了其中 4 张，
+# 文件缺失会导致「编译通过但界面空白」。这 4 张改用 tools/make_placeholder_assets.py
+# 生成的自绘中性占位图入库（同名同尺寸，合计约 5KB）。
+# 若要换回自有素材，把图放进下面两个目录后删掉对应 .gitignore 规则即可。
+# vcc-client/bq/
+# vcc-client/tx/
+# vcc-client/images/
+
 # ---------- Python 缓存（内含源码字节码，禁止入库）----------
 __pycache__/
 *.py[cod]
