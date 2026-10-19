@@ -38,8 +38,8 @@ deploy/dist/
 # ---------- 巨型第三方 / 工具链（不入库，改用文档说明获取方式）----------
 MSYS2/
 **/node_modules/
-WeChat/ffmpeg-4.2.2/
-WeChat/SDL2-2.0.10/
+vcc-client/ffmpeg-4.2.2/
+vcc-client/SDL2-2.0.10/
 
 # ---------- Python 缓存（内含源码字节码，禁止入库）----------
 __pycache__/

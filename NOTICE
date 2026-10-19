@@ -1,0 +1,77 @@
+# NOTICE
+
+VCC 视频会议（VCC Video Conference）
+Copyright (c) 2026 <你的名字>
+
+本项目依据 MIT License 发布，许可证全文见同目录 `LICENSE` 文件。
+
+---
+
+## 一、与本项目无关的声明
+
+本项目是**个人独立完成的课程/自学作品**，用于学习与展示音视频通信、
+网络编程与 Qt 桌面应用开发技术。
+
+- 本项目**非商业用途**，不隶属于任何公司或组织
+- 项目名称 "VCC 视频会议" 为自拟名称，与任何商业产品无关
+- 仓库中出现的所有第三方名称（Qt、FFmpeg、SDL2、WebRTC、OpenCV、MySQL、
+  Nginx、Docker 等）均为其各自所有者的商标或项目名，此处仅作技术栈说明，
+  不代表任何背书或从属关系
+- 早期版本使用的 `WeChat` 仅为内部项目代号，**与腾讯公司无关，
+  未使用其任何代码、素材或商标**，现已完成更名
+
+## 二、第三方组件与许可证
+
+本仓库**不含**第三方源码。所有第三方组件需由使用者自行获取与编译。
+
+### 编译期依赖（需自行下载放到指定位置）
+
+| 组件 | 版本 | 许可证 | 用途 | 获取方式 |
+|---|---|---|---|---|
+| Qt | 5.12.11 | LGPL v3 / GPL v3 / 商业 | GUI 框架 | <https://www.qt.io/> |
+| FFmpeg | 4.2.2 | LGPL v2.1+（部分组件为 GPL v2） | 音视频编解码 | <https://ffmpeg.org/download.html> |
+| SDL2 | 2.0.10 | zlib License | 音频采集与播放 | <https://www.libsdl.org/> |
+| WebRTC VAD | — | BSD-3-Clause | 语音活动检测 | WebRTC 项目 |
+| Opus | 1.x | BSD-3-Clause | 语音编码 | <https://opus-codec.org/> |
+| Speex | — | BSD-3-Clause | 语音编码（历史代码保留） | <https://www.speex.org/> |
+| OpenCV | 4.2.0 | Apache-2.0 | 人脸检测与视频帧处理 | <https://opencv.org/> |
+| MySQL | 5.6 / 8.0 | GPL v2 | 数据库（服务端） | <https://www.mysql.com/> |
+
+### 服务端依赖
+
+| 组件 | 许可证 | 用途 |
+|---|---|---|
+| Nginx | BSD-2-Clause | mTLS 网关 |
+| stunnel | GPL v2 | mTLS 隧道 |
+| Docker / Docker Compose | Apache-2.0 | 部署编排 |
+| MySQL C++ Connector | GPL v2 / FOSS Exception | 数据库连接 |
+
+**关于 FFmpeg 的许可说明**：FFmpeg 默认构建为 LGPL，但若启用了
+`--enable-gpl` 或 `--enable-nonfree` 选项则整体转为 GPL v2。
+本项目**未修改 FFmpeg 源码**，仅通过库文件链接使用，且**不与 FFmpeg 静态链接**，
+符合 LGPL 要求的「以动态库方式使用」。
+
+**关于 OpenCV 的许可说明**：OpenCV 4.x 采用 Apache-2.0 许可，可自由用于商业与非商业用途。
+
+### 数据库连接驱动
+
+服务端使用 MySQL Connector/C++（也可用 Connector/C 二进制），
+该组件为 GPL 或带 FOSS Exception 的双许可，使用时须遵守其条款。
+
+## 三、字体与图标
+
+界面使用的图标为项目自绘的简单几何图形或占位图，
+未包含任何第三方图标库（如 Font Awesome、Material Icons 等）。
+
+## 四、素材版权
+
+仓库中如包含演示用图片、头像、表情等素材，
+均为学习过程中的临时占位内容，或来自明确标注许可的公开资源。
+若您发现任何素材存在侵权情形，请通过仓库 Issues 联系我们，我们会在核实后立即移除。
+
+## 五、免责声明
+
+本项目按「原样」提供，不对适销性、特定用途适用性或无侵权做任何明示或暗示保证。
+
+在任何情况下，作者不对因使用或无法使用本项目而产生的
+直接、间接、偶然、特殊、惩戒性或后果性损害承担责任。
