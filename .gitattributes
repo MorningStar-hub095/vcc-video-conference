@@ -1,0 +1,38 @@
+# ============================================================
+# 行尾规范：Linux 侧（服务端源码 / 部署脚本）必须 LF，
+# 否则在 Ubuntu 上 make 会报 "missing separator"、
+# bash 会报 "bad interpreter: /bin/bash^M"。
+# ============================================================
+* text=auto
+
+# Linux 侧：强制 LF
+服务端代码/**        text eol=lf
+deploy/**            text eol=lf
+deploy/*.sh          text eol=lf
+*.sh                 text eol=lf
+*.cpp                text eol=lf
+*.h                  text eol=lf
+makefile             text eol=lf
+Makefile             text eol=lf
+*.sql                text eol=lf
+*.py                 text eol=lf
+Dockerfile           text eol=lf
+*.yml                text eol=lf
+*.service            text eol=lf
+
+# Windows 侧：批处理保持 CRLF
+*.bat                text eol=crlf
+
+# 二进制：不做任何转换
+*.png  binary
+*.jpg  binary
+*.gif  binary
+*.ico  binary
+*.pdf  binary
+*.docx binary
+*.xmind binary
+*.zip  binary
+*.exe  binary
+*.dll  binary
+*.lib  binary
+*.o    binary

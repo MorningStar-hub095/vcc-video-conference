@@ -1,0 +1,93 @@
+# ============================================================
+# VCC 视频会议系统 —— 仓库忽略规则
+# 目标：只入库「源码 + 文档 + 部署配置」，构建产物与调试残留不入库
+# ============================================================
+
+# ---------- 构建产物 ----------
+build-*/
+build/
+debug/
+release/
+*.o
+*.obj
+*.ilk
+*.pdb
+*.exe
+*.dll
+*.lib
+*.a
+*.so
+*.so.*
+moc_*.cpp
+moc_*.h
+qrc_*.cpp
+ui_*.h
+Makefile.Debug
+Makefile.Release
+.qmake.stash
+*.pro.user
+*.pro.user.*
+
+# ---------- 部署密钥与产物（绝不入库）----------
+deploy/.env
+deploy/.staging/
+deploy/backups/
+deploy/dist/
+*.sql.bak
+
+# ---------- 巨型第三方 / 工具链（不入库，改用文档说明获取方式）----------
+MSYS2/
+**/node_modules/
+WeChat/ffmpeg-4.2.2/
+WeChat/SDL2-2.0.10/
+
+# ---------- Python 缓存（内含源码字节码，禁止入库）----------
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# ---------- 密钥 / 证书（防御性兜底：任何新产生的私钥都不得入库）----------
+*.key
+*.p12
+*.pfx
+*.keystore
+# 方案 B 实验室产物（含 CA 私钥与用户私钥，一律本地清理）
+deploy/bare/tls/lab/_work/
+
+# ---------- 调试 / 临时残留 ----------
+min_test/
+clean_test/
+full_copy_test/
+dll_only_test/
+t0123456789*/
+*_log*.txt
+*.log
+core
+core.*
+vgcore.*
+
+# ---------- 本地工作记录 ----------
+.workbuddy/
+
+# ---------- 系统 / 编辑器 ----------
+.DS_Store
+Thumbs.db
+desktop.ini
+*.swp
+*~
+.idea/
+.vs/
+.vscode/
+
+# ---------- 编辑器 / IDE 临时残留（防御性兜底）----------
+# 2026-10-19：clogic.cpp.hbiFEK 这类编辑过程中产生的副本曾被误提交进版本库，
+# 内容是与源码不同步的陈旧副本，容易被误当成有效文件。此处按常见后缀统一兜底。
+*.hbiFEK
+*.bak
+# 注：故意不忽略 *.orig —— AudioDemo2/MediaPlayer 下 SDL2-2.0.10 第三方头文件里
+#     有 3 个已入库的 SDL_config_macosx.h.orig，加这条会造成规则与现状冲突。
+*.rej
+*.autosave
+.#*
+*.*.swp
+CMakeUserPresets.json
