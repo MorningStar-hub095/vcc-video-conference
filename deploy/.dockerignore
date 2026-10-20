@@ -1,0 +1,20 @@
+# 构建上下文排除项：密钥与产物绝不发给 Docker daemon
+.env
+.env.*
+backups/
+dist/
+*.sql.bak
+.last_good_tag
+.current_tag
+.git
+.gitignore
+*.md
+
+# 证书与 CA 私钥：这些目录由 compose 在【运行时】挂载（volumes），
+# 构建期完全不需要。此前未排除会导致整套私钥被打进构建上下文发给 daemon，
+# 属于不必要的暴露面。注意保留单个 .cpp .sh 级别文件，勿用 *.sh 通配。
+certs/
+tls/
+stunnel/
+bare/
+.prepare-stamp

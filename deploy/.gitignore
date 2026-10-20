@@ -1,0 +1,21 @@
+.env
+.staging/
+backups/
+*.sql.bak
+# 部署运行时状态文件（回滚锚点，随环境变化，不入库）
+.current_tag
+.last_good_tag
+# TLS 私钥与证书（含私钥，严禁入库；用 ./tls/gen-certs.sh 重新生成）
+certs/
+
+# 私钥扩展名兜底——此前 bare/ 下的 CA 私钥靠【根目录】规则里的
+# "deploy/bare/tls/lab/_work/" 路径名才被忽略，一旦目录改名就会漏保护。
+# 这里按扩展名显式兜底，与路径无关。
+*.key
+*.p12
+*.pfx
+*.crt
+*.csr
+
+# 客户端打包产物（155MB，含 Qt 运行库）
+dist/

@@ -1,0 +1,33 @@
+[Unit]
+Description=VCC PlayerHallServer (video conference signaling/media server)
+Documentation=file:///opt/vcc/README
+After=network-online.target mysql.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=vcc
+Group=vcc
+WorkingDirectory=/opt/vcc
+# P0-2：数据库账号口令由环境文件注入（600，属主 vcc），不写进二进制
+EnvironmentFile=/opt/vcc/server.env
+# argv[1] = 监听端口
+ExecStart=/opt/vcc/playerhallserver 8000
+ExecReload=/bin/kill -HUP $MAINPID
+
+# 服务端遇到 MySQL 连接失败会 exit(-1)，必须自动拉起并限流，避免疯狂重启
+Restart=on-failure
+RestartSec=5s
+StartLimitIntervalSec=60s
+StartLimitBurst=5
+
+# 三路 TCP × N 客户端，连接数较大
+LimitNOFILE=65535
+TasksMax=4096
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=playerhallserver
+
+[Install]
+WantedBy=multi-user.target

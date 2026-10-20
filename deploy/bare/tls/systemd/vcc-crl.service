@@ -1,0 +1,12 @@
+[Unit]
+Description=VCC mTLS 客户端 CRL 续签
+Documentation=file:/opt/vcc-ca/crl-renew.sh
+After=network-online.target
+
+[Service]
+Type=oneshot
+Environment=CA_DIR=/opt/vcc-ca
+Environment=TLS_DIR=/etc/vcc-tls
+Environment=CRL_PUB_DIR=/var/www/html
+ExecStart=/opt/vcc-ca/crl-renew.sh
+User=root

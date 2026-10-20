@@ -102,6 +102,13 @@ vcc-video-conference/
 │   ├── src/bcrypt_wrapper.cpp 口令 bcrypt 散列
 │   └── include/packdef.h     协议定义（与客户端严格对齐）
 │
+├── deploy/                   部署资产（Docker / 裸机 / mTLS / CI 门禁）
+│   ├── deploy.sh rollback.sh smoke.sh security_smoke.sh
+│   ├── Dockerfile docker-compose*.yml
+│   ├── bare/tls/             私有 CA、证书签发/吊销、CRL 定时续期
+│   ├── tls/ stunnel/         证书生成与 mTLS 隧道
+│   └── monitoring/           Prometheus 告警规则
+│
 └── tools/
     └── make_placeholder_assets.py  生成 UI 占位图
 ```
@@ -182,6 +189,73 @@ make
 # 数据库连接信息通过环境变量注入，不写入源码：
 #   DB_IP / DB_USER / DB_PWD / DB_NAME
 ```
+
+## 部署
+
+`deploy/` 提供完整的容器化部署资产与 TLS 双向认证方案。
+
+```
+deploy/
+├── deploy.sh                 一键部署（构建镜像 → 起栈 → 迁移 → 冒烟）
+├── deploy-bare.sh            裸机部署（无容器）
+├── rollback.sh               按 tag 回滚
+├── smoke.sh                  功能冒烟
+├── security_smoke.sh         安全项冒烟（mTLS / SQL 注入 / 弱口令）
+├── ci-local.sh               本地门禁：编译 + 冒烟 + 注入回归
+├── migrate.sh                数据库版本化迁移
+├── prepare.sh                打包前的 staging 准备
+├── pack_client.bat           客户端打包（Windows）
+├── Dockerfile
+├── docker-compose.yml        主栈：MySQL + 服务端
+├── docker-compose.tls.yml    TLS 变体
+├── docker-compose.smoke.yml  冒烟隔离栈
+├── schema.sql                建库建表
+├── migrations/               版本化迁移脚本
+├── playerhallserver.service   systemd 单元
+├── config.ini.example        客户端配置样例
+├── .env.example              环境变量样例（复制为 .env 后填写）
+├── tls/                      证书生成（gen-certs.sh）
+├── stunnel/                  mTLS 隧道配置
+├── bare/tls/                 裸机 mTLS：私有 CA、签发/吊销、CRL 定时续期
+└── monitoring/               Prometheus 告警规则
+```
+
+### 快速开始
+
+```bash
+cd deploy
+
+# 1. 填配置：复制样例并修改数据库口令等敏感项
+cp .env.example .env
+
+# 2. 生成 TLS 证书（若需 mTLS 双向认证）
+./tls/gen-certs.sh
+
+# 3. 一键部署
+./deploy.sh
+
+# 4. 验证
+./smoke.sh && ./security_smoke.sh
+```
+
+> **凭据处理**：`deploy/.env`、`deploy/certs/`、`*.key` / `*.crt` / `*.pem`
+> 均已在 `.gitignore` 中排除，**不会入库**。证书可用 `tls/gen-certs.sh`
+> 或 `bare/tls/ca-init.sh` 重新生成。
+> 数据库口令经环境变量注入服务端进程，不写入源码。
+
+### 客户端打包
+
+```batch
+deploy\pack_client.bat <服务端IP>
+```
+
+产物落在 `deploy/dist/vcc-client/`，含 Qt 运行库（`windeployqt` 收集）、
+FFmpeg/SDL2 DLL、`config.ini` 与一键启动脚本。
+
+> 该脚本假设客户端已在
+> `build-vcc-client-Desktop_Qt_5_12_11_MinGW_32_bit-release/` 编译完成。
+> 实际构建目录以 Qt Creator 的 shadow build 路径为准，可修改脚本顶部的
+> `BUILD_DIR` 变量。
 
 ## 配置
 

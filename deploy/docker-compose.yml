@@ -1,0 +1,86 @@
+# ============================================================
+# VCC 视频会议系统 —— 一键部署编排
+# 用法： cd deploy && cp .env.example .env && ./deploy.sh
+# ============================================================
+
+services:
+
+  mysql:
+    image: ${MYSQL_IMAGE:-mysql:8.0}
+    container_name: vcc-mysql
+    restart: unless-stopped
+    # 源码使用 libmysqlclient 直连，走 mysql_native_password 兼容性最稳
+    command:
+      - --default-authentication-plugin=mysql_native_password
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_general_ci
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PWD}
+      MYSQL_DATABASE: ${DB_NAME}
+      MYSQL_USER: ${DB_USER}
+      MYSQL_PASSWORD: ${DB_PWD}
+    volumes:
+      - mysql_data:/var/lib/mysql
+      - ./schema.sql:/docker-entrypoint-initdb.d/01-schema.sql:ro
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-uroot", "-p${MYSQL_ROOT_PWD}"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 30s
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+    networks: [vcc]
+
+  server:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: vcc-server:${IMAGE_TAG:-latest}
+    container_name: vcc-server
+    restart: unless-stopped
+    # P0-2：口令在运行期注入，不进镜像层（源码 packdef.h 用 _db_env() 读取）
+    environment:
+      DB_IP: ${DB_IP}
+      DB_NAME: ${DB_NAME}
+      DB_USER: ${DB_USER}
+      DB_PWD: ${DB_PWD}
+    depends_on:
+      mysql:
+        condition: service_healthy
+    # 默认只绑 127.0.0.1：明文业务端口不出本机，公网必须走 8443 TLS 网关。
+    # 若确实是纯内网可信环境、需要局域网直连，显式设置 SERVER_BIND=0.0.0.0。
+    ports:
+      - "${SERVER_BIND:-127.0.0.1}:${SERVER_PORT:-8000}:8000"
+    # 等待 MySQL 真正可连后再启动，避免 Open() 直接 exit(-1)
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        until nc -z mysql 3306; do echo "waiting for mysql..."; sleep 1; done
+        exec /usr/local/bin/playerhallserver 8000
+    healthcheck:
+      # 业务级探测：发 LOGIN_RQ（不存在的用户），必须收到 LOGIN_RS 才算健康。
+      # 相比原先的 `nc -z` 能多发现两类致命故障：线程池/epoll 阻塞、MySQL 不可用
+      # ——这两种情况下服务端不会回包，探针超时，状态转为 unhealthy。
+      test: ["CMD", "/usr/local/bin/health-probe", "127.0.0.1", "8000", "5"]
+      interval: 10s
+      timeout: 8s
+      retries: 5
+      start_period: 15s
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+    networks: [vcc]
+
+volumes:
+  mysql_data:
+
+networks:
+  vcc:
+    driver: bridge

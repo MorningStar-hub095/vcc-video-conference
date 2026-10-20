@@ -1,0 +1,49 @@
+; ============================================================
+; stunnel 客户端配置（每人一份，证书内含姓名/工号/邮箱）
+;
+; 部署位置（Windows）： C:\Program Files (x86)\stunnel\config\vcc.conf
+; 部署位置（Linux）  ： /etc/stunnel/vcc.conf
+;
+; 与旧版的区别：
+;   1) 服务端证书改由公共可信 CA 签发 → 用系统信任库校验，不再下发自签根 CA
+;   2) 每人的 cert/key 各自独立，吊销只影响本人
+;   3) CRL 由网关侧校验，客户端无需配置
+; ============================================================
+
+; 调试期打开（排障完请关掉）
+; debug = 5
+; output = stunnel.log
+
+[vcc-mtls]
+client = yes
+
+; 本机明文入口：Qt 客户端 config.ini 保持 ip=127.0.0.1，连这里
+accept = 127.0.0.1:8000
+
+; 服务端 TLS 网关（改成实际域名或 IP）
+connect = meet.example.com:8443
+
+; ---- 本人专属客户端证书（mTLS 凭据）----
+cert = u001.crt
+key  = u001.key
+; Windows 若用 p12 导入到系统证书库，可改成：
+; cert = Computer\Personal   （stunnel 5.x 支持按证书库选择）
+
+; ---- 校验服务端证书：公共 CA，用系统信任库 ----
+verify = 3
+CApath = /etc/ssl/certs          ; Linux
+; Windows： CAfile = ca-certs.pem（把系统根证书导出）
+; 校验主机名：必须与服务端证书 CN/SAN 一致
+checkHost = meet.example.com
+
+; 只放行现代 TLS
+sslVersionMin = TLSv1.2
+options = NO_SSLv2
+options = NO_SSLv3
+options = NO_TLSv1
+options = NO_TLSv1.1
+options = NO_TICKET
+
+; 长连接（音视频会议）
+TIMEOUTclose = 0
+TIMEOUTidle  = 86400

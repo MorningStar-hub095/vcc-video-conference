@@ -1,0 +1,57 @@
+# ============================================================
+# 冒烟专用 override —— 一次性、可丢弃的隔离环境
+#
+# 用法（务必带 -p，卷与网络靠它隔离）：
+#   cd deploy && ./smoke.sh              # 一键：起环境 → verify → 拆环境
+#
+# 手动：
+#   docker compose -p vcc-smoke \
+#     -f docker-compose.yml -f docker-compose.smoke.yml up -d --wait --build
+#   python3 verify.py --host 127.0.0.1 --port 18000
+#   docker compose -p vcc-smoke down -v
+#
+# ------------------------------------------------------------
+# 设计要点：以下三条每一条都对应一个真实陷阱，修改前请先读懂
+# ------------------------------------------------------------
+# 1) container_name 是【全局唯一】的，-p <project> 管不了它。
+#    project name 只隔离网络与卷（会变成 vcc-smoke_mysql_data），
+#    但不会给 container_name 加前缀。不改名则与主栈直接冲突：
+#      Conflict. The container name "/vcc-mysql" is already in use
+#
+# 2) compose 的 ports 按「容器端口」merge：
+#      ports: []                        ✗ 空列表不参与匹配，主文件映射照样生效
+#      ports: ["127.0.0.1:18000:8000"]  ✓ 容器端口同为 8000，命中并替换
+#    这正是 docker-compose.tls.yml 头部注释里那条限制的【正反两面】。
+#
+# 3) volumes 无需覆盖：加了 -p vcc-smoke 之后，命名卷自动变成
+#    vcc-smoke_mysql_data，与生产的 deploy_mysql_data 互不相干，
+#    down -v 即彻底销毁。因此本文件刻意不动 volumes。
+# ============================================================
+
+services:
+
+  mysql:
+    container_name: smoke-mysql
+    restart: "no"
+    # 冒烟环境允许固定弱口令，降低调试摩擦；生产 .env 里的口令不受影响
+    environment:
+      MYSQL_ROOT_PASSWORD: smoke_root_only
+      MYSQL_DATABASE: ${DB_NAME:-vcc}
+      MYSQL_USER: smoke
+      MYSQL_PASSWORD: smoke_only_123
+
+  server:
+    container_name: smoke-server
+    restart: "no"
+    environment:
+      DB_IP: mysql
+      DB_NAME: ${DB_NAME:-vcc}
+      DB_USER: smoke
+      DB_PWD: smoke_only_123
+    ports:
+      # 与主文件【逐字符相同】的 ports 表达式。
+      # compose 对 ports 是【追加】而非替换（已实测：写了 18000 后渲染结果是
+      # 8000 和 18000 两条并存），但只要两条规则完全相同就会去重。
+      # 因此这里照抄主文件表达式，由 SERVER_PORT 决定最终发布到哪个宿主端口，
+      # 从而在完全不改主 compose 的前提下把 smoke 挪到 SMOKE_PORT 上。
+      - "${SERVER_BIND:-127.0.0.1}:${SERVER_PORT:-8000}:8000"

@@ -1,0 +1,55 @@
+# ============================================================
+# TLS / mTLS 网关 —— 叠加在 docker-compose.yml 之上的 override 文件
+#
+# 用法：
+#   cd deploy
+#   ./tls/gen-certs.sh 公网域名或IP        # 一次性生成证书
+#   docker compose -f docker-compose.yml -f docker-compose.tls.yml up -d
+#
+# 说明：
+#   1) 网关把 8443 的 TLS 流量解密后，明文转发到容器网络内的 server:8000
+#      —— 明文只存在于 Docker 内部网络，不出主机
+#   2) server 的 8000 端口不再发布到主机（ports: [] 覆盖），
+#      公网无法绕过网关直连明文端口
+#   3) 严格模式下（默认）没有有效客户端证书，TLS 握手直接失败
+#
+# 模式切换：
+#   TLS_MODE=nginx-mtls.conf   严格（mTLS，推荐公网）
+#   TLS_MODE=nginx-tls.conf    宽松（仅加密）
+# ============================================================
+
+services:
+
+  # 注意：compose 的 ports: [] 无法真正移除主文件已声明的端口映射，
+  # 因此主文件默认把明文 8000 绑在 127.0.0.1（SERVER_BIND），
+  # 公网只能经本网关的 8443 进入，明文端口在主机外不可达。
+
+  tls-gateway:
+    image: ${NGINX_IMAGE:-nginx:1.27-alpine}
+    container_name: vcc-tls-gateway
+    restart: unless-stopped
+    depends_on:
+      server:
+        # 必须等 server 真正起来再解析 upstream，否则 nginx 启动即退出
+        condition: service_healthy
+    ports:
+      - "${TLS_PORT:-8443}:8443"
+    volumes:
+      - ./tls/${TLS_MODE:-nginx-mtls.conf}:/etc/nginx/nginx.conf:ro
+      - ./certs:/etc/nginx/certs:ro
+    healthcheck:
+      # 网关是纯 TCP 转发，自检自身 8443 端口意义有限（只证明 nginx 在监听）。
+      # 改为探测上游 server:8000：能同时覆盖容器网络连通性与后端存活，
+      # 网关失去转发能力时才会真正转 unhealthy。
+      # 注：此处未用 health-probe，因该二进制是 glibc 构建，无法在 alpine 上运行。
+      test: ["CMD-SHELL", "nc -z server 8000 || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+    networks: [vcc]

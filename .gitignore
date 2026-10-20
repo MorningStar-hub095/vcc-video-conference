@@ -33,7 +33,17 @@ deploy/.env
 deploy/.staging/
 deploy/backups/
 deploy/dist/
+# TLS 证书与私钥：用 deploy/tls/gen-certs.sh 或 bare/tls/ca-init.sh 重新生成
+deploy/certs/
 *.sql.bak
+
+# 私钥/证书扩展名兜底 —— 不按路径、按后缀，目录改名也不会漏保护
+*.key
+*.p12
+*.pfx
+*.crt
+*.csr
+*.pem
 
 # ---------- 巨型第三方 / 工具链（不入库，改用文档说明获取方式）----------
 MSYS2/

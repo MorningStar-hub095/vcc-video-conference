@@ -1,0 +1,99 @@
+# ============================================================
+# 告警规则（Prometheus / Alertmanager 兼容格式）
+#
+# 为什么要先定这个文件：
+#   现在这套栈【零监控】—— 服务端挂了只会被用户先发现。
+#   但装监控之前必须先把"什么算故障"写清楚，否则采集器一上来就是
+#   几十条噪音告警，最后全部静音。按 SRE 的做法：先定 SLO，再写规则，
+#   每条规则都必须对应一个【人能马上执行的动作】。
+#
+# 生效前提（当前尚未部署，按此顺序接入即可让规则真正跑起来）：
+#   1) 部署 prometheus + alertmanager；
+#   2) 采集端：mysqld_exporter（MySQL）、cadvisor（容器）、node_exporter（主机）；
+#   3) 在 prometheus.yml 里 rule_files: ["alert-rules.yml"]。
+#   在采集器到位前，这些规则只作为"告警契约"存在。
+#
+# 最小可用替代（不装 Prometheus 也能当天用上）：
+#   */1 * * * * /usr/local/bin/health-probe 127.0.0.1 8000 5 \
+#        || echo "$(date) 服务端无响应" >> /var/log/vcc-watchdog.log
+#   再加一条 cron 读日志发企业微信/邮件 —— 一条黄金信号先跑起来，
+#   胜过一堆没接采集器的规则。
+# ============================================================
+
+groups:
+  - name: vcc-server
+    rules:
+      # ---- 可用性（延迟/错误的合并症状：业务探针直接判定"能不能用"）----
+      - alert: VccServerProbeFailed
+        expr: weave_probe_success{job="vcc-server"} == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "服务端业务探针连续 2 分钟失败"
+          impact: "用户无法注册/登录，音视频信令中断"
+          action: |
+            1) docker compose logs --tail=100 server
+            2) 确认 MySQL 容器 healthy： docker inspect -f '{{.State.Health.Status}}' vcc-mysql
+            3) 2 分钟内无法恢复则执行 deploy/rollback.sh
+
+      # ---- 依赖（MySQL）----
+      - alert: VCCMysqlDown
+        expr: mysql_up{job="mysql"} == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "MySQL 不可用"
+          action: "docker compose logs --tail=100 mysql；检查卷容量是否写满"
+
+      - alert: VCCMysqlSlowQuerySpike
+        expr: rate(mysql_global_status_slow_queries[5m]) > 1
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "慢查询突增"
+          action: "抓慢日志定位；重点看 t_user 是否走了索引（tel/name/email 三条）"
+
+      # ---- 饱和度：容器内存接近限制 ----
+      - alert: VCCContainerMemoryHigh
+        expr: container_memory_usage_bytes{name=~"vcc-server|vcc-mysql"} /
+              container_spec_memory_limit_bytes{name=~"vcc-server|vcc-mysql"} > 0.85
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "容器内存使用超过 85%"
+          action: "查连接数是否泄漏（每路音视频都是长连接）；必要时重启并复盘"
+
+      # ---- 磁盘 ----
+      - alert: VCCDiskWillFillIn4Hours
+        expr: predict_linear(node_filesystem_free_bytes{fstype!~"tmpfs"}[6h], 4*3600) < 0
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "按当前速度 4 小时内磁盘将写满"
+          action: "清理 deploy/backups 旧备份；确认 docker 日志轮转（max-size=10m max-file=3）已生效"
+
+  - name: vcc-tls
+    rules:
+      # ---- 证书有效期：过期会让全部客户端同时连不上，属于"可预知事故" ----
+      - alert: VCCClientCertExpiring
+        expr: ssl_certificate_expiry_seconds{job="vcc-tls"} < 30 * 24 * 3600
+        for: 1h
+        labels:
+          severity: warning
+        annotations:
+          summary: "TLS 证书 30 天内到期"
+          action: "重新签发并分发客户端证书；到期前必须完成，否则客户端集体掉线"
+
+      - alert: VCCGatewayNoClientCertReject
+        expr: increase(nginx_stream_client_cert_fail_total[10m]) > 20
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "大量连接因客户端证书被拒"
+          action: "可能是证书已过期/已吊销，或有人在扫描端口；核对 CRL 与客户端分发清单"

@@ -1,0 +1,23 @@
+# 实验室专用：用容器跑「裸机 nginx 配置」，验证 CA/CRL 逻辑本身
+# 转发目标 server:8000 是主部署栈里的 vcc-server（同一 Docker 网络）
+services:
+  tls-lab:
+    image: nginx:1.27-alpine
+    container_name: vcc-tls-lab
+    volumes:
+      - ./nginx-lab.conf:/etc/nginx/nginx.conf:ro
+      - ./_work/tls:/etc/vcc-tls:ro
+    ports:
+      - "8443:8443"      # 注意：主栈网关也占 8443，跑实验室前需先停掉主网关
+      - "8080:8080"      # CRL 分发点
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z 127.0.0.1 8443 || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    networks: [vcc]
+
+networks:
+  vcc:
+    external: true
+    name: deploy_vcc
