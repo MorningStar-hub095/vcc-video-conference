@@ -1,6 +1,7 @@
 #include "usershow.h"
 #include "ui_usershow.h"
 #include <QPainter>
+#include <QCoreApplication>
 
 // 引入FFmpeg AVFrame完整定义用于帧尺寸日志输出
 // usershow.h仅有前向声明struct AVFrame，访问frame->width/height需完整定义
@@ -14,7 +15,7 @@ extern "C"
 
 UserShow::UserShow(QWidget *parent) :
     QWidget(parent),
-    ui(new Ui::UserShow) , m_defaultImg("./images/tuer.jpg")
+    ui(new Ui::UserShow) , m_id(0)
 {
     // 初始化GL控件指针
     m_glWidget = nullptr;
@@ -23,6 +24,11 @@ UserShow::UserShow(QWidget *parent) :
     connect( &m_timer , SIGNAL(timeout()) , this , SLOT(slot_checkTimer() ));
 
     m_lastTime = QTime::currentTime();
+
+    //【修复-P3：默认头像相对路径】"./images/tuer.jpg" 依赖进程工作目录，
+    // 从其他目录启动 exe 时加载失败。改为按可执行文件目录定位。
+    // 原代码: m_defaultImg("./images/tuer.jpg")（相对工作目录）
+    m_defaultImg = QImage( QCoreApplication::applicationDirPath() + "/images/tuer.jpg" );
 
     m_timer.start( 1000 );
 }

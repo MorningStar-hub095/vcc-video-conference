@@ -5,6 +5,8 @@
 TcpServer::TcpServer( INetMediator * pMediator ):m_sock( INVALID_SOCKET ),m_isStop(false)
 {
 	m_pMediator = pMediator;
+    //【安全修复-P0：WSACleanup 引用计数失衡】实例持有标志
+    m_wsaHeld = false;
 }
 
 TcpServer::~TcpServer()  //使用时, 父类指针指向子类, 使用虚析构
@@ -15,29 +17,13 @@ TcpServer::~TcpServer()  //使用时, 父类指针指向子类, 使用虚析构
 //初始化网络	//加载库 创建套接字 绑定
 bool TcpServer::InitNet(const char *szBufIP, unsigned short port)
 {
-    if( !m_isLoadlib )
+    //【安全修复-P0：WSACleanup 引用计数失衡】进程级引用计数，见 INet.h 说明
+    // 原代码: if( !m_isLoadlib ){ ...WSAStartup... m_isLoadlib = true; }
+    if( !m_wsaHeld )
     {
-        //1.做个小买卖 炸串 --加载库
-        WORD wVersionRequested;
-        WSADATA wsaData;
-        int err;
-
-    /* Use the MAKEWORD(lowbyte, highbyte) macro declared in Windef.h */
-        wVersionRequested = MAKEWORD(2, 2);
-
-        err = WSAStartup(wVersionRequested, &wsaData);
-        if (err != 0) {
-            /* Tell the user that we could not find a usable */
-            /* Winsock DLL.                                  */
+        if( !wsaStartupRef() )
             return false;
-        }
-
-        if (LOBYTE(wsaData.wVersion) != 2 || HIBYTE(wsaData.wVersion) != 2) {
-
-            WSACleanup();
-            return false;
-        }
-        m_isLoadlib = true;
+        m_wsaHeld = true;
     }
 
 
@@ -140,9 +126,11 @@ void TcpServer::UnInitNet()
 			closesocket(ite->second);
 	}
 
-    if( m_isLoadlib ){
-        WSACleanup();
-        m_isLoadlib = false;
+    //【安全修复-P0：WSACleanup 引用计数失衡】仅释放本实例引用
+    // 原代码: if(m_isLoadlib){ WSACleanup(); m_isLoadlib = false; }
+    if( m_wsaHeld ){
+        wsaCleanupRef();
+        m_wsaHeld = false;
     }
 } 
 

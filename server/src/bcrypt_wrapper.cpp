@@ -63,7 +63,13 @@ std::string bcrypt_hash(const std::string& password)
     memset(&data, 0, sizeof(data));
 
     char* result = crypt_r(password.c_str(), salt.c_str(), &data);
-    if (result == NULL || result[0] == '\0') {
+    //【安全修复-P0：crypt_r 失败返回 "*0"】
+    // 修改原因: glibc crypt_r 失败时不返回 NULL，而是返回指向 "*0" 的字符串
+    //           （并置 errno）。原代码只判 NULL/空串，会把 "*0" 当合法哈希
+    //           INSERT 进库，该账号从此永远无法登录。
+    // 修改效果: 结果以 '*' 开头一律视为失败，返回空串由调用方走注册失败路径。
+    // 原代码: if (result == NULL || result[0] == '\0')
+    if (result == NULL || result[0] == '\0' || result[0] == '*') {
         return "";
     }
     return std::string(result);
@@ -79,7 +85,12 @@ bool bcrypt_verify(const std::string& password, const std::string& hash)
 
     // crypt_r 会从 hash 中解析算法、cost、盐值并重新计算
     char* result = crypt_r(password.c_str(), hash.c_str(), &data);
-    if (result == NULL) return false;
+    //【安全修复-P0：crypt_r 失败返回 "*0" 造成认证绕过】
+    // 修改原因: 若库中 hash 恰为 "*0"（历史脏数据），重算结果同为 "*0"，
+    //           常量时间比较返回 true —— 任意口令均可通过验证。
+    // 修改效果: 结果以 '*' 开头直接判失败。
+    // 原代码: if (result == NULL) return false;
+    if (result == NULL || result[0] == '*') return false;
 
     return constant_time_equals(std::string(result), hash);
 }

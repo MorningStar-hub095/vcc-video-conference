@@ -8,6 +8,8 @@ UdpNet::UdpNet( INetMediator * pMediator ):m_sock( INVALID_SOCKET ),m_isStop(fal
 {
 	m_pMediator = pMediator;
 	m_hThreadHandle = NULL;
+    //【安全修复-P0：WSACleanup 引用计数失衡】实例持有标志
+    m_wsaHeld = false;
 }
 UdpNet::~UdpNet()  //使用时, 父类指针指向子类, 使用虚析构
 {
@@ -16,28 +18,13 @@ UdpNet::~UdpNet()  //使用时, 父类指针指向子类, 使用虚析构
 //初始化网络	//加载库 创建套接字 绑定
 bool UdpNet::InitNet(const char* szBufIP , unsigned short port)
 {
-    if( !m_isLoadlib )
+    //【安全修复-P0：WSACleanup 引用计数失衡】进程级引用计数，见 INet.h 说明
+    // 原代码: if( !m_isLoadlib ){ ...WSAStartup... m_isLoadlib = true; }
+    if( !m_wsaHeld )
     {
-        //1.做个小买卖 炸串 --加载库
-        WORD wVersionRequested;
-        WSADATA wsaData;
-        int err;
-
-    /* Use the MAKEWORD(lowbyte, highbyte) macro declared in Windef.h */
-        wVersionRequested = MAKEWORD(2, 2);
-
-        err = WSAStartup(wVersionRequested, &wsaData);
-        if (err != 0) {
-
+        if( !wsaStartupRef() )
             return false;
-        }
-
-        if (LOBYTE(wsaData.wVersion) != 2 || HIBYTE(wsaData.wVersion) != 2) {
-
-            WSACleanup();
-            return false;
-        }
-        m_isLoadlib = true;
+        m_wsaHeld = true;
     }
 
 
@@ -84,11 +71,30 @@ unsigned int __stdcall UdpNet::RecvThread( void * lpvoid)
 //关闭网络
 void UdpNet::UnInitNet()
 {
-	m_isStop = true ; // 尝试退出线程循环 
+	//【P2修复：TerminateThread 强杀接收线程】
+	// 修改原因: 原代码先等 100ms 就 TerminateThread 强杀，而 RecvData 大概率正阻塞在
+	//           recvfrom() 上（100ms 内根本等不到自旋退出），强杀时线程持有的 CRT 资源/
+	//           栈上对象不释放，且 DealData 可能执行到一半被打断。
+	// 修改效果: 先 closesocket 让阻塞中的 recvfrom 立即返回错误、线程自然走到循环条件
+	//           退出；等待时间放宽到 1000ms。强杀路径仅作兜底保留（注释保留）。
+	// 原代码保留备查：
+	//     m_isStop = true;
+	//     if( m_hThreadHandle ) {
+	//         if( WaitForSingleObject(m_hThreadHandle , 100 ) == WAIT_TIMEOUT )
+	//             TerminateThread( m_hThreadHandle , -1 );
+	//         CloseHandle(m_hThreadHandle); m_hThreadHandle = NULL;
+	//     }
+	m_isStop = true ; // 尝试退出线程循环
+	if( m_sock && m_sock != INVALID_SOCKET )
+	{
+		closesocket( m_sock );   // 解除 RecvData 中 recvfrom 的阻塞，让线程自然退出
+		m_sock = INVALID_SOCKET;
+	}
 	if( m_hThreadHandle )
 	{
-		if( WaitForSingleObject(m_hThreadHandle , 100 ) == WAIT_TIMEOUT )
+		if( WaitForSingleObject(m_hThreadHandle , 1000 ) == WAIT_TIMEOUT )
 		{
+			// 兜底：极少数情况下仍退出不了才强杀（保留原路径以备追溯）
 			TerminateThread( m_hThreadHandle , -1 );
 		}
 		CloseHandle(m_hThreadHandle);
@@ -96,11 +102,13 @@ void UdpNet::UnInitNet()
 	}
 	if( m_sock && m_sock != INVALID_SOCKET )
 		closesocket(m_sock);
-    if( m_isLoadlib ){
-        WSACleanup();
-        m_isLoadlib = false;
+    //【安全修复-P0：WSACleanup 引用计数失衡】仅释放本实例引用
+    // 原代码: if(m_isLoadlib){ WSACleanup(); m_isLoadlib = false; }
+    if( m_wsaHeld ){
+        wsaCleanupRef();
+        m_wsaHeld = false;
     }
-} 
+}
 //发送 : 同时兼容tcp udp 
 bool UdpNet::SendData( unsigned int lSendIP , char* buf , int nlen )
 {

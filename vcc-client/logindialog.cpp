@@ -114,11 +114,15 @@ void LoginDialog::on_pb_commit_register_clicked()
         return;
     }
     //1.校验手机号 正则表达式
-    QRegExp reg("^1[3-8][0-9]\{6,9\}$");
+    //【修复-P1：注册/登录口径不一致】原注册允许 8-11 位（^1[3-8][0-9]{6,9}$），
+    // 登录只允许 11 位（^1[3-9][0-9]{9}$）—— 8~10 位注册的账号永远登不上。
+    // 统一为与登录一致的 11 位（1[3-9] 号段）。
+    // 原代码: QRegExp reg("^1[3-8][0-9]{6,9}$");
+    QRegExp reg("^1[3-9][0-9]{9}$");
     bool res = reg.exactMatch(strTel);
     if(!res)
     {
-        QMessageBox::about(this, "提示", "手机号格式错误，8-11位手机号");
+        QMessageBox::about(this, "提示", "手机号格式错误，应为11位手机号");
         return;
     }
 

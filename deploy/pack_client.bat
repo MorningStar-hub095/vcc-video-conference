@@ -15,15 +15,20 @@ REM   pack_client.bat meet.example.com --with-stunnel u001  走 8443 mTLS
 REM ============================================================
 setlocal enabledelayedexpansion
 
+REM 仓库根目录 = 本脚本所在 deploy\ 的上一级（%~dp0 已带尾随反斜杠）
+set REPO_ROOT=%~dp0..
+REM ---- 以下路径按需修改 ----
+REM QT_BIN 指向 Qt 的 MinGW 32bit bin 目录
 set QT_BIN=D://Qt//5.12.11//mingw73_32//bin
-set BUILD_DIR=<项目目录>//build-vcc-client-Desktop_Qt_5_12_11_MinGW_32_bit-release//release
-set OUT=<项目目录>//deploy//dist//vcc-client
+REM BUILD_DIR 指向 Qt Creator 的 shadow build 产物目录（以 .pro 文件名 vcc-client 为准）
+set BUILD_DIR=%REPO_ROOT%//build-vcc-client-Desktop_Qt_5_12_11_MinGW_32_bit-release//release
+set OUT=%REPO_ROOT%//deploy//dist//vcc-client
 set SERVER_IP=127.0.0.1
 
 REM ---- mTLS 隧道开关：默认 0=关闭（行为与旧版一致）----
 set WITH_STUNNEL=0
-set STUNNEL_DIR=<项目目录>//deploy//stunnel
-set CERT_SRC=<项目目录>//deploy//certs
+set STUNNEL_DIR=%REPO_ROOT%//deploy//stunnel
+set CERT_SRC=%REPO_ROOT%//deploy//certs
 set CLIENT_UID=
 set GATEWAY_HOST=127.0.0.1
 set GATEWAY_PORT=8443
@@ -36,7 +41,12 @@ if /i "%~1"=="-h" goto USAGE
 if /i "%~1"=="--with-stunnel" goto ARG_STUNNEL
 if /i "%~1"=="--stunnel-dir" goto ARG_STUNNEL_DIR
 if /i "%~1"=="--cert-dir" goto ARG_CERT_DIR
-if "%~1:~0,2%"=="--" goto ARG_UNKNOWN
+REM [FIX-P1] %~1 cannot be substring-expanded in batch; copy to a variable first.
+REM Reason: the old test never matched, so unknown options fell through and were
+REM           treated as SERVER_IP (e.g. "--foo" became the server address).
+REM Effect: unknown "--xxx" options are now routed to ARG_UNKNOWN as intended.
+set "ARG_CHK=%~1"
+if "%ARG_CHK:~0,2%"=="--" goto ARG_UNKNOWN
 set SERVER_IP=%~1
 shift
 goto ARGS
@@ -45,7 +55,10 @@ goto ARGS
 set WITH_STUNNEL=1
 shift
 if "%~1"=="" goto ARGS
-if "%~1:~0,2%"=="--" goto ARGS
+REM [FIX-P1] same substring-expansion fix as above (value-following-option case):
+REM           if the next token is another option, do not swallow it as the UID.
+set "ARG_CHK=%~1"
+if "%ARG_CHK:~0,2%"=="--" goto ARGS
 set CLIENT_UID=%~1
 shift
 goto ARGS

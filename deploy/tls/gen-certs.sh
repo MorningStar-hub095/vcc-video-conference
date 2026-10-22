@@ -19,7 +19,20 @@ set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 OUT="$HERE/../certs"
 SERVER_CN="${1:-localhost}"
-CERT_PWD="${CERT_PWD:-vcc}"
+#【P2修复：p12 导出口令硬编码 "vcc"】
+# 修改原因: 默认口令 "vcc" 随源码公开，client.p12 内含私钥，等于私钥裸奔；
+#           任何人拿到仓库都能导出客户端证书通过 mTLS 鉴权。
+# 修改效果: 未显式传入 CERT_PWD 时自动生成 24 位随机口令，写入
+#           $OUT/client.p12.password（chmod 600，不入库），并在末尾提示；
+#           显式传入 CERT_PWD 时行为不变。
+# 原代码保留备查：
+# CERT_PWD="${CERT_PWD:-vcc}"
+if [ -z "${CERT_PWD:-}" ]; then
+  CERT_PWD="$(openssl rand -base64 24 | tr -d '/+=\n' | cut -c1-24)"
+  GENERATED_PWD=1
+else
+  GENERATED_PWD=0
+fi
 DAYS_CA=3650
 DAYS_LEAF=825
 
@@ -38,14 +51,25 @@ openssl req -newkey rsa:2048 -nodes \
   -subj "/C=CN/O=VCCMeeting/OU=Server/CN=${SERVER_CN}" 2>/dev/null
 
 # SAN：同时支持 IP 与 DNS，避免客户端校验主机名失败
+#【P2修复：TLS SAN 缺 IP 条目】
+# 修改原因: 原固定只写 IP.1=127.0.0.1；当 SERVER_CN 是 IP（如 192.0.2.10）时
+#           它被塞进 DNS.1，客户端按 IP 直连时主机名校验必失败。
+# 修改效果: 判断 SERVER_CN 形态——IP 则写入 IP 条目，域名则写入 DNS 条目。
+# 原代码保留备查：
+#   DNS.1=${SERVER_CN} / DNS.2=localhost / IP.1=127.0.0.1
+if echo "$SERVER_CN" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$'; then
+  SAN_EXTRA="IP.2=${SERVER_CN}"
+else
+  SAN_EXTRA="DNS.2=${SERVER_CN}"
+fi
 cat > "$OUT/server-ext.cnf" <<EOF
 basicConstraints=CA:FALSE
 keyUsage=critical,digitalSignature,keyEncipherment
 extendedKeyUsage=serverAuth
 subjectAltName=@alt
 [alt]
-DNS.1=${SERVER_CN}
-DNS.2=localhost
+DNS.1=localhost
+${SAN_EXTRA}
 IP.1=127.0.0.1
 EOF
 
@@ -76,9 +100,23 @@ rm -f "$OUT"/*.csr "$OUT"/*.cnf "$OUT"/ca.srl
 chmod 600 "$OUT"/*.key
 chmod 644 "$OUT"/*.crt
 
+#【P2修复：p12 导出口令硬编码】自动生成口令时落盘保存（私钥文件同等级保护）
+if [ "$GENERATED_PWD" = "1" ]; then
+  printf '%s\n' "$CERT_PWD" > "$OUT/client.p12.password"
+  chmod 600 "$OUT/client.p12.password"
+fi
+
 echo
 echo "=== 生成完成：$OUT ==="
 ls -l "$OUT"
+echo
+#【P2修复：p12 导出口令硬编码】提示口令位置（自动生成模式下）
+if [ "$GENERATED_PWD" = "1" ]; then
+  echo "client.p12 导入口令已随机生成并保存到: $OUT/client.p12.password（请离线保管）"
+  echo "导入时使用: \$(cat $OUT/client.p12.password)"
+else
+  echo "client.p12 导入口令: 使用你显式指定的 CERT_PWD"
+fi
 echo
 echo "校验： openssl verify -CAfile $OUT/ca.crt $OUT/server.crt $OUT/client.crt"
 openssl verify -CAfile "$OUT/ca.crt" "$OUT/server.crt" "$OUT/client.crt"

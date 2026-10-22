@@ -53,18 +53,36 @@ ALLOW_DRIFT="${ALLOW_DRIFT:-0}"
 md5_of() { md5sum "$1" 2>/dev/null | awk '{print $1}'; }
 
 # ---------- 连接通道 ----------
+# 【修复-P1：未选择数据库】q()/run_file() 补 -D "$DB_NAME"
+# 修改原因: 原命令没有 -D/--database，mysql 登录后处于"未选库"状态：
+#           1) 执行 SQL 文件/CREATE TABLE/INSERT 直接报 "No database selected"，
+#              迁移完全无法运行；
+#           2) information_schema 查询里 table_schema=database() 求值为 NULL，
+#              --plan/--check 模式 HAS_TABLE 恒为 0，误报"版本表不存在"。
+# 修改效果: 所有连接默认选中 ${DB_NAME}，查询/建表/执行迁移全部落到正确的库，
+#           plan/check 模式的探测也恢复真实语义。其余逻辑不变。
+# 原代码:
+#   q():        mysql -uroot -p"$MYSQL_ROOT_PWD" -N -B -e "$1"
+#   run_file(): mysql -uroot -p"$MYSQL_ROOT_PWD" < "$1"
 q() {   # 只查不写，返回纯结果
+  #【P2修复：密码经命令行泄漏】-p"$PWD" 出现在进程参数里，ps/proc 可见。
+  # 修改效果: 改经环境变量 MYSQL_PWD 传递（不进参数表、不进 shell 历史）；
+  #           bare 模式对该条命令单独注入，docker 模式用 exec -e 注入。
+  # 原代码保留备查：
+  #   docker exec -i "$MYSQL_CONTAINER" mysql -uroot -p"$MYSQL_ROOT_PWD" -D "$DB_NAME" -N -B -e "$1"
+  #   mysql -uroot -p"$MYSQL_ROOT_PWD" -D "$DB_NAME" -N -B -e "$1"
   if [[ "$MODE" == "docker" ]]; then
-    docker exec -i "$MYSQL_CONTAINER" mysql -uroot -p"$MYSQL_ROOT_PWD" -N -B -e "$1"
+    docker exec -i -e MYSQL_PWD="$MYSQL_ROOT_PWD" "$MYSQL_CONTAINER" mysql -uroot -D "$DB_NAME" -N -B -e "$1"
   else
-    mysql -uroot -p"$MYSQL_ROOT_PWD" -N -B -e "$1"
+    MYSQL_PWD="$MYSQL_ROOT_PWD" mysql -uroot -D "$DB_NAME" -N -B -e "$1"
   fi
 }
 run_file() {   # 执行一个 SQL 文件
+  #【P2修复：密码经命令行泄漏】同 q()
   if [[ "$MODE" == "docker" ]]; then
-    docker exec -i "$MYSQL_CONTAINER" mysql -uroot -p"$MYSQL_ROOT_PWD" < "$1"
+    docker exec -i -e MYSQL_PWD="$MYSQL_ROOT_PWD" "$MYSQL_CONTAINER" mysql -uroot -D "$DB_NAME" < "$1"
   else
-    mysql -uroot -p"$MYSQL_ROOT_PWD" < "$1"
+    MYSQL_PWD="$MYSQL_ROOT_PWD" mysql -uroot -D "$DB_NAME" < "$1"
   fi
 }
 
@@ -109,7 +127,11 @@ fi
 
 PENDING=()
 DRIFT=0
-for f in $(ls "$MIG_DIR" | sort); do
+#【P2修复：for 拆词】原 `for f in $(ls ...)` 按空白拆词，文件名含空格即被拆成两项。
+# 修改效果: 改为 NUL 分隔的安全遍历，文件名含空格/换行都不会拆错。
+# 原代码保留备查：
+# for f in $(ls "$MIG_DIR" | sort); do
+while IFS= read -r -d '' f; do
   [[ "$f" == *.sql ]] || continue
   ver="${f%%_*}"
   md5="$(md5_of "$MIG_DIR/$f")"
@@ -122,7 +144,8 @@ for f in $(ls "$MIG_DIR" | sort); do
   else
     PENDING+=("${f}|${ver}|${md5}")
   fi
-done
+#【P2修复】循环终止改为 NUL 分隔输入（配合上方 while read -d ''，原为 for $(ls) 拆词）
+done < <(find "$MIG_DIR" -maxdepth 1 -type f -printf '%f\0' | sort -z)
 
 echo
 echo "== 待应用迁移 =="

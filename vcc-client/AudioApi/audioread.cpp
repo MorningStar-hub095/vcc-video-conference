@@ -72,20 +72,34 @@ AudioRead::AudioRead(QObject *parent) : QObject(parent)
 
     //  WebRTC VAD 静音检测初始化
     // 与 Opus DTX 双重保障：VAD 在编码前清零静音帧，DTX 在编码时压缩静音帧
+    handle = NULL;          //【修复-P2】默认无效，USE_VAD 初始化成功才可用
+    m_vadEnabled = false;
 #ifdef USE_VAD
+    //【修复-P2：VAD 句柄失败仍被使用】任一步失败即禁用 VAD，
+    // 回调线程按 isMute=false（有声）处理，不再对无效句柄调 Process。
+    // 原代码: 失败仅 qDebug，回调仍无条件 WebRtcVad_Process(audio->handle,...)
+    m_vadEnabled = false;
     if( 0 != WebRtcVad_Create( &handle ))
     {
         qDebug()<< "[VAD] vad create fail";
     }
-    if( 0 != WebRtcVad_Init(handle))
+    else if( 0 != WebRtcVad_Init(handle))
     {
         qDebug()<< "[VAD] vad init fail";
+        WebRtcVad_Free(handle);
+        handle = NULL;
     }
-    // 设置 VAD 灵敏度模式为 2（中等偏高，VoIP 推荐档）
-    // 模式 0=宽松 / 1=中等偏低 / 2=中等偏高(推荐) / 3=严格
-    // 后续由 slot_adjustVadMode 根据环境噪声动态调整
-    WebRtcVad_set_mode(handle, 2);
-    qDebug()<< "[VAD] vad mode set to 2 (VoIP recommended)";
+    else
+    {
+        // 设置 VAD 灵敏度模式为 2（中等偏高，VoIP 推荐档）
+        // 模式 0=宽松 / 1=中等偏低 / 2=中等偏高(推荐) / 3=严格
+        // 后续由 slot_adjustVadMode 根据环境噪声动态调整
+        WebRtcVad_set_mode(handle, 2);
+        m_vadEnabled = true;
+        qDebug()<< "[VAD] vad mode set to 2 (VoIP recommended)";
+    }
+    if( !m_vadEnabled )
+        handle = NULL;
 #endif
 
     // ===== VAD 动态阈值调整成员初始化 =====
@@ -265,10 +279,16 @@ void AudioRead::audioCallback(void *userdata, Uint8 *stream, int len)
     // 修改原因：原基础版无法感知静音状态、易因停顿抖动、不能自适应环境噪声
     bool isMute = false;
 #ifdef USE_VAD
-    // VAD 检测：返回 0=静音，1=有声，-1=错误（错误时按有声处理，避免误清零）
-    int vadResult = WebRtcVad_Process(audio->handle, 48000,
-                                       (int16_t*)stream, 960);
-    isMute = (vadResult == 0);
+    //【修复-P2：VAD 句柄失败仍被使用】仅在句柄有效时调用 VAD；
+    // 初始化失败的实例按"有声"处理（不清零音频），避免对无效句柄调 Process 的 UB。
+    // 原代码: 无条件 WebRtcVad_Process(audio->handle, ...)
+    if( audio->m_vadEnabled && audio->handle != NULL )
+    {
+        // VAD 检测：返回 0=静音，1=有声，-1=错误（错误时按有声处理，避免误清零）
+        int vadResult = WebRtcVad_Process(audio->handle, 48000,
+                                           (int16_t*)stream, 960);
+        isMute = (vadResult == 0);
+    }
 
     // 计算当前帧 RMS 能量，供 slot_adjustVadMode 动态阈值调整使用
     audio->m_noiseLevel = audio->calculateRMS((int16_t*)stream, 960);

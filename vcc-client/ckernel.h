@@ -19,6 +19,10 @@
 
 // 分片重组主动扫描定时器所需（新增成员 m_reassembleScanTimer 的完整类型）
 #include <QTimer>
+#include <QThread> //【修复-P2：桌面共享移出 UI 线程】m_pScreenThread
+#include <mutex> //【P2修复：SIG_SendVideo 队列泄漏兜底】保护在途缓冲登记表
+#include <set>   //【P2修复】同上
+#include <thread> //【P2修复：detached 线程竞态】成员线程对象
 
 #include "threadworker.h"
 
@@ -116,6 +120,10 @@ public slots:
     void slot_dealVideoFrameRq(uint sock,char* buf,int nlen);
     //补全邮箱回复处理
     void slot_dealUpdateEmailRS(uint sock,char* buf,int nlen);
+    //【P2修复：断线重连不重发音视频注册包】AV连接重连成功后补发注册包
+    // 功能：TcpClientMediator 内部重连成功会发出 SIG_reconnected，
+    //       服务端只认注册包绑定的 fd，不补发则重连后的音视频帧全部被丢弃。
+    void slot_avReconnected();
 
     // H.264视频帧处理槽函数
     // 处理H.264视频帧包（与JPEG路径共存）
@@ -157,6 +165,9 @@ private:
 
     int m_id;
     int m_roomid;
+    //【安全修复-P0：音视频通道劫持】登录成功时保存服务端下发的会话令牌，
+    // 音/视频通道注册包必须携带（与 packdef.h 的 m_token 字段配套）。
+    int m_token;
     //添加 m_UserName 成员保存当前登录用户名
     //原代码未保存用户名，导致创建房间时无法正确设置自己的 UserShow 信息
     QString m_UserName;
@@ -169,6 +180,8 @@ private:
     VideoRead * m_pVideoRead;
 
     ScreenRead * m_pScreenRead;
+    //【修复-P2：桌面共享移出 UI 线程】ScreenRead 所在工作线程（moveToThread）
+    QThread * m_pScreenThread;
 
     enum client_type{ audio_client = 0 , video_client = 1 };
     INetMediator * m_pAVClient[2];
@@ -244,6 +257,19 @@ private:
     // 功能：计算视频帧PTS，与audio_clock比对，超前则QThread::msleep等待
     double synchronizeVideo(double pts, double frameDelay);
     */
+
+    //【P2修复：SIG_SendVideo 裸 new[] 队列泄漏兜底】
+    // 修改原因: 视频分片缓冲区 new[] 后经队列信号投递给 worker 线程释放；
+    //           若 worker 停止（slot_destroy 中 clear()）时事件队列尚有未消费的
+    //           投递项，其携带的 char* 随队列一起被丢弃，内存泄漏且无从追回。
+    // 修改效果: 发射前登记、worker 消费后注销、worker 停止后统一释放残留，
+    //           保证每一块 new[] 出去的缓冲区最终都被 delete[]。
+    std::mutex m_videoBufMutex;          //保护下表（主线程登记 / worker 线程注销）
+    std::set<char*> m_inflightVideoBufs; //已发射、尚未被 worker 消费的视频包缓冲区
+
+    //【P2修复：detached 线程竞态】网络初始化线程改为可 join 的成员对象
+    // 原代码: initConfig 中 std::thread(...).detach()，与主线程生命周期脱钩
+    std::thread m_netInitThread;
 
 
 };

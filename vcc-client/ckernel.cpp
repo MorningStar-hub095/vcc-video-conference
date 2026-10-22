@@ -84,6 +84,8 @@ ckernel::ckernel(QObject *parent) : QObject(parent), m_id(0), m_roomid(0)
     m_h264Encoder = nullptr;
     m_useH264 = false;  // 默认关闭，待编码器初始化成功后开启
     m_h264FrameSeq = 0;
+    //【安全修复-P0：音视频通道劫持】会话令牌，登录成功时由服务端下发
+    m_token = 0;
     m_encodingPending = false;  //  编码防堆积标志初始值
 
     // 分片重组主动扫描定时器初始化
@@ -110,6 +112,12 @@ ckernel::ckernel(QObject *parent) : QObject(parent), m_id(0), m_roomid(0)
     // 参考AudioDemo2/main.cpp中的SDL_Init(SDL_INIT_AUDIO)
     if (SDL_Init(SDL_INIT_AUDIO) < 0) {
         qDebug() << "[SDL] SDL_Init(SDL_INIT_AUDIO) failed:" << SDL_GetError();
+        //【修复-P2：SDL 失败静默】原代码仅 qDebug，用户进房间后听不到任何声音
+        // 也无提示。弹窗明确告知（程序继续运行，仅音频功能不可用）。
+        // 原代码: （仅日志）
+        QMessageBox::warning(NULL, tr("音频初始化失败"),
+            tr("音频子系统初始化失败：%1\n\n进入会议室后将无法使用麦克风与扬声器。")
+            .arg(SDL_GetError()));
     } else {
         qDebug() << "[SDL] SDL_Init(SDL_INIT_AUDIO) succeeded";
     }
@@ -152,10 +160,24 @@ ckernel::ckernel(QObject *parent) : QObject(parent), m_id(0), m_roomid(0)
         m_pAVClient[i] = new TcpClientMediator;
         //修复：原来错误地连接了 m_pClient，应该连接 m_pAVClient
         connect(m_pAVClient[i] , SIGNAL(SIG_ReadyData(uint,char*,int)),this , SLOT(slot_dealData(uint,char*,int)));
+        //【P2修复：断线重连不重发音视频注册包】重连成功后补发注册包
+        // 修改原因: 重连建立的是全新连接，服务端此前绑定的音视频 fd 已失效，
+        //           不补发 AUDIO/VIDEO_REGISTER 则重连后的音视频帧全部被服务端丢弃。
+        // 修改效果: 重连成功 -> slot_avReconnected 补发注册包（跨线程队列投递，安全）。
+        connect(m_pAVClient[i] , SIGNAL(SIG_reconnected()) , this , SLOT(slot_avReconnected()));
     }
 
     //修复：网络初始化（阻塞式 connect）放到子线程执行，避免主线程阻塞导致 UI 无响应
-    std::thread([this](){
+    //【P2修复：detached 线程竞态】
+    // 修改原因: 原 std::thread(...).detach() 与主线程生命周期完全脱钩：
+    //           用户在连接建立前退出程序（slot_destroy），主线程 delete m_pClient/
+    //           m_pAVClient 的同时 detached 线程可能仍在调用其 OpenNet —— use-after-free。
+    // 修改效果: 线程改为成员对象，slot_destroy 回收网络资源前先 join，
+    //           保证初始化线程彻底结束后再清理。代价：若服务器不可达，
+    //           connect 需等待系统 TCP 超时（最长约 20s）才能退出，属可接受的退出延迟。
+    // 原代码保留备查：
+    //     std::thread([this](){ ...同下方 lambda... }).detach();
+    m_netInitThread = std::thread([this](){
         m_pClient->OpenNet(m_serverIP.toStdString().c_str());
         for( int i = 0 ; i < 2 ; i++ )
         {
@@ -170,7 +192,7 @@ ckernel::ckernel(QObject *parent) : QObject(parent), m_id(0), m_roomid(0)
             // 原代码: m_pAVClient->OpenNet( _DEF_SERVER_IP , _DEF_PORT );
             m_pAVClient[i]->OpenNet( m_serverIP.toStdString().c_str() , _DEF_PORT );
         }
-    }).detach();
+    });//【P2修复】不再 detach，线程对象存入 m_netInitThread，slot_destroy 中 join
     m_pAudioRead = new AudioRead;
     connect(m_pAudioRead , SIGNAL(SIG_audioFrame(QByteArray)),this , SLOT(slot_audioFrame(QByteArray)));
     // 连接静音状态变化信号（AudioRead VAD 检测 → ckernel → RoomDialog UI 联动）
@@ -181,7 +203,18 @@ ckernel::ckernel(QObject *parent) : QObject(parent), m_id(0), m_roomid(0)
     m_pVideoRead = new VideoRead;
     connect( m_pVideoRead , SIGNAL(SIG_sendVideoFrame(QImage)) , this , SLOT(slot_sendVideoFrame(QImage)));
 
-    m_pScreenRead = new ScreenRead;
+    //【修复-P2：桌面共享在 UI 线程 20fps 抓屏+缩放】ScreenRead 整体移入工作线程：
+    // grabWindow + 1080p SmoothTransformation 每 50ms 一次全在 UI 线程执行时，
+    // 桌面共享期间界面明显卡顿。moveToThread 后抓屏/缩放在工作线程执行，
+    // SIG_getScreenFrame 经 AutoConnection 自动跨线程队列投递回 UI 线程。
+    // 注意: 移线程后 slot_openVideo/slot_closeVideo 一律经 invokeMethod 队列调用，
+    //       直接跨线程调 QTimer::start 会触发 "Timers cannot be started from
+    //       another thread" 且静默失败。
+    // 原代码: m_pScreenRead = new ScreenRead;（留在 UI 线程，直接方法调用）
+    m_pScreenThread = new QThread( this );
+    m_pScreenRead = new ScreenRead;         // 无 parent，便于 moveToThread
+    m_pScreenRead->moveToThread( m_pScreenThread );
+    m_pScreenThread->start();
     connect( m_pScreenRead , SIGNAL(SIG_getScreenFrame(QImage)) , this , SLOT(slot_sendVideoFrame(QImage)));
 
     m_pSendVideoWorker = QSharedPointer<SendVideoWorker>( new SendVideoWorker );
@@ -194,24 +227,42 @@ ckernel::ckernel(QObject *parent) : QObject(parent), m_id(0), m_roomid(0)
 void ckernel::slot_destroy()
 {
     qDebug()<<__func__;
+    //【P2修复：detached 线程竞态】先等网络初始化线程结束，再清理它正在使用的对象
+    // 修改原因与效果见 initConfig 处注释；join 必须在 delete m_pClient/m_pAVClient 之前。
+    if( m_netInitThread.joinable() )
+        m_netInitThread.join();
     if(m_pVccDlg)
     {
         m_pVccDlg->hide();
-        delete m_pVccDlg;
+        //【P2修复：closeEvent 中同步 delete 自身栈对象】
+        // 修改原因: SIG_close 由对话框自身的 closeEvent() 发出，slot_destroy 是在
+        //           closeEvent 的调用栈内同步执行的，此处直接 delete 正处于栈帧中的
+        //           对象是未定义行为（delete 返回后 closeEvent 还要继续执行）。
+        // 修改效果: 改为 deleteLater()，把销毁推迟到事件循环，栈帧安全退出；
+        //           因 slot_destroy 末尾 exit(0)，实际销毁时机差异无业务影响。
+        // 原代码保留备查：
+        //     delete m_pVccDlg;
+        m_pVccDlg->deleteLater();
         m_pVccDlg = NULL;
 
     }
     if(m_pLoginDlg)
     {
         m_pLoginDlg->hide();
-        delete m_pLoginDlg;
+        //【P2修复】同上：closeEvent 栈帧内禁止同步 delete，改 deleteLater()
+        // 原代码保留备查：
+        //     delete m_pLoginDlg;
+        m_pLoginDlg->deleteLater();
         m_pLoginDlg = NULL;
 
     }
     if(m_pRoomdialog)
     {
         m_pRoomdialog->hide();
-        delete m_pRoomdialog;
+        //【P2修复】同上：closeEvent 栈帧内禁止同步 delete，改 deleteLater()
+        // 原代码保留备查：
+        //     delete m_pRoomdialog;
+        m_pRoomdialog->deleteLater();
         m_pRoomdialog = NULL;
 
     }
@@ -221,6 +272,29 @@ void ckernel::slot_destroy()
         delete m_pAudioRead;
         m_pAudioRead = NULL;
 
+    }
+    //【P2修复：slot_destroy 不释放 VideoRead/摄像头（ScreenRead 同理）】
+    // 修改原因: 原回收流程只停了 AudioRead，VideoRead 的采集定时器与 cv::VideoCapture
+    //           （摄像头句柄）、ScreenRead 的截屏定时器均未停止，摄像头指示灯常亮，
+    //           定时器在对象销毁前后仍可能触发一次回调访问悬空指针。
+    // 修改效果: 先调用各自的 slot_closeVideo 停定时器/释放摄像头，再 delete 对象。
+    // 原代码: （无此两段回收）
+    if(m_pVideoRead)
+    {
+        m_pVideoRead->slot_closeVideo();
+        delete m_pVideoRead;
+        m_pVideoRead = NULL;
+    }
+    if(m_pScreenRead)
+    {
+        //【修复-P2：ScreenRead 已移入工作线程】先经队列停定时器，再退出线程并回收：
+        // 跨线程直接 delete 属 UB；deleteLater 在对象所属线程（工作线程）执行。
+        // 原代码: m_pScreenRead->slot_closeVideo(); delete m_pScreenRead;
+        QMetaObject::invokeMethod( m_pScreenRead , "slot_closeVideo" , Qt::BlockingQueuedConnection );
+        m_pScreenRead->deleteLater();
+        m_pScreenRead = NULL;
+        m_pScreenThread->quit();
+        m_pScreenThread->wait();
     }
     if(m_pClient)
     {
@@ -241,6 +315,21 @@ void ckernel::slot_destroy()
         qDebug() << "停止 SendVideoWorker 线程...";
         m_pSendVideoWorker.clear();  // 触发 ThreadWorker 析构：quit() + wait()
         qDebug() << "SendVideoWorker 线程已停止";
+        //【P2修复：SIG_SendVideo 裸 new[] 队列泄漏兜底】
+        // worker 停止后其事件队列中未消费的投递项会被整体丢弃，携带的 char* 若不
+        // 在此回收则永久泄漏；登记表内剩下的就是这些未被消费的缓冲区。
+        {
+            std::lock_guard<std::mutex> lck( m_videoBufMutex );
+            size_t nLeak = m_inflightVideoBufs.size();
+            for( std::set<char*>::iterator it = m_inflightVideoBufs.begin();
+                 it != m_inflightVideoBufs.end(); ++it )
+            {
+                delete [] *it;
+            }
+            m_inflightVideoBufs.clear();
+            if( nLeak > 0 )
+                qDebug() << "回收 worker 队列残留视频包缓冲区:" << nLeak << "块";
+        }
     }
 
     //回收 AV 连接
@@ -296,7 +385,13 @@ void ckernel::slot_destroy()
     }
 
     qDebug() << "=== H264资源清理完成 ===";
-    exit(0);
+    //【修复-P1：exit(0) 强退】改用正常退出事件循环。
+    // 修改原因: exit(0) 直接终止进程，跳过 a.exec() 返回后的正常收尾：
+    //           QApplication/栈对象不走析构、Qt 的窗口清理链不执行，
+    //           SDL_Quit 等收尾全被跳过，属于"进程要退了无所谓"的隐患写法。
+    // 修改效果: 清理已在上文完成，这里只请求退出事件循环，main() 正常返回。
+    // 原代码: exit(0);
+    qApp->quit();
 }
 
 //MD5 加盐密钥优化
@@ -423,7 +518,14 @@ void ckernel::slot_joinroom()
     //弹出窗口 填房间号
     QString strRoom = QInputDialog::getText(m_pVccDlg , "加入房间", "输入房间号");
     //合理化判断
-    QRegExp exp("^[0-9]\{1,8\}$");
+    //【P2修复：QRegExp 量词转义失效】
+    // 修改原因: 原字符串 "\{1,8\}" 依赖编译器对非法转义 \{ \} 的容错（MinGW 仅给
+    //           unknown escape sequence 警告后按字面 {} 处理），属未定义行为；
+    //           换编译器/加严警告时正则会变成字面大括号，房间号校验直接失效。
+    // 修改效果: 显式写正确的量词 {1,8}，消除编译警告，校验行为不变。
+    // 原代码保留备查：
+    // QRegExp exp("^[0-9]\{1,8\}$");
+    QRegExp exp("^[0-9]{1,8}$");
     if(!exp.exactMatch(strRoom))
     {
         QMessageBox::about(m_pVccDlg, "提示", "房间号输入不合法,长度不超过8位");
@@ -441,7 +543,11 @@ void ckernel::slot_joinroom()
 //退出房间
 void ckernel::slot_quitRoom()
 {
-
+    //【修复-P2：无房间也发退房包】m_roomid==0 说明根本不在房间，
+    // 原 CloseRoomDialog 也无条件发 LEAVEROOM_RQ，服务端按 RoomID=0 查不到
+    // 房间静默丢弃 —— 白白发包且语义混乱。
+    // 原代码: （无前置检查）
+    if( m_roomid == 0 ) return;
 
     //发退出包
     STRU_LEAVEROOM_RQ rq;
@@ -459,7 +565,7 @@ void ckernel::slot_quitRoom()
     //关闭 音频 视频
     m_pAudioRead->pause();
     m_pVideoRead->slot_closeVideo();
-    m_pScreenRead->slot_closeVideo();
+    QMetaObject::invokeMethod( m_pScreenRead , "slot_closeVideo" , Qt::QueuedConnection );
     m_pRoomdialog->slot_setAudioCheck( false );
     m_pRoomdialog->slot_setVideoCheck( false );
     m_pRoomdialog->slot_setScreenCheck( false );
@@ -615,7 +721,7 @@ void ckernel::slot_pauseVideo()
 //开启桌面
 void ckernel::slot_startScreen()
 {
-    m_pScreenRead->slot_openVideo();
+    QMetaObject::invokeMethod( m_pScreenRead , "slot_openVideo" , Qt::QueuedConnection );
 
     // 桌面共享启动时初始化H264编码器
     // 原Bug: slot_startScreen()仅启动屏幕采集定时器，未初始化H264编码器。
@@ -674,7 +780,7 @@ void ckernel::slot_startScreen()
 //暂停桌面
 void ckernel::slot_pauseScreen()
 {
-    m_pScreenRead->slot_closeVideo();
+    QMetaObject::invokeMethod( m_pScreenRead , "slot_closeVideo" , Qt::QueuedConnection );
 }
 
 
@@ -975,6 +1081,12 @@ void ckernel::encodeAndSendVideoFrame(QImage img)
             memcpy(fragTmp, ba.data() + offset, fragDataSize);
 
             // 通过信号发送到SendVideoWorker线程
+            //【P2修复：SIG_SendVideo 裸 new[] 队列泄漏兜底】发射前登记，
+            // slot_SendVideo 消费后注销；worker 停止时残留项由 slot_destroy 统一释放
+            {
+                std::lock_guard<std::mutex> lck( m_videoBufMutex );
+                m_inflightVideoBufs.insert( fragBuf );
+            }
             Q_EMIT SIG_SendVideo(fragBuf, fragPackSize);
         }
     } else {
@@ -1006,6 +1118,12 @@ void ckernel::encodeAndSendVideoFrame(QImage img)
         tmp += sizeof (int);
 
         memcpy( tmp , ba.data() , ba.size() );
+        //通过信号发送（JPEG 路径，同样先登记，见 H264 路径说明）
+        //【P2修复：SIG_SendVideo 裸 new[] 队列泄漏兜底】
+        {
+            std::lock_guard<std::mutex> lck( m_videoBufMutex );
+            m_inflightVideoBufs.insert( buf );
+        }
         Q_EMIT SIG_SendVideo( buf , nPackSize );
     }
 
@@ -1053,6 +1171,11 @@ void ckernel::slot_SendVideo(char *buf, int nlen)
     if( delayMs > 2000)
     {
         qDebug() << "[slot_SendVideo] DROP: delay=" << delayMs << "ms, packType=" << packType;
+        //【P2修复】从在途登记表注销后释放（登记见 encodeAndSendVideoFrame）
+        {
+            std::lock_guard<std::mutex> lck( m_videoBufMutex );
+            m_inflightVideoBufs.erase( buf );
+        }
         delete []  buf;
         return;
     }
@@ -1095,6 +1218,11 @@ void ckernel::slot_SendVideo(char *buf, int nlen)
     {
         qDebug() << "[slot_SendVideo] SendData OK, packType=" << packType;
     }
+    //【P2修复】从在途登记表注销后释放（登记见 encodeAndSendVideoFrame）
+    {
+        std::lock_guard<std::mutex> lck( m_videoBufMutex );
+        m_inflightVideoBufs.erase( buf );
+    }
     delete [] buf;
 
 }
@@ -1132,6 +1260,10 @@ void ckernel::slot_dealData(uint sock, char *buf, int nlen)
 void ckernel::slot_dealLoginRS(uint sock, char *buf, int nlen)
 {
     qDebug()<<__func__;
+    //【P2修复：槽入口包长校验】畸形短包直接强转结构体会越界读（服务端被攻破/网络错乱时触发）
+    // 修改效果: 包体不足 sizeof(STRU_LOGIN_RS) 时丢弃；正常包不受影响。
+    // 原代码: （无校验，直接拆包）
+    if( nlen < (int)sizeof(STRU_LOGIN_RS) ) return;
     //拆包
     STRU_LOGIN_RS * rs = (STRU_LOGIN_RS*)buf;
     //根据返回结果，得到不同信息
@@ -1159,6 +1291,8 @@ void ckernel::slot_dealLoginRS(uint sock, char *buf, int nlen)
 
 
         m_id = rs->m_userid;
+        //【安全修复-P0：音视频通道劫持】保存服务端签发的会话令牌
+        m_token = rs->m_token;
         //保存当前登录用户名，供创建房间时设置 UserShow 使用
         //使用 fromUtf8 正确解码服务端发送的UTF-8中文用户名
         m_UserName = QString::fromUtf8( rs->m_name );
@@ -1169,9 +1303,11 @@ void ckernel::slot_dealLoginRS(uint sock, char *buf, int nlen)
         //注册音频和视频的fd
         STRU_AUDIO_REGISTER rq_audio;
         rq_audio.m_userid = m_id;
+        rq_audio.m_token = m_token;
 
         STRU_VIDEO_REGISTER rq_video;
         rq_video.m_userid = m_id;
+        rq_video.m_token = m_token;
 
         // 记录AV连接状态和注册包发送结果
         qDebug() << "[LoginRS] AV connection status:"
@@ -1196,6 +1332,8 @@ void ckernel::slot_dealLoginRS(uint sock, char *buf, int nlen)
         QMessageBox::about(m_pLoginDlg , "提示" , strMsg);
 
         m_id = rs->m_userid;
+        //【安全修复-P0：音视频通道劫持】保存服务端签发的会话令牌
+        m_token = rs->m_token;
         m_UserName = QString::fromUtf8( rs->m_name );
 
         //弹出补全邮箱对话框，循环直到用户输入有效邮箱或取消
@@ -1236,8 +1374,10 @@ void ckernel::slot_dealLoginRS(uint sock, char *buf, int nlen)
         //注册音频和视频的fd
         STRU_AUDIO_REGISTER rq_audio;
         rq_audio.m_userid = m_id;
+        rq_audio.m_token = m_token;
         STRU_VIDEO_REGISTER rq_video;
         rq_video.m_userid = m_id;
+        rq_video.m_token = m_token;
         m_pAVClient[audio_client]->SendData( 0 , (char*)&rq_audio , sizeof (rq_audio));
         m_pAVClient[video_client]->SendData( 0 , (char*)&rq_video , sizeof (rq_video));
     }
@@ -1248,10 +1388,34 @@ void ckernel::slot_dealLoginRS(uint sock, char *buf, int nlen)
     }
 }
 
+//【P2修复：断线重连不重发音视频注册包】AV连接重连成功后补发注册包
+// 修改原因: TcpClientMediator::SendData 内部重连建立的是全新连接，
+//           服务端只认注册包绑定的 fd；不补发则重连后的音视频帧全部被服务端丢弃。
+// 修改效果: 重连成功（SIG_reconnected）即重发 AUDIO_REGISTER / VIDEO_REGISTER；
+//           未登录（m_id==0）时不发，行为与旧版一致。
+// 原代码: （无此槽，重连后注册包丢失）
+void ckernel::slot_avReconnected()
+{
+    if( m_id == 0 ) return; // 未登录，无需补发
+    qDebug() << "[avReconnected] AV连接重连成功，补发音视频注册包, m_id=" << m_id;
+    STRU_AUDIO_REGISTER rq_audio;
+    rq_audio.m_userid = m_id;
+    rq_audio.m_token = m_token;
+    STRU_VIDEO_REGISTER rq_video;
+    rq_video.m_userid = m_id;
+    rq_video.m_token = m_token;
+    if( m_pAVClient[ audio_client ] )
+        m_pAVClient[ audio_client ]->SendData( 0 , (char*)&rq_audio , sizeof(rq_audio) );
+    if( m_pAVClient[ video_client ] )
+        m_pAVClient[ video_client ]->SendData( 0 , (char*)&rq_video , sizeof(rq_video) );
+}
+
 //注册回复处理
 void ckernel::slot_dealRegisterRS(uint sock, char *buf, int nlen)
 {
      qDebug()<<__func__;
+    //【P2修复：槽入口包长校验】同 slot_dealLoginRS
+    if( nlen < (int)sizeof(STRU_REGISTER_RS) ) return;
     //拆包
     STRU_REGISTER_RS * rs = (STRU_REGISTER_RS *)buf;
     //根据不同的结果，弹出不同的提示窗
@@ -1280,6 +1444,8 @@ void ckernel::slot_dealRegisterRS(uint sock, char *buf, int nlen)
 //创建房间回复处理
 void ckernel::slot_dealCreateRoomRS(uint sock, char *buf, int nlen)
 {
+    //【P2修复：槽入口包长校验】同 slot_dealLoginRS
+    if( nlen < (int)sizeof(STRU_CREATEROOM_RS) ) return;
     //拆包
     STRU_CREATEROOM_RS* rs = (STRU_CREATEROOM_RS*)buf;
     //房间号 显示到界面 跳转
@@ -1314,6 +1480,8 @@ void ckernel::slot_dealCreateRoomRS(uint sock, char *buf, int nlen)
 //加入房间回复
 void ckernel::slot_dealJoinRoomRS(uint sock, char *buf, int nlen)
 {
+    //【P2修复：槽入口包长校验】同 slot_dealLoginRS
+    if( nlen < (int)sizeof(STRU_JOINROOM_RS) ) return;
     //拆包
     STRU_JOINROOM_RS* rs = (STRU_JOINROOM_RS*)buf;
     //根据结果 失败 提示
@@ -1372,6 +1540,8 @@ void ckernel::slot_dealJoinRoomRS(uint sock, char *buf, int nlen)
 //房间成员请求处理
 void ckernel::slot_dealRoomMemberRq(uint sock, char *buf, int nlen)
 {
+    //【P2修复：槽入口包长校验】同 slot_dealLoginRS
+    if( nlen < (int)sizeof(STRU_ROOM_MEMBER_RQ) ) return;
     //拆包
     STRU_ROOM_MEMBER_RQ *rq = (STRU_ROOM_MEMBER_RQ*)buf;
     //原代码每次收到成员请求都创建新的 UserShow，没有检查是否已存在
@@ -1418,6 +1588,8 @@ void ckernel::slot_dealRoomMemberRq(uint sock, char *buf, int nlen)
 //离开房间的请求处理
 void ckernel::slot_dealLeaveRoomRq(uint sock, char *buf, int nlen)
 {
+    //【P2修复：槽入口包长校验】同 slot_dealLoginRS
+    if( nlen < (int)sizeof(STRU_LEAVEROOM_RQ) ) return;
     //拆包
     STRU_LEAVEROOM_RQ * rq = (STRU_LEAVEROOM_RQ*)buf;
     //把这个人从ui上去掉
@@ -1449,6 +1621,15 @@ void ckernel::slot_dealLeaveRoomRq(uint sock, char *buf, int nlen)
 //音频帧处理
 void ckernel::slot_dealAudioFrameRq(uint sock, char *buf, int nlen)
 {
+    //【安全修复-P0：残包越界读】校验必须先于任何解引用。
+    // 修改原因: slot_dealData 只保证 nlen>=4；原校验位于读头之后（1613 行），
+    //           nlen=4~23 的残包在到达校验前已解引用 24 字节包头 —— 越界读在先，
+    //           校验形同虚设。
+    // 修改效果: 包体不足 24 字节（6 个 int：type/userid/roomid/min/sec/msec）
+    //           直接丢弃，后续解引用全部安全。
+    // 原代码: 校验放在 nbufLen 计算处（读头之后）
+    if( nlen < (int)(6 * sizeof(int)) ) return;
+
     //反序列化
     char * tmp = buf;
     //跳过协议类型
@@ -1459,10 +1640,30 @@ void ckernel::slot_dealAudioFrameRq(uint sock, char *buf, int nlen)
     tmp += sizeof (int);
 
     //跳过时间戳字段 min, sec, msec
+    //【P2修复：AVSync 用本地到达时刻而非包内时间戳（同步形同虚设）】
+    // 修改原因: 音/视频时钟都用【接收端到达时刻】打点，网络抖动被同时叠加到两个时钟上，
+    //           diff 恒近似为 0，同步判断从未真正生效。
+    // 修改效果: 改用包内发送端时间戳（min/sec/msec）作为音视频共同时钟基准，
+    //           网络抖动反映为真实 diff，同步逻辑从此有效。
+    //           注：时间戳不含小时，整点翻转（59:59.999→0:00.000）时 diff 会出现一次
+    //           负向大跳变，走"视频落后→立即显示"分支自愈，无需额外处理。
+    // 原代码保留备查：
+    //     tmp += sizeof (int);
+    //     tmp += sizeof (int);
+    //     tmp += sizeof (int);
+    int aMin  = *(int*)tmp;
     tmp += sizeof (int);
+    int aSec  = *(int*)tmp;
     tmp += sizeof (int);
+    int aMsec = *(int*)tmp;
     tmp += sizeof (int);
 
+    //【修复-P1：短包长度校验】nbufLen 前必须确认包体至少含 6 个 int
+    // 修改原因: 原代码直接算 nlen - 6*sizeof(int)，畸形短包（nlen<24）时结果为负，
+    //           QByteArray 构造负长度越界，进程崩溃。
+    // 修改效果: 包体不足 24 字节直接丢弃，不再构造 QByteArray；正常包不受影响。
+    // 原代码: （无校验，直接 int nbufLen = nlen - 6*sizeof(int);）
+    if( nlen < (int)(6 * sizeof(int)) ) return;
     int nbufLen = nlen - 6*sizeof (int);
     QByteArray ba( tmp , nbufLen );
 
@@ -1496,11 +1697,11 @@ void ckernel::slot_dealAudioFrameRq(uint sock, char *buf, int nlen)
     */
 
     // 使用 AVSyncManager 更新指定用户的音频主时钟
-    // 功能：每收到一帧音频数据，用当前系统时间更新该用户的 audio_clock
-    // 原理：音频以恒定速率播放（8kHz/20ms），audio_clock 作为主基准驱动视频同步
-    // 参数：userId - 音频帧来源用户ID, timestamp - 当前系统时间（微秒）
+    // 功能：每收到一帧音频数据，用包内发送时间戳更新该用户的 audio_clock
+    //【P2修复：AVSync 时钟基准】见函数头部注释——改用发送端时间戳（微秒）
+    // 参数：userId - 音频帧来源用户ID, timestamp - 发送端采集时刻（微秒）
     {
-        double timestamp = (double)AVSyncManager::getCurrentTimeUs();
+        double timestamp = (double)(( aMin * 60 + aSec ) * 1000 + aMsec) * 1000.0;
         AVSyncManager::getInstance().updateAudioClock(userId, timestamp);
     }
 }
@@ -1508,11 +1709,15 @@ void ckernel::slot_dealAudioFrameRq(uint sock, char *buf, int nlen)
 //视频帧处理
 void ckernel::slot_dealVideoFrameRq(uint sock, char *buf, int nlen)
 {
+    //【安全修复-P0：残包越界读】校验先于解引用，同 slot_dealAudioFrameRq：
+    // nlen=4~23 的残包原会在校验前解引用 24 字节包头。不足 24 字节直接丢弃。
+    // 原代码: 校验放在 datalen 计算处（读头之后）
+    if( nlen < (int)(6 * sizeof(int)) ) return;
+
     //反序列化
     char * tmp = buf;
     //跳过协议类型
     tmp += sizeof ( int );
-    //提取 userId
     int userId = *(int*) tmp;
     tmp += sizeof ( int );
     //提取 roomId
@@ -1520,8 +1725,17 @@ void ckernel::slot_dealVideoFrameRq(uint sock, char *buf, int nlen)
     tmp += sizeof ( int );
 
     //跳过时间戳字段 min, sec, msec
+    //【P2修复：AVSync 用本地到达时刻而非包内时间戳】与音频槽对称：
+    // 改为读取包内发送端时间戳用于视频 PTS，见 slot_dealAudioFrameRq 处注释。
+    // 原代码保留备查：
+    //     tmp += sizeof ( int );
+    //     tmp += sizeof ( int );
+    //     tmp += sizeof ( int );
+    int vMin  = *(int*) tmp;
     tmp += sizeof ( int );
+    int vSec  = *(int*) tmp;
     tmp += sizeof ( int );
+    int vMsec = *(int*) tmp;
     tmp += sizeof ( int );
 
     int datalen = nlen - 6*sizeof (int);
@@ -1545,7 +1759,9 @@ void ckernel::slot_dealVideoFrameRq(uint sock, char *buf, int nlen)
         // 注意: synchronizeVideo 内部会更新 videoClock，供后续帧的同步判断使用
         //       这里仅调用以更新时钟，忽略返回的 waitMs（不阻塞）
         {
-            double video_pts = (double)AVSyncManager::getCurrentTimeUs();
+            //【P2修复：AVSync 时钟基准】视频 PTS 同样改用包内发送端时间戳（微秒），
+            // 与音频时钟同一基准，diff 才有意义。见 slot_dealAudioFrameRq 处注释。
+            double video_pts = (double)(( vMin * 60 + vSec ) * 1000 + vMsec) * 1000.0;
             double frameDelay = 33333.0;  // 30fps = 33333微秒
             AVSyncManager::getInstance().synchronizeVideo(userId, video_pts, frameDelay);
             // QThread::msleep(waitMs) — 阻塞主线程导致视频不刷新
@@ -1557,6 +1773,8 @@ void ckernel::slot_dealVideoFrameRq(uint sock, char *buf, int nlen)
 void ckernel::slot_dealUpdateEmailRS(uint sock, char *buf, int nlen)
 {
     qDebug()<<__func__;
+    //【P2修复：槽入口包长校验】同 slot_dealLoginRS
+    if( nlen < (int)sizeof(STRU_UPDATE_EMAIL_RS) ) return;
     //拆包
     STRU_UPDATE_EMAIL_RS * rs = (STRU_UPDATE_EMAIL_RS *)buf;
     if( rs->m_lresult == 1 )
@@ -1655,6 +1873,14 @@ void ckernel::slot_dealVideoFrameH264Rq(uint sock, char *buf, int nlen)
         // 避免因丢包导致分片组永久驻留内存
         qint64 now = QDateTime::currentMSecsSinceEpoch();
         if (now - group.timestamp > H264_REASSEMBLE_TIMEOUT) {
+            //【修复-P1：erase 后访问悬空引用（UB）】
+            // 修改原因: group 是 map 节点内的引用，userGroups.erase(frameSeq) 之后
+            //           节点已销毁，下方 group.frameType 是对已释放内存的读取
+            //           （I 帧超时分支必经，属确定性 UB）。
+            // 修改效果: erase 前先把 frameType 存入局部变量，日志与 PLI 判断
+            //           使用副本，行为语义不变，消除 UB。
+            // 原代码: userGroups.erase(frameSeq); 之后直接引用 group.frameType
+            int nLostFrameType = group.frameType;
             // 当前帧组超时，丢弃
             qWarning() << "H264重组超时, userId:" << userId
                        << "frameSeq:" << frameSeq
@@ -1667,7 +1893,7 @@ void ckernel::slot_dealVideoFrameH264Rq(uint sock, char *buf, int nlen)
             //        而它依赖的I帧/P帧已被丢弃。FFmpeg解码器会产生花屏（参考帧缺失），
             //        直到发送端自然产生下一个I帧（GOP=60，最长2秒）。
             // 修复: 发送PLI请求，通知发送端立即产生一个I帧。
-            if (group.frameType == 0) {
+            if (nLostFrameType == 0) {
                 // 丢失的是I帧，后续P帧都无法解码，必须请求新的I帧
                 qDebug() << "H264: lost I-frame, sending PLI request for userId:" << userId;
             }
@@ -1964,15 +2190,20 @@ bool ckernel_initH264Encoder(ckernel *kernel)
     Q_UNUSED(kernel);
     return false;
 
-    // 激活ckernel_initH264Encoder状态查询接口
-    // 由于ckernel私有成员无法从外部直接访问，此函数转为状态查询接口
-    // 实际初始化由ckernel::slot_startVideo内部完成
-    // 此函数保留作为外部模块（如服务端调试工具）查询H264支持能力的入口
-    qDebug() << " ckernel_initH264Encoder: 状态查询接口被调用"
-             << "实际初始化由slot_startVideo完成";
-    Q_UNUSED(kernel);
-    // 返回true表示H264路径已激活（slot_startVideo成功初始化后会设置m_useH264=true）
-    return true;
+    //【P2修复：H264Encoder 死代码】以下为 return false 之后的不可达代码，
+    // 编译器不会生成任何执行路径，属于纯死代码；按「注释保留」规则处理，
+    // 若未来需要恢复状态查询接口，取消注释即可。
+    // 修改效果: 删除不可达路径，消除维护误导；函数对外行为不变（恒返回 false）。
+    // 原代码保留备查：
+    // // 激活ckernel_initH264Encoder状态查询接口
+    // // 由于ckernel私有成员无法从外部直接访问，此函数转为状态查询接口
+    // // 实际初始化由ckernel::slot_startVideo内部完成
+    // // 此函数保留作为外部模块（如服务端调试工具）查询H264支持能力的入口
+    // qDebug() << " ckernel_initH264Encoder: 状态查询接口被调用"
+    //          << "实际初始化由slot_startVideo完成";
+    // Q_UNUSED(kernel);
+    // // 返回true表示H264路径已激活（slot_startVideo成功初始化后会设置m_useH264=true）
+    // return true;
 }
 
 

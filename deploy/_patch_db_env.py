@@ -1,7 +1,10 @@
 # -*- coding: utf-8 -*-
 """
 P0-2 补丁：把 packdef.h 里硬编码的数据库账号/口令改为运行期读取环境变量。
-对「非权威副本」同样打补丁，确保明文口令在整个项目里彻底消失。
+
+注意：这是针对旧版仓库布局的一次性迁移脚本。当前仓库的
+server/include/packdef.h 已经是打补丁后的状态，脚本检测到 _db_env 即幂等跳过，
+保留它仅用于帮助从旧版本迁移过来的使用者。
 
 用法： python3 _patch_db_env.py
 幂等：已打过补丁的文件会跳过（检测到 _db_env 即跳过）。
@@ -12,13 +15,10 @@ import sys
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 
-# 需要打补丁的 packdef.h（权威源在前）
+# 需要打补丁的 packdef.h。
+# 旧版仓库在 服务端代码/PlayerHallServer/ 下有三份重复副本，本仓库已精简为 server/ 一份。
 TARGETS = [
-    os.path.join(ROOT, "服务端代码", "PlayerHallServer", "include", "packdef.h"),
-    os.path.join(ROOT, "服务端代码", "PlayerHallServer", "PlayerHallServer",
-                 "include", "packdef.h"),
-    os.path.join(ROOT, "服务端代码", "PlayerHallServer", "PlayerHallServer1",
-                 "PlayerHallServer", "include", "packdef.h"),
+    os.path.join(ROOT, "server", "include", "packdef.h"),
 ]
 
 # 注意：旧口令在此脱敏为占位符（该文件会被 Git 跟踪，绝不能再写回真实口令）。

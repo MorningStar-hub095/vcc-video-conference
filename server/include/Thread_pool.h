@@ -36,6 +36,10 @@ public:
     bool Pool_create(int,int,int);
     void pool_destroy();
     int Producer_add( void *(*)(void*),void*);
+    //【安全修复-P0：主循环阻塞】非阻塞入队：队列满立即返回 -1，不等待。
+    // 供 epoll 事件循环线程使用 —— 阻塞版 Producer_add 在队满时会卡死在
+    // not_full 条件变量上，epoll 主循环停摆 = 整个服务对所有人失去响应。
+    int Producer_add_nb( void *(*)(void*),void*);
     static void * Custom(void*);
     static void * Manager(void*);
 

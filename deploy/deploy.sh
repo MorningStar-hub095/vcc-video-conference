@@ -76,8 +76,17 @@ fi
 if docker ps --format '{{.Names}}' | grep -q '^vcc-mysql$'; then
   TS="$(date +%Y%m%d-%H%M%S)"
   echo "== 备份现有数据库 -> backups/db-${TS}.sql =="
-  docker exec vcc-mysql mysqldump -uroot -p"${MYSQL_ROOT_PWD}" \
-      --databases "${DB_NAME}" > "backups/db-${TS}.sql" || echo "⚠ 备份失败（首次部署可忽略）"
+  #【P2修复1：备份失败继续部署】原 `|| echo "⚠ 备份失败"` 吞掉失败继续部署：
+  # 修改原因: MySQL 容器在而 dump 失败说明数据库状态异常，此时继续部署一旦失败，
+  #           回滚基线（备份）根本不存在，等于裸奔上线。
+  # 修改效果: 备份失败立即中止部署；仅当容器不在（首次部署）才跳过备份。
+  #【P2修复2：密码经命令行泄漏】mysqldump -p"$PWD" 对 ps 可见，改经 MYSQL_PWD 环境变量。
+  # 原代码保留备查：
+  #   docker exec vcc-mysql mysqldump -uroot -p"${MYSQL_ROOT_PWD}" \
+  #       --databases "${DB_NAME}" > "backups/db-${TS}.sql" || echo "⚠ 备份失败（首次部署可忽略）"
+  docker exec -e MYSQL_PWD="${MYSQL_ROOT_PWD}" vcc-mysql mysqldump -uroot \
+      --databases "${DB_NAME}" > "backups/db-${TS}.sql" \
+      || { echo "✗ 数据库备份失败，中止部署（回滚基线不能缺）"; exit 1; }
 fi
 
 # ---------- 2. 准备源码 ----------

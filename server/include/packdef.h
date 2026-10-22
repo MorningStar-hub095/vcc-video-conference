@@ -21,16 +21,10 @@
 
 
 //边界值
-#define _DEF_SIZE           45
-#define _DEF_BUFFERSIZE     1000
 #define _DEF_PORT           8000
 #define _DEF_SERVERIP       "0.0.0.0"
-#define _DEF_LISTEN         128
-#define _DEF_EPOLLSIZE      4096
-#define _DEF_IPSIZE         16
 #define _DEF_COUNT          10
 #define _DEF_TIMEOUT        10
-#define _DEF_SQLIEN         400
 #define TRUE                true
 #define FALSE               false
 
@@ -49,14 +43,18 @@ static inline const char* _db_env(const char* key, const char* def){
     const char* v = getenv(key);
     return (v && *v) ? v : def;
 }
-#define _DEF_DB_NAME    _db_env("DB_NAME", "vcc")
+//【P2修复】DB_NAME 默认值 "vcc" 与实际库名 "wechat" 不一致：
+// 修改原因: 本服务端 MySQL 库名固定为 wechat（lower_case_table_names=0，库名必须小写），
+//           未注入 DB_NAME 环境变量时旧默认值导致连库失败（Unknown database 'vcc'）。
+// 修改效果: 默认回退到 wechat，与部署脚本/Dockerfile 注入的库名一致。
+// 原代码保留备查：
+// #define _DEF_DB_NAME    _db_env("DB_NAME", "vcc")
+#define _DEF_DB_NAME    _db_env("DB_NAME", "wechat")
 #define _DEF_DB_IP      _db_env("DB_IP",   "localhost")
 #define _DEF_DB_USER    _db_env("DB_USER", "vcc")
 #define _DEF_DB_PWD     _db_env("DB_PWD",  "")
 /*--------------------------------------*/
-#define _MAX_PATH           (260)
 #define _DEF_BUFFER         (4096)
-#define _DEF_CONTENT_SIZE	(1024)
 #define _MAX_SIZE           (40)
 
 //自定义协议   先写协议头 再写协议结构
@@ -85,6 +83,7 @@ static inline const char* _db_env(const char* key, const char* def){
 //退出房间请求
 #define DEF_PACK_LEAVEROOM_RQ   (DEF_PACK_BASE + 11)
 //退出房间回复
+//【预留】协议号已分配但当前无收发实现（保留槽位，勿删否则后续编号错位）
 #define DEF_PACK_LEAVEROOM_RS   (DEF_PACK_BASE + 12)
 //音频注册
 #define DEF_PACK_AUDIO_REGISTER   (DEF_PACK_BASE + 13)
@@ -100,15 +99,18 @@ static inline const char* _db_env(const char* key, const char* def){
 //关键帧请求（PLI机制，新成员加入时触发）
 #define DEF_PACK_PLI_REQUEST       (DEF_PACK_BASE + 18)
 //SPS/PPS单独分发（可选，编码器默认inline模式可不使用）
+//【预留】SPS/PPS 单独分发，编码器默认 inline 模式，暂未使用
 #define DEF_PACK_VIDEO_SPSPPS      (DEF_PACK_BASE + 19)
 
 
 
 // TECH_INTEGRATION: [packdef] H.264 分片大小常量 (新增)
-//单片4KB，加上包头约4.1KB，远低于1MB安全阈值
-#define H264_FRAGMENT_SIZE       (4096)
+//【一致性修复】原值 4096/100，客户端 netapi/net/packdef.h 已调整为 8192/150（见该文件同名前缀说明）。
+//两份 packdef.h 必须严格对齐：分片大小决定包长、超时决定丢帧阈值，不一致会在后续
+//任一端按自身常量做缓冲或校验时产生错位。单片 8KB 加包头仍远低于 1MB 安全阈值。
+#define H264_FRAGMENT_SIZE       (8192)
 //H.264分片重组超时（毫秒）
-#define H264_REASSEMBLE_TIMEOUT  (100)
+#define H264_REASSEMBLE_TIMEOUT  (150)
 
 //返回的结果
 //注册请求的结果
@@ -201,11 +203,16 @@ typedef struct STRU_LOGIN_RS
         m_userid = 0;
         m_lresult = 0;
         memset(m_name , 0 , MAX_SIZE);
+        //【安全修复-P0：音视频通道劫持】
+        m_token = 0;
     }
     PackType m_nType;//包类型
     int  m_userid;
     int  m_lresult;//注册结果
     char m_name[MAX_SIZE];//密码
+    //【安全修复-P0：音视频通道劫持】登录成功时下发会话令牌，
+    // 客户端发起音/视频通道注册时原样带回，服务端比对通过才登记通道 fd。
+    int m_token;
 
 }STRU_LOGIN_RS;
 
@@ -329,6 +336,8 @@ typedef struct UserInfo
         memset(m_userName , 0 , MAX_SIZE);
         m_videofd = 0;
         m_audiofd = 0;
+        //【安全修复-P0：音视频通道劫持】会话令牌，登录时生成
+        m_token = 0;
     }
     int  m_sock;
     int  m_id;
@@ -337,6 +346,9 @@ typedef struct UserInfo
 
     int m_videofd;
     int m_audiofd;
+    //【安全修复-P0：音视频通道劫持】登录成功时由服务端生成的一次性会话令牌，
+    // 音/视频通道注册包必须携带同一令牌才允许登记 fd，防止任意连接冒名抢注。
+    int m_token;
 
 }UserInfo;
 
@@ -346,9 +358,13 @@ struct STRU_AUDIO_REGISTER
     STRU_AUDIO_REGISTER():m_nType(DEF_PACK_AUDIO_REGISTER)
     {
         m_userid = 0;
+        //【安全修复-P0：音视频通道劫持】
+        m_token = 0;
     }
     PackType m_nType;//包类型
     int m_userid;
+    //【安全修复-P0：音视频通道劫持】必须等于登录时下发的会话令牌
+    int m_token;
 
 };
 
@@ -358,9 +374,13 @@ struct STRU_VIDEO_REGISTER
     STRU_VIDEO_REGISTER():m_nType(DEF_PACK_VIDEO_REGISTER)
     {
         m_userid = 0;
+        //【安全修复-P0：音视频通道劫持】
+        m_token = 0;
     }
     PackType m_nType;//包类型
     int m_userid;
+    //【安全修复-P0：音视频通道劫持】必须等于登录时下发的会话令牌
+    int m_token;
 
 
 };

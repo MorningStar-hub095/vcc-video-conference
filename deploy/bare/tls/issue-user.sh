@@ -32,6 +32,16 @@ done
 
 [[ -n "$UID_" && -n "$NAME" && -n "$EMAIL" ]] || \
   die "用法: issue-user.sh --uid <工号> --name <姓名> --email <邮箱>"
+
+#【P2修复：subject 未转义】
+# 修改原因: NAME/EMAIL/UID_ 直接拼进 -subj 字符串，值里含 '/' 会被 openssl 当成
+#           字段分隔符——既能截断 subject，也能注入任意 RDN（如冒充 O=/OU=）。
+# 修改效果: 三个值中出现 '/' 直接拒绝签发；其余合法字符行为不变。
+#           （openssl -subj 无官方转义机制，白名单拒绝是唯一可靠做法。）
+# 原代码: （无校验，直接拼入 -subj）
+for _v in "$NAME" "$EMAIL" "$UID_"; do
+  [[ "$_v" != *"/"* ]] || die "参数含非法字符 '/'，拒绝签发（防 subject 注入）: $_v"
+done
 need_file "$ICA_DIR/openssl.cnf"
 need_file "$ICA_DIR/ica.crt"
 

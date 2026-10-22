@@ -102,8 +102,12 @@ void AVSyncManager::updateAudioClock(int userId, double pts)
     ctx.lastAudioUpdateTime = QDateTime::currentMSecsSinceEpoch();
 
     // 调试日志（低频输出，避免刷屏）
-    qDebug() << "[AVSync] 更新音频时钟, userId:" << userId
-             << ", audioClock(us):" << ctx.audioClock;
+    //【P2修复：日志风暴】本函数每收到一帧音频（50帧/s/用户）都会执行，
+    // 原无条件 qDebug 在多人会议下产生海量日志，拖慢 UI 线程并刷爆日志文件。
+    // 修改效果: 删除逐帧日志；自动创建上下文的日志（低频）保留。
+    // 原代码保留备查：
+    // qDebug() << "[AVSync] 更新音频时钟, userId:" << userId
+    //          << ", audioClock(us):" << ctx.audioClock;
 }
 
 // 视频帧同步等待计算（接收端使用）
@@ -208,9 +212,12 @@ int AVSyncManager::computeSyncDelay(SyncContext& ctx, double video_pts, double f
     double diff = currentVideoPts - ctx.audioClock;
 
     // 调试日志
-    qDebug() << "[AVSync] 同步比对 video_pts:" << currentVideoPts
-             << ", audioClock:" << ctx.audioClock
-             << ", diff(us):" << diff;
+    //【P2修复：日志风暴】本函数每视频帧执行（30帧/s/用户），逐帧日志在多人会议下
+    // 刷屏且拖慢 UI 线程。修改效果: 删除逐帧比对日志；异常分支（超时/未初始化）日志保留。
+    // 原代码保留备查：
+    // qDebug() << "[AVSync] 同步比对 video_pts:" << currentVideoPts
+    //          << ", audioClock:" << ctx.audioClock
+    //          << ", diff(us):" << diff;
 
     // 步骤6: 判断是否需要等待
     if (diff > SYNC_THRESHOLD_US)
@@ -223,7 +230,11 @@ int AVSyncManager::computeSyncDelay(SyncContext& ctx, double video_pts, double f
         {
             waitMs = MAX_WAIT_MS;
         }
-        qDebug() << "[AVSync] 视频超前, 等待:" << waitMs << "ms";
+        //【P2修复：日志风暴】仅在等待量异常大（>200ms，说明音视频明显失衡）时打日志，
+        // 正常范围等待不再逐帧输出。原代码保留备查：
+        // qDebug() << "[AVSync] 视频超前, 等待:" << waitMs << "ms";
+        if( waitMs > 200 )
+            qDebug() << "[AVSync] 视频超前, 等待:" << waitMs << "ms";
         return waitMs;
     }
 

@@ -183,6 +183,15 @@ def main():
 
     # ---------- 4. 反向鉴权：无客户端证书必须被拒绝 ----------
     if steps == 4:
+        # 【修复-P1：bad 未初始化导致 NameError】
+        # 修改原因: 原代码在 try 块内才给 bad 赋值；若 make_conn() 握手即抛异常
+        #           （这正是"无证书被拒绝"的正常场景），finally 里 bad.close()
+        #           因 bad 未定义抛 NameError，脚本以 traceback 非 0 退出，
+        #           调用方把"鉴权正确拒绝"误判为验证失败。
+        # 修改效果: 先置 bad = None，finally 判空再 close；
+        #           "握手即被拒"恢复为预期的 ✓ 分支，退出码正确。
+        # 原代码: （try 内首次赋值，finally 直接 bad.close()）
+        bad = None
         try:
             bad = make_conn(args, use_client_cert=False)
             bad.sendall(pkt(struct.pack("<i", LOGIN_RQ)

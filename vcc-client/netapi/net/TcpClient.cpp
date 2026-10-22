@@ -10,6 +10,8 @@ TcpClient::TcpClient( INetMediator * pMediator ):m_sock( INVALID_SOCKET ),m_isSt
 	m_pMediator = pMediator;
     m_isConnected = false; //atomic<bool> 支持隐式赋值
 	m_hThreadHandle = NULL;
+    //【安全修复-P0：WSACleanup 引用计数失衡】实例持有标志
+    m_wsaHeld = false;
 }
 
 TcpClient::~TcpClient()  //使用时, 父类指针指向子类, 使用虚析构
@@ -19,26 +21,15 @@ TcpClient::~TcpClient()  //使用时, 父类指针指向子类, 使用虚析构
 //初始化网络	//加载库 创建套接字 绑定
 bool TcpClient::InitNet(const char *szBufIP, unsigned short port)
 {
-    if( !m_isLoadlib )
+    //【安全修复-P0：WSACleanup 引用计数失衡】改用进程级引用计数，
+    // 首次调用执行 WSAStartup，之后仅计数。原先 static m_isLoadlib +
+    // 每实例无条件 WSACleanup 会让任一连接断开杀死全部连接。
+    // 原代码: if( !m_isLoadlib ){ ...WSAStartup... m_isLoadlib = true; }
+    if( !m_wsaHeld )
     {
-        //1.做个小买卖 炸串 --加载库
-        WORD wVersionRequested;
-        WSADATA wsaData;
-        int err;
-
-    /* Use the MAKEWORD(lowbyte, highbyte) macro declared in Windef.h */
-        wVersionRequested = MAKEWORD(2, 2);
-
-        err = WSAStartup(wVersionRequested, &wsaData);
-        if (err != 0) {
+        if( !wsaStartupRef() )
             return false;
-        }
-
-        if (LOBYTE(wsaData.wVersion) != 2 || HIBYTE(wsaData.wVersion) != 2) {
-            WSACleanup();
-            return false;
-        }
-        m_isLoadlib = true;
+        m_wsaHeld = true;
     }
 
     m_isConnected = false;
@@ -46,7 +37,11 @@ bool TcpClient::InitNet(const char *szBufIP, unsigned short port)
 	//2.雇人-- 创建套接字 进程与外界网络通信需要的接口 决定了与外界通讯的方式(tcp udp)
 	m_sock = socket( AF_INET , SOCK_STREAM , IPPROTO_TCP ); // ipv4 udp
 	if ( m_sock == INVALID_SOCKET) {
-		WSACleanup();
+        //【安全修复-P0】回滚本实例的引用即可，绝不能 WSACleanup ——
+        // 其它连接（音频/视频/主连接）还在使用 Winsock。
+        // 原代码: WSACleanup();（直接清掉全进程引用）
+        wsaCleanupRef();
+        m_wsaHeld = false;
         return false;
 	}
 
@@ -57,7 +52,7 @@ bool TcpClient::InitNet(const char *szBufIP, unsigned short port)
     addr.sin_port = htons( port );  //htons 转换为网络字节序 大端存储  43232
 
     //  记录连接目标
-    printf("[TcpClient::InitNet] connecting to %s:%d, m_sock=%d\n", szBufIP, port, m_sock);
+    printf("[TcpClient::InitNet] connecting to %s:%d, m_sock=%d\n", szBufIP, port, m_sock.load());
 
 	if( connect( m_sock ,(const sockaddr* ) &addr , sizeof(addr) ) == SOCKET_ERROR )
 	{
@@ -66,7 +61,7 @@ bool TcpClient::InitNet(const char *szBufIP, unsigned short port)
         return false;
 	}
     //  连接成功
-    printf("[TcpClient::InitNet] connect OK, m_sock=%d\n", m_sock);
+    printf("[TcpClient::InitNet] connect OK, m_sock=%d\n", m_sock.load());
 
     //设置客户端发送缓冲区
     //  缓冲区从256KB扩大到1MB
@@ -161,7 +156,7 @@ void TcpClient::UnInitNet()
 	{
 		if( WaitForSingleObject(m_hThreadHandle , 2000 ) == WAIT_TIMEOUT )
 		{
-            printf("[TcpClient::UnInitNet] WARNING: RecvData thread did not exit after 2s, force terminating, m_sock=%d\n", m_sock);
+            printf("[TcpClient::UnInitNet] WARNING: RecvData thread did not exit after 2s, force terminating, m_sock=%d\n", m_sock.load());
             fflush(stdout);
 			TerminateThread( m_hThreadHandle , -1 );
 		}
@@ -176,10 +171,13 @@ void TcpClient::UnInitNet()
     m_sock = INVALID_SOCKET;
     m_isConnected = false;
 
-    if( m_isLoadlib )
+    //【安全修复-P0：WSACleanup 引用计数失衡】仅当本实例持有引用时减一，
+    // 归零才真正 WSACleanup；其余连接不受影响。
+    // 原代码: if(m_isLoadlib){ WSACleanup(); m_isLoadlib = false; }
+    if( m_wsaHeld )
     {
-        WSACleanup();
-        m_isLoadlib = false;
+        wsaCleanupRef();
+        m_wsaHeld = false;
     }
 }
 //发送 : 同时兼容tcp udp 
@@ -201,8 +199,9 @@ bool TcpClient::SendData(unsigned int lSendIP , char* szbuf , int nlen )
 
     //  记录发送socket和数据大小
     int sendType = *(int*)szbuf;
-    printf("[TcpClient::SendData] m_sock=%d, nlen=%d, packType=%d\n", m_sock, nlen, sendType);
-    fflush(stdout);
+    //【修复-P1：高频路径 printf】每包一条 printf+fflush（30fps×多分片+音频50fps）
+    // 在 Win32 控制台是实测性能杀手，删除；错误路径日志保留。
+    // 原代码: printf("[TcpClient::SendData] m_sock=%d, nlen=%d, packType=%d\n", ...); fflush(stdout);
 
     int DataLen = nlen + 4;
     std::vector<char> vecbuf;
@@ -253,12 +252,31 @@ void TcpClient::RecvData()
 	while( !m_isStop )
 	{
 		//接收先接收包大小 在接受数据包
-		nRes = recv( m_sock , (char*)&nPackSize , sizeof(int) , 0   );
+		//【修复-P1：包头未收满 4 字节】TCP 短读会让 nPackSize 只含部分长度字段
+		// 修改原因: recv 不保证一次返回sizeof(int)个字节；短读时 nPackSize 是
+		//           "半截长度"，后续按它收包必然错位，整个连接永久解析错乱。
+		// 修改效果: 循环 recv 直到收满 4 字节包头（对端关闭/致命错误走既有清理路径）。
+		// 原代码:
+		//     nRes = recv( m_sock , (char*)&nPackSize , sizeof(int) , 0   );
+		{
+			int nHeaderGot = 0;
+			char * pHeader = (char*)&nPackSize;
+			nPackSize = 0;
+			while( nHeaderGot < (int)sizeof(int) )
+			{
+				nRes = recv( m_sock , pHeader + nHeaderGot , sizeof(int) - nHeaderGot , 0 );
+				if( nRes <= 0 )
+					break; // 0=对端关闭 / 负值=错误：保持 nRes 原值，交下方既有分支统一处理
+				nHeaderGot += nRes;
+			}
+			// 收满 4 字节时 nRes>0，正常继续；未收满时 nRes<=0，
+			// 由下方 nRes==0（对端关闭）/ nRes<0（错误）分支按原有语义清理退出。
+		}
 		//从接收缓冲区拷贝包大小
         if( nRes == 0)
         {
             //对端正常关闭连接
-            printf("[TcpClient::RecvData] Connection closed by peer (recv=0), m_sock=%d\n", m_sock);
+            printf("[TcpClient::RecvData] Connection closed by peer (recv=0), m_sock=%d\n", m_sock.load());
             fflush(stdout);
             // m_isStop=true 时由 UnInitNet 统一关闭 socket，这里不重复关闭
             if( !m_isStop ) {
@@ -279,7 +297,7 @@ void TcpClient::RecvData()
             //           永远不会匹配，导致所有可恢复错误被当作致命错误处理，socket 被关闭。
             int wsaErr = WSAGetLastError();
             printf("[TcpClient::RecvData] recv() failed, wsaErr=%d, m_sock=%d, m_isStop=%d\n",
-                   wsaErr, m_sock, (int)m_isStop);
+                   wsaErr, m_sock.load(), (int)m_isStop);
             fflush(stdout);
 
             // m_isStop=true 说明是 UnInitNet 调用了 shutdown()，正常退出
@@ -304,9 +322,24 @@ void TcpClient::RecvData()
         //限制单个数据包最大 1MB，超过则视为非法包，跳过并继续
         if( nPackSize <= 0 || nPackSize > 1024 * 1024 )
         {
-            printf("[TcpClient::RecvData] Invalid pack size=%d, skipping\n", nPackSize);
+            printf("[TcpClient::RecvData] Invalid pack size=%d, connection desynced, closing\n", nPackSize);
             fflush(stdout);
-            continue; //非法包大小，跳过
+            //【修复-P1：非法包长后残留字节污染流】
+            // 修改原因: 原代码仅 continue，字节流中该非法包头之后的字节原样留存，
+            //           后续每次都从错误的字节边界当包头解析，连接永久解析错乱，
+            //           且疯狂打印 Invalid pack size 日志刷屏。
+            // 修改效果: 帧边界已不可信、无法重同步（协议无分隔符/魔数），
+            //           判定连接已错乱，走既有清理路径断开重连
+            //           （m_isConnected=false + disConnect + closesocket），
+            //           由上层断线重连机制恢复。对端正常时永远不会走进此分支。
+            // 原代码: continue; //非法包大小，跳过
+            if( !m_isStop ) {
+                this->m_isConnected = false;
+                this->m_pMediator->disConnect();
+                closesocket(m_sock);
+                m_sock = INVALID_SOCKET;
+            }
+            break;
         }
 		int offset = 0;
 		char * buf = new char[nPackSize];
@@ -324,7 +357,7 @@ void TcpClient::RecvData()
             {
                 //连接已关闭，释放缓冲区避免泄漏，并退出外层循环
                 delete[] buf;
-                printf("[TcpClient::RecvData] Inner recv: connection closed (recv=0), m_sock=%d\n", m_sock);
+                printf("[TcpClient::RecvData] Inner recv: connection closed (recv=0), m_sock=%d\n", m_sock.load());
                 fflush(stdout);
                 if( !m_isStop ) {
                     this->m_isConnected = false;
@@ -344,7 +377,7 @@ void TcpClient::RecvData()
                 }
                 //不可恢复错误，释放缓冲区并退出
                 delete[] buf;
-                printf("[TcpClient::RecvData] Inner recv() failed, wsaErr=%d, m_sock=%d\n", wsaErr2, m_sock);
+                printf("[TcpClient::RecvData] Inner recv() failed, wsaErr=%d, m_sock=%d\n", wsaErr2, m_sock.load());
                 fflush(stdout);
                 if( !m_isStop ) {
                     this->m_isConnected = false;
@@ -357,7 +390,7 @@ void TcpClient::RecvData()
 		this->m_pMediator->DealData( m_sock , buf , offset  );  //需要在这个函数回收 堆区 空间
 	}
 recv_exit:
-    printf("[TcpClient::RecvData] Thread exiting, m_sock=%d, m_isStop=%d\n", m_sock, (int)m_isStop);
+    printf("[TcpClient::RecvData] Thread exiting, m_sock=%d, m_isStop=%d\n", m_sock.load(), (int)m_isStop);
     fflush(stdout);
 }
 

@@ -250,7 +250,14 @@ void YuvGLWidget::uploadYuvTextures(AVFrame *frame)
     // U 平面
     glActiveTexture(GL_TEXTURE1);
     glBindTexture(GL_TEXTURE_2D, m_texU);
-    if (!m_texturesAllocated || m_texWidth != yW) {
+    //【P2修复：UV 纹理重建条件只比宽不比高】
+    // 修改原因: 原条件 m_texWidth != yW 只比较宽度；分辨率高度变化（如 720p↔1080p
+    //           等宽不同高）时不会重建纹理，glTexSubImage2D 按 uvH 新高度写入旧高度
+    //           纹理 → 越界写/花屏。
+    // 修改效果: 加入高度比较，宽或高任一变化即重建 U 纹理。
+    // 原代码保留备查：
+    //     if (!m_texturesAllocated || m_texWidth != yW) {
+    if (!m_texturesAllocated || m_texWidth != yW || m_texHeight != yH) {
         glTexImage2D(GL_TEXTURE_2D, 0, GL_RED, uvW, uvH, 0,
                      GL_RED, GL_UNSIGNED_BYTE, frame->data[1]);
     } else {
@@ -261,7 +268,10 @@ void YuvGLWidget::uploadYuvTextures(AVFrame *frame)
     // V 平面
     glActiveTexture(GL_TEXTURE2);
     glBindTexture(GL_TEXTURE_2D, m_texV);
-    if (!m_texturesAllocated || m_texWidth != yW) {
+    //【P2修复】同 U 平面：重建条件加入高度比较（原代码只比宽）
+    // 原代码保留备查：
+    //     if (!m_texturesAllocated || m_texWidth != yW) {
+    if (!m_texturesAllocated || m_texWidth != yW || m_texHeight != yH) {
         glTexImage2D(GL_TEXTURE_2D, 0, GL_RED, uvW, uvH, 0,
                      GL_RED, GL_UNSIGNED_BYTE, frame->data[2]);
     } else {

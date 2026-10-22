@@ -4,18 +4,17 @@
 # 作用：把服务端源码拷贝到 deploy/.staging/PlayerHallServer/
 #
 # 为什么要拷贝：
-#   1) 源路径含中文（服务端代码/PlayerHallServer），作为 Docker 构建
-#      上下文在部分 Docker Desktop 版本上会出现路径编码问题；
-#   2) 源目录里混有 .o / .pro.user / makefile 教学模板 / 空桩 main.cpp，
-#      直接进入上下文会污染构建。
+#   1) 源目录里混有 .o / .pro.user / makefile 教学模板 等构建无关文件，
+#      直接进入上下文会污染构建；
+#   2) 统一在 .staging 生成一份可逐字节校验的构建上下文。
 # ============================================================
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$HERE/.." && pwd)"
 
-# 唯一权威源码目录（另一份 PlayerHallServer1/ 为旧副本，不参与构建）
-SRC="$ROOT/服务端代码/PlayerHallServer"
+# 唯一权威源码目录
+SRC="$ROOT/server"
 STAGE="$HERE/.staging"
 
 if [[ ! -d "$SRC/src" ]]; then

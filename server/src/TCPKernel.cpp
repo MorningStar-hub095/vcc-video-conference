@@ -31,7 +31,15 @@ void TcpKernel::setNetPackMap()
 
 TcpKernel::TcpKernel()
 {
-
+    //【修复-P1：构造函数不初始化成员】
+    // 修改原因: 原构造函数为空，m_sql/m_tcp/m_logic 为野指针；
+    //           若 Open() 提前失败返回，main 继续调 EventLoop() 会解引用野 m_tcp 崩溃，
+    //           析构函数 `if(m_logic) delete` 判断的也是野指针。
+    // 修改效果: 三指针默认 NULL，任何失败路径下判空/析构都是安全空操作。
+    // 原代码: TcpKernel::TcpKernel() { }
+    m_sql   = NULL;
+    m_tcp   = NULL;
+    m_logic = NULL;
 }
 
 TcpKernel::~TcpKernel()
@@ -66,6 +74,14 @@ int TcpKernel::Open( int port)
     if( !res )
         err_str( "net init fail:" ,-1);
 
+    //【修复-P1：断开无业务层清理】接线：连接关闭 -> CLogic::onClientClosed
+    // 修改原因: 网络层断开时业务层（在线用户表/房间成员表）永不清理，
+    //           UserInfo 泄漏、死 fd 复用后音视频帧串线。
+    // 修改效果: fd 关闭即触发业务层清理；m_logic 在 InitNet 之后创建，
+    //           注意回调执行时 m_logic 必已就绪（连接事件只会发生在 Open 完成后）。
+    // 原代码: （无接线）
+    m_tcp->setCloseCallback( &TcpKernel::OnClientClosed );
+
     m_logic = new CLogic(this);
 
     setNetPackMap();
@@ -89,9 +105,13 @@ void TcpKernel::initRand()
 
 void TcpKernel::DealData(sock_fd clientfd,char *szbuf,int nlen)
 {
+    //【修复-P1：DealData 读包头前未校验包长】
+    // 修改原因: *(PackType*)szbuf 固定读 4 字节，nlen 为 1~3 的残包会越界读。
+    // 修改效果: 包体不足 4 字节直接丢弃，不再进入类型分发。
+    // 原代码: PackType type = *(PackType*)szbuf;（无校验）
+    if( nlen < (int)sizeof(PackType) ) return;
+
     PackType type = *(PackType*)szbuf;
-    // [诊断日志] 记录所有收到的数据包
-    fflush(stdout);
     if( (type >= DEF_PACK_BASE) && ( type < DEF_PACK_BASE + DEF_PACK_COUNT) )
     {
         PFUN pf = NetPackMap( type );
@@ -101,12 +121,10 @@ void TcpKernel::DealData(sock_fd clientfd,char *szbuf,int nlen)
         }
         else
         {
-            // [诊断日志] 协议映射为空
         }
     }
     else
     {
-        // [诊断日志] 类型越界
     }
 
     return;
@@ -117,333 +135,27 @@ void TcpKernel::EventLoop()
     m_tcp->EventLoop();
 }
 
+//【修复-P1：断开无业务层清理】连接关闭回调（静态，转调业务层）
+// 修改原因: 见 Open() 中 setCloseCallback 接线处注释。
+// 修改效果: fd 关闭 -> CLogic::onClientClosed 清理在线用户与房间成员；
+//           m_logic 未就绪（理论不可达，防御性判空）时静默跳过。
+// 原代码: （无此函数）
+void TcpKernel::OnClientClosed( int fd )
+{
+    TcpKernel * pKernel = TcpKernel::GetInstance();
+    if( pKernel && pKernel->m_logic )
+        pKernel->m_logic->onClientClosed( fd );
+}
+
 void TcpKernel::SendData(sock_fd clientfd, char *szbuf, int nlen)
 {
     m_tcp->SendData(clientfd , szbuf ,nlen );
 }
 
-////register
-//void TcpKernel::RegisterRq(int clientfd, char * szbuf, int nlen)
-//{
-//   printf("clientfd:%d RegisterRq\n", clientfd);
-//   //1.拆包
-//   STRU_REGISTER_RQ * rq = (STRU_REGISTER_RQ *)szbuf;
-//   STRU_REGISTER_RS rs;
-//   //獲取tel password name
 
-//   //查表t_user 根據tel 查tel
-//   char sqlStr[1024] = {0}/*""*/;
-//   sprintf( sqlStr , "select tel from t_user where tel = '%s';",rq->m_tel);
-//   list<string> resList;
-//   if(!m_sql->SelectMysql(sqlStr , 1 , resList))
-//   {
-//       printf("SelectMysql error: %s \n",sqlStr);
-//       return;
-//   }
-//   //有user存在 返回
-//   if(resList.size() > 0)
-//   {
-//       rs.m_lresult = tel_is_exist;
-//   }
-//   else
-//   {
-//       //沒有，查表 t_user 根據name 查name name有沒有
-//       char sqlStr[1024] = {0}/*""*/;
-//       resList.clear();
-//       sprintf(sqlStr , "select name from t_user where name = '%s';",rq->m_name);
-
-//       if(!m_sql->SelectMysql(sqlStr , 1 , resList))
-//       {
-//           printf("SelectMysql error: %s \n",sqlStr);
-//           return;
-//       }
-//       if( resList.size() > 0)
-//       {
-//           //有name存在，返回
-//           rs.m_lresult = name_is_exist;
-//       }
-//       else
-//       {
-//           //沒有，寫表tel pass name頭像和籤名的默認值 返回注冊成功
-//           rs.m_lresult = register_success;
-//           sprintf(sqlStr , "insert into t_user( tel, password , name , icon , feeling) values('%s', '%s' , '%s' , '%d' , '%s');"
-//                   ,rq->m_tel,rq->m_password,rq->m_name, 1 ,"比較懶，什麼也沒寫");
-//           if(!m_sql->UpdataMysql(sqlStr))
-//           {
-//               printf("UpdataMysql error: %s \n",sqlStr);
-//           }
-//       }
-//   }
-//   m_tcp->SendData(clientfd , (char*)&rs , sizeof(rs));
-//}
-
-////LOGIN
-//void TcpKernel::LoginRq(int clientfd, char * szbuf, int nlen)
-//{
-//   printf("clientfd:%d LoginRq\n", clientfd);
-//   //拆包 //手機號 密碼
-//   STRU_LOGIN_RQ * rq = (STRU_LOGIN_RQ *)szbuf;
-//   STRU_LOGIN_RS rs;
-//   // 根據tel 查pass id
-//   char strsql[1024] = "";
-//   list<string> lstRes;
-//   sprintf( strsql , "select tel from t_user where tel = '%s';",rq->m_tel);
-
-//   if(!m_sql->SelectMysql(strsql , 2 , lstRes))
-//   {
-//       printf("SelectMysql error: %s \n",strsql);
-//       return;
-//   }
-//   if(lstRes.size() == 0)
-//   {
-//       //查不到，返回，沒此用戶
-//       rs.m_lresult = password_error;
-//   }else{
-//       lstRes.pop_front();
-//       //一致，sock要保存起來 id->sock映射（爲了通信）
-//       int id = atoi(lstRes.front().c_str());
-//       //sock要保存起來 id->sock映射（爲了通信）
-//       UserInfo * pInfo = new UserInfo;
-//       pInfo->m_id = id;
-//       pInfo->m_roomid = 0;
-//       pInfo->m_sock = clientfd;
-
-//       strcpy(pInfo->m_userName , lstRes.front().c_str());
-//       lstRes.pop_front();
-//       //判斷id是否在線，在線強制下線，不在線添加
-//       if(m_mapIDToUserInfo.IsExist(pInfo->m_id))
-//       {
-//           //強制下線
-
-//       }
-//       //**m_mapIDToUserInfo,inserter(pInfo->m_id , pInfo);
-//       //寫返回包 返回 帶id和結果
-//       rs.m_userid = id;
-//       rs.m_lresult = login_success;
-//       strcpy(rs.m_name , pInfo->m_userName);
-
-
-//   }
-
-
-//   //STRU_LOGIN_RS rs;
-//   //rs.m_lresult = password_error;
-//   SendData(clientfd, (char*)&rs, sizeof rs);
-
-//}
-
-////創建房間
-//void TcpKernel::CreateRoomRq(int clientfd, char *szbuf, int nlen)
-//{
-//    printf("clientfd:%d CreateRoomRq\n", clientfd);
-//    //拆包
-//    STRU_CREATEROOM_RQ* rq = (STRU_CREATEROOM_RQ*)szbuf;
-//    //房間號 1-8位隨機數
-//    int roomid = 0;
-//    do{
-//        roomid = rand()%99999999+1;
-
-//    }while(m_mapIDToRoomid.IsExist( roomid ));
-//    list<int> lst;
-//    lst.push_back( rq->m_UserID );
-//    m_mapIDToRoomid.insert( roomid , lst);
-//    printf("roomid = %d\n",roomid);
-//    //回復
-//    STRU_CREATEROOM_RS rs;
-//    rs.m_RoomID = roomid;
-//    rs.m_lresult = 1;
-
-//    SendData( clientfd , (char*)&rs , sizeof (rs));
-
-//}
-
-////加入房間
-//void TcpKernel::JoinRoomRq(int clientfd, char *szbuf, int nlen)
-//{
-//    printf("clientfd:%d JoinRoomRq\n", clientfd);
-//    //拆包
-//    STRU_JOINROOM_RQ * rq = (STRU_JOINROOM_RQ*)szbuf;
-//    STRU_JOINROOM_RS rs;
-//    //查看房間是否存在
-//    if(!m_mapIDToRoomid.IsExist(rq->m_RoomID))
-//    {
-//        //不存在，返回失敗
-//        rs.m_lresult = 0;
-//        SendData( clientfd , (char*)&rs , sizeof (rs));
-//        return;
-//    }
-//        //存在，返回成功
-//        rs.m_lresult = 1;
-//        SendData( clientfd , (char*)&rs , sizeof (rs));
-
-//        if( !m_mapIDToRoomid.IsExist(rq->m_UserID)) return;
-//        UserInfo * joiner = m_mapIDToUserInfo.find(rq->m_UserID);
-
-//        STRU_ROOM_MEMBER_RQ joinrq;
-//        joinrq.m_UserID = rq->m_UserID;
-//        strcpy(joinrq.m_szUser , joiner->m_userName);
-//        //給自己用於更新自己的信息
-//        SendData( clientfd , (char*)&joinrq , sizeof (joinrq));
-
-//        //根據房間號拿到房間成員列表
-//        list<int> lstRoomMem = m_mapIDToRoomid.find(rq->m_RoomID);
-//        //互換信息
-//        for( auto ite = lstRoomMem.begin() ; ite!=lstRoomMem.end() ; ++ite)
-//        {
-//            int Memid = *ite;
-//            if( !m_mapIDToUserInfo.IsExist(Memid)) return;
-//            UserInfo * memInfo = m_mapIDToUserInfo.find(Memid);
-
-//            STRU_ROOM_MEMBER_RQ memrq;
-//            memrq.m_UserID = memInfo->m_id;
-//            strcpy(memrq.m_szUser , memInfo->m_userName);
-
-//            //把加入人的信息發送給每一個房間內成員
-//            SendData(memInfo->m_sock , (char*)&joinrq ,sizeof (joinrq));
-//            //房間內成員每個人信息發給加入人
-//            SendData(clientfd , (char*)&memrq, sizeof (memrq));
-//        }
-//        //加入人，添加到房間列表
-//        lstRoomMem.push_back( rq->m_UserID);
-//        m_mapIDToRoomid.insert(rq->m_RoomID , lstRoomMem);
-
-
-//}
-
-////離開房間
-//void TcpKernel::LeaveRoomRq(int clientfd, char *szbuf, int nlen)
-//{
-//    printf("clientfd:%d LeaveRoomRq\n", clientfd);
-//    //拆包
-//    STRU_LEAVEROOM_RQ * rq = (STRU_LEAVEROOM_RQ*)szbuf;
-//    //看房间是否存在
-//    if(!m_mapIDToRoomid.IsExist(rq->m_RoomID)) return;
-//    //如果房间存在。可以获得用户列表
-//    list< int > lst = m_mapIDToRoomid.find( rq->m_RoomID );
-//    for( auto ite = lst.begin(); ite != lst.end();)
-//    {
-//        int userid = *ite;
-//        //遍历每个用户
-//        //是不是自己，如果是自己，从列表中去除--从房间移除了
-//        if( userid == rq->m_nUserID )
-//        {
-//            ite = lst.erase(ite);
-//        }else{
-//            //用户是否在线，在线转发
-//            if( m_mapIDToUserInfo.IsExist(userid))
-//            {
-//                UserInfo *info = m_mapIDToUserInfo.find( userid );
-//                SendData( info->m_sock , szbuf , nlen);
-//            }
-//            ++ite;
-//        }
-//    }
-
-
-
-//    //列表是否节点数为0->map项去掉
-//    if( lst.size() == 0)
-//    {
-//        m_mapIDToRoomid.erase( rq->m_RoomID );
-//        return;
-//    }
-
-//    //更新房间成员列表
-//    m_mapIDToRoomid.insert( rq->m_RoomID , lst);
-//}
-
-////處理音頻幀
-//void TcpKernel::AudioFrameRq(int clientfd, char *szbuf, int nlen)
-//{
-//    printf("clientfd:%d AudioFrameRq\n", clientfd);
-//    //拆包
-//    char * tmp = szbuf;
-//    //跳過type
-//    tmp += sizeof(int);
-//    //讀取userid
-//    int uid = *(int*) tmp;
-//    //跳過userid
-//    tmp += sizeof(int);
-//    //獲取roomid
-//    int roomid = *(int*) tmp;
-
-//    //看房間是否存在
-//    if( !m_mapIDToRoomid.IsExist( roomid )) return;
-//    list<int> lst = m_mapIDToRoomid.find(roomid);
-//    //獲取成員列表
-//    for( auto ite = lst.begin() ; ite != lst.end() ; ++ite)
-//    {
-//        //看是否在線，轉發
-//        int userid = *ite;
-//        //屏蔽掉自己 不轉發
-//        if( uid == userid ) continue;
-//        if( !m_mapIDToRoomid.IsExist(userid)) continue;
-//        UserInfo * userinfo = m_mapIDToUserInfo.find(userid);
-//        //原樣轉發
-//        SendData( userinfo->m_sock , szbuf , nlen);
-
-//    }
-//}
-
-//void TcpKernel::VideoFrameRq(int clientfd, char *szbuf, int nlen)
-//{
-//    printf("clientfd:%d VideoFrameRq\n", clientfd);
-//    //拆包
-//    char * tmp = szbuf;
-//    //跳過type
-//    tmp += sizeof(int);
-//    //讀取userid
-//    int uid = *(int*) tmp;
-//    //跳過userid
-//    tmp += sizeof(int);
-//    //獲取roomid
-//    int roomid = *(int*) tmp;
-
-//    //看房間是否存在
-//    if( !m_mapIDToRoomid.IsExist( roomid )) return;
-//    list<int> lst = m_mapIDToRoomid.find(roomid);
-//    //獲取成員列表
-//    for( auto ite = lst.begin() ; ite != lst.end() ; ++ite)
-//    {
-//        //看是否在線，轉發
-//        int userid = *ite;
-//        //屏蔽掉自己 不轉發
-//        if( uid == userid ) continue;
-//        if( !m_mapIDToRoomid.IsExist(userid)) continue;
-//        UserInfo * userinfo = m_mapIDToUserInfo.find(userid);
-//        //原樣轉發
-//        //SendData( userinfo->m_sock , szbuf , nlen);
-//        SendData( userinfo->m_audiofd , szbuf , nlen);
-
-//    }
-//}
-
-////音頻注冊
-//void TcpKernel::AudioRegister(int clientfd, char *szbuf, int nlen)
-//{
-//    printf("clientfd:%d AudioReister\n", clientfd);
-//    //拆包
-//    STRU_AUDIO_REGISTER *rq = (STRU_AUDIO_REGISTER * )szbuf;
-//    int userid = rq->m_userid;
-//    //根據userid找到節點 更新fd
-//    if( m_mapIDToUserInfo.IsExist(userid) )
-//    {
-//        UserInfo * info = m_mapIDToUserInfo.find(userid);
-//        info->m_audiofd = clientfd;
-//    }
-//}
-
-////視頻注冊
-//void TcpKernel::VideoRegister(int clientfd, char *szbuf, int nlen)
-//{
-//    printf("clientfd:%d VideoRegister\n", clientfd);
-//    //拆包
-//    STRU_VIDEO_REGISTER *rq = (STRU_VIDEO_REGISTER * )szbuf;
-//    int userid = rq->m_userid;
-//    //根據userid找到節點 更新fd
-//    if( m_mapIDToUserInfo.IsExist(userid) )
-//    {
-//        UserInfo * info = m_mapIDToUserInfo.find(userid);
-//        info->m_audiofd = clientfd;
-//    }
-//}
+// -----------------------------------------------------------------------------
+// 原RegisterRq / LoginRq / CreateRoomRq / JoinRoomRq / LeaveRoomRq / AudioFrameRq /
+// VideoFrameRq / AudioRegister / VideoRegister 的实现（约 320 行）曾位于本文件，
+// 现已全部迁移至 CLogic（见 server/src/clogic.cpp），本类不再处理任何协议包。
+// 保留此说明以说明 TcpKernel 的职责边界：它只负责网络收发与包类型分发。
+// -----------------------------------------------------------------------------

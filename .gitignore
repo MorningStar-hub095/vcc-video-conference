@@ -51,6 +51,18 @@ MSYS2/
 vcc-client/ffmpeg-4.2.2/
 vcc-client/SDL2-2.0.10/
 
+# 【修复-P0（发布阻断）：*.a/*.lib 构建产物规则误伤 vendored 静态库】
+# 修改原因: 上方"构建产物"区的 *.a / *.lib 通配规则把两个小型 vendored 第三方
+#           静态库也一并排除了——vcc-client/AudioApi/opus/lib/libopus.a 与
+#           vcc-client/AudioApi/WebRtc_Vad/signalProcess.lib。它们不在仓库里时
+#           克隆后客户端【链接必失败】（2026-10-21 全量构建实测复现），且二者
+#           无公开一致的获取渠道，属于发布阻断项。
+# 修改效果: 用 ! 例外规则精确放行这两个文件（合计 <1.5MB），其余 *.a/*.lib
+#           构建产物仍被忽略；配合 git add -f 入库后克隆即可链接。
+# 原代码: （无例外规则，两库被 *.a/*.lib 规则吞掉）
+!vcc-client/AudioApi/opus/lib/libopus.a
+!vcc-client/AudioApi/WebRtc_Vad/signalProcess.lib
+
 # ---------- 原始素材（不入库）----------
 # 原项目带 193 张表情 + 37 张 UI 图，版权归属不明，全部排除。
 # 但 logindialog.ui / vccdialog.ui 共 6 处通过 resource.qrc 引用了其中 4 张，

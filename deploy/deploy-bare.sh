@@ -8,7 +8,7 @@ set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$HERE/.." && pwd)"
-SRC="$ROOT/服务端代码/PlayerHallServer"
+SRC="$ROOT/server"
 
 INSTALL_DIR=/opt/vcc
 SERVICE_NAME=playerhallserver
@@ -83,9 +83,19 @@ ufw allow "${PORT}"/tcp comment 'VCC server' 2>/dev/null || true
 echo
 echo "== 验证 =="
 sleep 2
-systemctl status "$SERVICE_NAME" --no-pager | head -12
+#【P2修复：systemctl SIGPIPE】status 输出被 head 截断时 systemctl 收到 SIGPIPE 以 141 退出，
+# set -e（若含 pipefail）会把脚本一起带崩。修改效果: 管道失败不中断部署。
+# 原代码保留备查：
+#   systemctl status "$SERVICE_NAME" --no-pager | head -12
+systemctl status "$SERVICE_NAME" --no-pager | head -12 || true
 nc -z 127.0.0.1 "$PORT" && echo "✓ 端口 ${PORT} 已监听" || { echo "✗ 端口未监听"; exit 1; }
 python3 "$HERE/verify.py" --host 127.0.0.1 --port "$PORT"
 
 echo
-echo "✓ 裸机部署完成。回滚： cp ${INSTALL_DIR}/playerhallserver.bak-* ${INSTALL_DIR}/playerhallserver && systemctl restart ${SERVICE_NAME}"
+#【P2修复：bak 通配符提示错误】原提示 `cp ...bak-* .../playerhallserver`：
+# 修改原因: bak 目录下通常有多份备份，通配符展开成多个源文件时 cp 会把最后一个
+#           覆盖写到目标（或直接报错），回滚到哪个版本完全靠运气。
+# 修改效果: 提示改为「取最近一份」的确定命令。
+# 原代码保留备查：
+#   echo "✓ 裸机部署完成。回滚： cp ${INSTALL_DIR}/playerhallserver.bak-* ${INSTALL_DIR}/playerhallserver && systemctl restart ${SERVICE_NAME}"
+echo "✓ 裸机部署完成。回滚： cp \$(ls -t ${INSTALL_DIR}/playerhallserver.bak-* | head -1) ${INSTALL_DIR}/playerhallserver && systemctl restart ${SERVICE_NAME}"

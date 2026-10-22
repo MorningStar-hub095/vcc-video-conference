@@ -33,15 +33,19 @@ public:
     void Close();
     //处理网络接收
     static void DealData(sock_fd clientfd, char*szbuf, int nlen);
+    //【修复-P1：断开无业务层清理】连接关闭回调（静态，转调 CLogic::onClientClosed）
+    // 修改原因: 网络层断开时业务层永不清理，UserInfo 泄漏、fd 复用后帧串线。
+    // 修改效果: Block_Epoll_Net 关闭 fd 前回调本函数完成业务层清理。
+    // 原代码: （无此声明）
+    static void OnClientClosed(int fd);
     //事件循环
     void EventLoop();
     //发送数据
     void SendData( sock_fd clientfd, char*szbuf, int nlen );
-    //--------------網絡處理-------------------//
-    //注冊
-    void RegisterRq(int clientfd, char* szbuf, int nlen);
-    //登錄
-    void LoginRq(int clientfd, char * szbuf, int nlen);
+    //注冊 / 登錄等协议包的实现已迁移至 CLogic（见 server/src/clogic.cpp），
+    //TcpKernel 只负责网络收发与按包类型分发，不再声明各业务处理函数。
+    //本类原先的 RegisterRq / LoginRq 声明已随实现一并移除（会误导读者以为
+    //TcpKernel 仍处理注册登录，实际 NetPackMap 映射的都是 CLogic 的成员函数）。
 
 
 private:

@@ -80,8 +80,13 @@ echo "   Docker 就绪，compose 配置通过"
 echo
 echo "== 1/3 起隔离环境 (project=$PROJECT, 宿主端口=$PORT) =="
 # --wait 会等到 healthcheck 转 healthy；依赖 Dockerfile 里的 health-probe
+#【P2修复：bash<4.4 空数组 unbound】未传 --build 时 BUILD=() 为空数组，
+# bash 4.3 及以下在 set -u 下展开 "${BUILD[@]}" 会报 unbound variable 直接退出。
+# 修改效果: 用 ${BUILD[@]+...} 保护性展开——数组为空时不展开任何词；非空时行为不变。
+# 原代码保留备查：
+#     up -d --wait "${BUILD[@]}"; then
 if ! docker compose -p "$PROJECT" "${COMPOSE_FILES[@]}" \
-      up -d --wait "${BUILD[@]}"; then
+      up -d --wait ${BUILD[@]+"${BUILD[@]}"}; then
   echo "✗ 环境启动失败，容器日志："
   docker compose -p "$PROJECT" logs --tail=40
   exit 1

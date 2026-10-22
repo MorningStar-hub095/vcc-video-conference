@@ -14,6 +14,12 @@ signals:
     void SIG_ReadyData( unsigned int lSendIP , char* buf , int nlen );
     //客户端断开连接
     void SIG_disConnect();
+    //【P2修复：断线重连不重发音视频注册包】重连成功后通知上层补发注册包
+    // 修改原因: TcpClientMediator::SendData 内部重连建立的是全新连接，
+    //           服务端此前绑定的 AUDIO/VIDEO_REGISTER fd 已失效，
+    //           不补发注册包则重连后的音视频帧全部被服务端丢弃。
+    // 修改效果: 重连成功即发此信号，由 ckernel 补发音视频注册包。
+    void SIG_reconnected();
 public:
     INetMediator();
     virtual ~INetMediator();//使用时, 父类指针指向子类, 使用虚析构

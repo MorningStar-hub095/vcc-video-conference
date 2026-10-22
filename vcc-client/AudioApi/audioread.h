@@ -77,6 +77,9 @@ private:
 
     // WebRTC VAD 静音检测（与 Opus DTX 双重保障）
     VadInst *handle;
+    //【修复-P2：VAD 句柄失败仍被使用】create/init 任一失败置 false，
+    // 回调线程据此跳过 WebRtcVad_Process（对无效句柄调用是未定义行为）。
+    bool m_vadEnabled;
 
     // SDL 采集回调函数（静态函数，SDL 音频线程调用）
     // 功能：每 20ms 被调用一次，接收 960 采样（1920字节）

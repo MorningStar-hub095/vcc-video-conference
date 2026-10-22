@@ -92,7 +92,18 @@ def register(host, port, tel, name, email, pw_md5):
         return None
     if rs is None or len(rs) < 8:
         return None
-    return struct.unpack("<ii", rs)[1]
+    #【P2修复：数字校验缺失】
+    # 修改原因: 原代码对响应只做长度判断就返回 result；响应类型回显与结果枚举
+    #           从不校验——服务端若返回乱码数值（协议错位/被劫持），用例照样按
+    #           "正常返回"处理，安全结论可能假绿。
+    # 修改效果: 类型回显必须等于 REGISTER_RS，result 必须落在枚举 0..3 内，
+    #           否则视为协议错乱返回 None（走"服务端未回包"分支）。
+    # 原代码保留备查：
+    #     return struct.unpack("<ii", rs)[1]
+    t, _result = struct.unpack("<ii", rs[:8])
+    if t != REGISTER_RS or _result not in (0, 1, 2, 3):
+        return None
+    return _result
 
 
 def login(host, port, ident, pw_md5):
@@ -103,7 +114,13 @@ def login(host, port, ident, pw_md5):
         return None
     if rs is None or len(rs) < 12:
         return None
+    #【P2修复：数字校验缺失】同 register()：校验类型回显与结果枚举范围
+    # 原代码保留备查：
+    #     t, userid, result = struct.unpack("<iii", rs[:12])
+    #     return userid, result
     t, userid, result = struct.unpack("<iii", rs[:12])
+    if t != LOGIN_RS or result not in (0, 1, 2, 3):
+        return None
     return userid, result
 
 
@@ -149,7 +166,10 @@ def login_on(s, ident, pw_md5):
     rs = send_rs(s, body)
     if rs is None or len(rs) < 12:
         return None
+    #【P2修复：数字校验缺失】同 login()：校验类型回显与结果枚举范围
     t, userid, result = struct.unpack("<iii", rs[:12])
+    if t != LOGIN_RS or result not in (0, 1, 2, 3):
+        return None
     return userid, result
 
 

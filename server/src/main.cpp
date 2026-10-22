@@ -27,7 +27,18 @@ int main(int argc,char *argv[])
     TcpKernel * pKernel =  TcpKernel::GetInstance();
 
     //开启服务 给定端口, 可以使用输入的port
-    pKernel->Open( port );
+    //【修复-P1：Open() 返回值未检查】
+    // 修改原因: 原代码不检查 Open 返回值——DB 连不上或端口 bind 失败时 Open 返回 FALSE，
+    //           m_tcp/m_logic 均为 NULL，随后 EventLoop() 解引用野指针直接段错误崩溃，
+    //           且无任何日志，是最难排查的"启动即闪退"。
+    // 修改效果: Open 失败时打印明确原因（stderr）并以非 0 退出码结束，
+    //           容器/运维可据此告警；成功路径行为不变。
+    // 原代码: pKernel->Open( port );（无检查）
+    if( !pKernel->Open( port ) )
+    {
+        fprintf(stderr, "[main] TcpKernel::Open(%d) failed, exit.\n", port);
+        return 1;
+    }
     // 事件循环 : 循环监听事件
     pKernel->EventLoop();
 

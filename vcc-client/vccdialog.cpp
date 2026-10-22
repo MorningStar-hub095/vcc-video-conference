@@ -139,14 +139,22 @@ void VccDialog::on_pb_book_clicked()
 //  4. 发送信号通知 ckernel 应用新设置
 void VccDialog::on_pb_set_clicked()
 {
-    //读取当前设置
-    QString configPath = QCoreApplication::applicationDirPath() + "/settings.ini";
+    //【修复-P1：配置双轨】统一写到 ckernel 实际读取的 config.ini 的 [Net]/ip。
+    // 修改原因: 原代码写 settings.ini 的 [Network]/ServerIP，而 ckernel::initConfig
+    //           只读 config.ini 的 [Net]/ip —— 用户在设置页改服务器 IP 永远不生效。
+    // 修改效果: 设置页与启动配置同源，重启后 IP 设置真正生效。
+    //           码率/音量等本地偏好仍保留在 settings.ini（无消费方冲突）。
+    // 原代码: QString configPath = ... + "/settings.ini"; 及 Network/ServerIP 读写
+    QString configPath = QCoreApplication::applicationDirPath() + "/config.ini";
     QSettings settings(configPath, QSettings::IniFormat);
 
-    //当前设置项
-    QString curServerIp = settings.value("Network/ServerIP", "127.0.0.1").toString();
-    int curVideoBitrate = settings.value("Video/Bitrate", 500).toInt();
-    int curAudioVolume = settings.value("Audio/Volume", 80).toInt();
+    //当前设置项（服务器 IP 与 ckernel::initConfig 同键：[Net]/ip）
+    QString curServerIp = settings.value("Net/ip", "127.0.0.1").toString();
+    //码率/音量为本地偏好，保留原 settings.ini 存储
+    QString prefPath = QCoreApplication::applicationDirPath() + "/settings.ini";
+    QSettings prefs(prefPath, QSettings::IniFormat);
+    int curVideoBitrate = prefs.value("Video/Bitrate", 500).toInt();
+    int curAudioVolume = prefs.value("Audio/Volume", 80).toInt();
 
     //弹出设置对话框（使用输入对话框简化实现）
     bool ok = false;
@@ -176,10 +184,10 @@ void VccDialog::on_pb_set_clicked()
                                           0, 100, 1, &ok);
     if( !ok ) return;
 
-    //保存设置到配置文件
-    settings.setValue("Network/ServerIP", serverIp);
-    settings.setValue("Video/Bitrate", videoBitrate);
-    settings.setValue("Audio/Volume", audioVolume);
+    //保存设置到配置文件（服务器 IP 写 config.ini，与 ckernel 读取路径一致）
+    settings.setValue("Net/ip", serverIp);
+    prefs.setValue("Video/Bitrate", videoBitrate);
+    prefs.setValue("Audio/Volume", audioVolume);
 
     //提示用户
     QMessageBox::information(this, tr("设置"),

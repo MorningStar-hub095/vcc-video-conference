@@ -41,11 +41,24 @@ STRU_POOL_T::STRU_POOL_T(int max, int min, int que_max)
 /* 检查线程是否存活 */
 int thread_pool::if_thread_alive(pthread_t tid)
 {
-    if((pthread_kill(tid,0)) == -1)
-    {
-        if(errno == ESRCH) // 线程不存在
-            return FALSE;
-    }
+    //【修复-P1：pthread_kill 返回值语义用错，死线程永不回收】
+    // 修改原因: POSIX 规定 pthread_kill 失败时【直接返回错误号】（如 ESRCH），
+    //           不返回 -1、不设置 errno。原代码 `== -1` 永远不成立，
+    //           if_thread_alive 恒为 TRUE——已退出的线程槽位永不复用，
+    //           扩容耗尽 200 槽位后线程池永久退化，服务假死。
+    // 修改效果: 按 `返回值 == ESRCH` 判定线程已死，管理线程可正确回收/复用槽位，
+    //           线程池不再退化。存活线程判定结果不变。
+    // 原代码:
+    //     if((pthread_kill(tid,0)) == -1)
+    //     {
+    //         if(errno == ESRCH) // 线程不存在
+    //             return FALSE;
+    //     }
+    //
+    //     return TRUE;
+    int ret = pthread_kill(tid, 0);
+    if( ret == ESRCH ) // 线程不存在
+        return FALSE;
 
     return TRUE;
 }
@@ -101,6 +114,29 @@ int thread_pool::Producer_add( void *(*task)(void *arg),void *arg)
 	
     pthread_mutex_unlock(&m_pool->lock); // 解锁
     return 0;
+}
+
+/* 添加任务 生产者（非阻塞版，供 epoll 主循环线程使用）*/
+//【安全修复-P0：主循环阻塞】原阻塞版在队满时 pthread_cond_wait(not_full)，
+// epoll 事件循环线程一旦在此卡住，accept/所有事件全部冻结（未认证流量即可触发）。
+// 本版本队列满立即返回 -1，调用方负责丢弃任务并断开对应连接。
+// 原代码: （无非阻塞版本，主循环路径直接用 Producer_add）
+int thread_pool::Producer_add_nb( void *(*task)(void *arg),void *arg)
+{
+    int ret = -1;
+    pthread_mutex_lock(&m_pool->lock);// 上锁
+    // 仅在「队列未满且线程池未关闭」时入队，任何不满足都立即失败返回
+    if( m_pool->thread_shutdown && m_pool->queue_cur < m_pool->queue_max )
+    {
+        m_pool->queue_task[m_pool->queue_front].task = task;
+        m_pool->queue_task[m_pool->queue_front].arg = arg;
+        m_pool->queue_front = (m_pool->queue_front + 1) % m_pool->queue_max;
+        ++(m_pool->queue_cur);
+        pthread_cond_signal(&m_pool->not_empty);
+        ret = 0;
+    }
+    pthread_mutex_unlock(&m_pool->lock);
+    return ret;
 }
 
 /* 工作线程函数 消费者*/
@@ -165,7 +201,11 @@ void *thread_pool::Manager(void *arg)
         cur = p->queue_cur; // 当前任务队列中的任务数
         pthread_mutex_unlock(&p->lock); // 解锁
 		/* 当前任务队列中的任务数大于存活的空闲线程数，或忙碌线程占比大于等于 80%，且存活的线程数小于最大线程数 */
-        if((cur > alive - busy || (float)busy / alive*100 >= (float)80 ) &&
+		/*【安全修复-P1：alive==0 除零】全部工作线程已退出时 (float)busy/alive 得 NaN，
+		  比较恒为 false，扩容逻辑静默失效。加 alive>0 前提。
+		  原代码: if((cur > alive - busy || (float)busy / alive*100 >= (float)80 ) && ...) */
+        if( alive > 0 &&
+                (cur > alive - busy || (float)busy / alive*100 >= (float)80 ) &&
                 p->thread_max > alive)
         {
             for(int j = 0;j<p->thread_min;j++)
@@ -177,9 +217,23 @@ void *thread_pool::Manager(void *arg)
                     {
                         pthread_mutex_lock(&p->lock);// 上锁
 						// 创建新的工作线程
-                        pthread_create(&p->tids[i],NULL,Custom,(void*)p);
-						// 存活的线程数加一
-                        ++(p->thread_alive);
+                        //【P2修复：pthread_create 返回值未检查】
+                        // 修改原因: 原代码不看返回值就直接 ++thread_alive；创建失败
+                        //           （EAGAIN 资源耗尽等）时存活数虚增，管理线程误判，
+                        //           线程池逐渐“空转”，任务无人消费。
+                        // 修改效果: 创建失败则跳过该槽位（不虚增计数），下轮管理线程重试；
+                        //           创建成功行为与原代码一致。
+                        // 原代码保留备查：
+                        //     pthread_create(&p->tids[i],NULL,Custom,(void*)p);
+                        if( pthread_create(&p->tids[i],NULL,Custom,(void*)p) == 0 )
+                        {
+							// 存活的线程数加一
+                            ++(p->thread_alive);
+                        }
+                        else
+                        {
+                            p->tids[i] = 0;//创建失败，槽位复位，避免残留脏 tid
+                        }
                         pthread_mutex_unlock(&p->lock);// 解锁
                         break;
                     }

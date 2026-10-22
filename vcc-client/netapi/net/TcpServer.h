@@ -4,6 +4,7 @@
 #include<iostream>
 #include<list>
 #include<map>
+#include <atomic> //【P2修复】为 m_isStop 提供 std::atomic<bool>
 
 using namespace std;
 
@@ -29,10 +30,14 @@ protected:
 	virtual void RecvData();
 
 	SOCKET m_sock; // 主套接字
+	//【安全修复-P0：WSACleanup 引用计数失衡】本实例是否持有 Winsock 引用
+	bool m_wsaHeld;
 	//SOCKET sockWaiter; // 用户和客户端对话的套接字 --> 一组 
 	map<unsigned int , SOCKET> m_mapThreadIdToSocket;
 	list<HANDLE> m_hThreadHandleLst; // 控制线程
 
-	bool m_isStop;
+	//【P2修复】同 TcpClient：m_isStop 跨线程读写改为原子量
+	// 原代码保留备查： bool m_isStop;
+	std::atomic<bool> m_isStop;
 };
 

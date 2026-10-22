@@ -169,6 +169,17 @@ void AudioWrite::slot_playAudio( QByteArray bt)
     // 参考：AudioDemo2/OpusApi/sdlaudiowrite.cpp::slot_playAudioFrame
     if (m_sdlIsOpen) {
         std::lock_guard<std::mutex> lck(m_mutex);
+        //【P2修复：音频队列无上限】
+        // 修改原因: 原代码无条件入队；当播放消费速度 < 网络到达速度（弱网恢复后
+        //           突发、服务端转发风暴）时队列无限增长，内存持续上涨且延迟越来越大。
+        // 修改效果: 队列超过 100 帧（约 2 秒 @50帧/s）时丢弃最旧数据再入队，
+        //           内存有界、播放延迟有界；正常速率下行为不变。
+        // 原代码保留备查：
+        //     m_audioQueue.emplace_back(bt);
+        while( m_audioQueue.size() >= 100 )
+        {
+            m_audioQueue.pop_front(); // 丢最旧帧，保实时性
+        }
         m_audioQueue.emplace_back(bt);
     }
 }
@@ -188,13 +199,31 @@ void AudioWrite::audioCallback(void *userdata, Uint8 *stream, int len)
     // 先将SDL缓冲区清零（静音填充）
     memset(stream, 0, len);
 
-    if (!audio->m_audioQueue.empty()) {
-        // 从队列头部取出一帧 Opus 编码数据
-        QByteArray recvBuffer = audio->m_audioQueue.front();
-        {
-            std::lock_guard<std::mutex> lck(audio->m_mutex);
+    //【修复-P0：音频队列锁外访问（并发 UB）】empty()/front() 移入互斥锁内
+    // 修改原因: 原代码 empty()/front() 在锁外访问 std::deque，仅 pop_front 持锁。
+    //           SDL 回调线程（audioCallback）与主线程 slot_playAudio（持锁 push，
+    //           见本文件第 170-173 行）每 20ms 并发一次，deque 扩容/元素移动期间
+    //           锁外读取会撕裂——长期运行大概率崩溃（隐藏最深的一个 P0）。
+    // 修改效果: empty/front/pop 三个操作全部移入同一 lock_guard 作用域，
+    //           取帧与入队完全互斥；取帧逻辑与解码逻辑不变。
+    // 原代码:
+    //     if (!audio->m_audioQueue.empty()) {
+    //         // 从队列头部取出一帧 Opus 编码数据
+    //         QByteArray recvBuffer = audio->m_audioQueue.front();
+    //         {
+    //             std::lock_guard<std::mutex> lck(audio->m_mutex);
+    //             audio->m_audioQueue.pop_front();
+    //         }
+    QByteArray recvBuffer;
+    {
+        std::lock_guard<std::mutex> lck(audio->m_mutex);
+        if (!audio->m_audioQueue.empty()) {
+            // 从队列头部取出一帧 Opus 编码数据（整体在锁内完成）
+            recvBuffer = audio->m_audioQueue.front();
             audio->m_audioQueue.pop_front();
         }
+    }
+    if (!recvBuffer.isEmpty()) {
 
         //  Speex 解码逻辑（已在上一轮迁移中废弃）
         // 解码工作已迁移到此处的 Opus 解码
@@ -203,7 +232,10 @@ void AudioWrite::audioCallback(void *userdata, Uint8 *stream, int len)
         // 输入：Opus 编码数据（约 60-120 字节）
         // 输出：PCM 数据（960采样 × 2字节 = 1920字节）
         // 参考：AudioDemo2/OpusApi/sdlaudiowrite.cpp::audioCallback
-        opus_int16 decodedData[4096];
+        //【修复-P2：解码缓冲容量不足】48kHz 单声道 Opus 单包最大可输出
+        // 120ms = 5760 采样（FEC/PLC 或畸形包会触发），4096 会导致解码截断失败。
+        // 原代码: opus_int16 decodedData[4096];
+        opus_int16 decodedData[5760];
         int frameSizeDecoded = opus_decode(audio->m_opusDecoder,
                                             (const unsigned char*)recvBuffer.data(),
                                             recvBuffer.size(),

@@ -38,8 +38,13 @@ void VideoRead::slot_getVideoFrame()
     //将 opencv 采集的 BGR 的图片类型转化为 RGB24 的类型
     cvtColor(frame,frame,CV_BGR2RGB);
     //定义 QImage 对象, 用于发送数据以及图片显示
+    //【修复-P1：QImage 悬空】QImage(frame.data,...) 不拷贝像素，image 依赖 frame
+    // 的外部缓冲；scaled 在"源尺寸==目标尺寸"时返回浅拷贝，frame 析构后悬空。
+    // 当前同线程直连侥幸安全，一旦改 Queued 连接立即崩溃 —— 显式 .copy() 一步到位。
+    // 原代码: QImage image((unsigned const char*)frame.data,...);（无 copy）
     QImage image ((unsigned const
     char*)frame.data,frame.cols,frame.rows,QImage::Format_RGB888);
+    image = image.copy();
     //转化为大小更小的图片 保持缩放比
     //  恢复 Qt::KeepAspectRatio，消除"人物变扁"变形问题
     // 修改原因: HD升级后编码器分辨率为1280x720(16:9)，slot_openVideo()中已通过
@@ -62,7 +67,12 @@ void VideoRead::slot_getVideoFrame()
 
 void VideoRead::slot_openVideo()
 {
-    m_timer->start( 1000/FRAME_RATE - 10 );
+    //【修复-P1：定时器先启动】改为摄像头打开成功后再启动采集定时器。
+    // 修改原因: 原代码先 m_timer->start() 再打开摄像头，打开失败时定时器
+    //           继续以 23ms 周期对未打开的 cap 空转（cap.read 直接 return），
+    //           且弹窗阻塞期间事件里仍排队采集槽。
+    // 修改效果: 失败路径不启动定时器（无空转）；成功路径行为与旧版一致。
+    // 原代码: m_timer->start( 1000/FRAME_RATE - 10 ); 在函数首行
 
     //摄像头打开逻辑增强
     //问题：在某些运行环境（如 Windows Defender ASR 规则限制的目录）下
@@ -120,7 +130,7 @@ void VideoRead::slot_openVideo()
     if( !bOpenSuccess )
     {
         QMessageBox::information(NULL,tr("提示"),tr("视频没有打开"));
-        return;
+        return; //【修复-P1】失败不启动定时器，避免空转
     }
 
     //  设置摄像头采集分辨率为1280x720(16:9)
@@ -135,6 +145,9 @@ void VideoRead::slot_openVideo()
     // SD回退值: 弱网环境可设置为 cap.set(CAP_PROP_FRAME_WIDTH, 640); cap.set(CAP_PROP_FRAME_HEIGHT, 480);
     cap.set( cv::CAP_PROP_FRAME_WIDTH, IMAGE_WIDTH );
     cap.set( cv::CAP_PROP_FRAME_HEIGHT, IMAGE_HEIGHT );
+
+    //【修复-P1】摄像头确认打开成功后才开始采集
+    m_timer->start( 1000/FRAME_RATE - 10 );
 }
 
 void VideoRead::slot_closeVideo()

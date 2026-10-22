@@ -3,14 +3,15 @@
 #include<memory.h>
 
 #define _DEF_BUFFER         (4096)
-#define _DEF_CONTENT_SIZE	(1024)
 #define _MAX_SIZE           (40)
-#define _MAX_PATH           (260)
 
 //自定义协议   先写协议头 再写协议结构
 //登录 注册 获取好友信息 添加好友 聊天 发文件 下线请求
+//【修复-P3：双 IP 宏并存】删除遗留的 _DEF_SERVERIP（无任何引用，真正生效的是
+// INetMediator.h 的 _DEF_SERVER_IP，且已被 config.ini 动态覆盖）。
+// 误用陷阱消除。_DEF_PORT 仍被 ckernel.cpp 使用，保留。
+// 原代码: #define _DEF_SERVERIP   ("127.0.0.1")
 #define _DEF_PORT   (8000)
-#define _DEF_SERVERIP   ("127.0.0.1")
 
 
 
@@ -38,6 +39,7 @@
 //退出房间请求
 #define DEF_PACK_LEAVEROOM_RQ   (DEF_PACK_BASE + 11)
 //退出房间回复
+//【预留】协议号已分配但当前无收发实现（保留槽位，勿删否则后续编号错位）
 #define DEF_PACK_LEAVEROOM_RS   (DEF_PACK_BASE + 12)
 //音频注册
 #define DEF_PACK_AUDIO_REGISTER   (DEF_PACK_BASE + 13)
@@ -53,6 +55,7 @@
 //关键帧请求（PLI机制，新成员加入时触发）
 #define DEF_PACK_PLI_REQUEST       (DEF_PACK_BASE + 18)
 //SPS/PPS单独分发（可选，编码器默认inline模式可不使用）
+//【预留】SPS/PPS 单独分发，编码器默认 inline 模式，暂未使用
 #define DEF_PACK_VIDEO_SPSPPS      (DEF_PACK_BASE + 19)
 
 
@@ -168,11 +171,16 @@ typedef struct STRU_LOGIN_RS
         m_userid = 0;
         m_lresult = 0;
         memset(m_name , 0 , MAX_SIZE);
+        //【安全修复-P0：音视频通道劫持】
+        m_token = 0;
 	}
     PackType m_nType;//包类型
     int  m_userid;
     int  m_lresult;//注册结果
     char m_name[MAX_SIZE];//密码
+    //【安全修复-P0：音视频通道劫持】登录成功时服务端下发的会话令牌，
+    // 音/视频通道注册时原样带回（与服务端 packdef.h 保持一致）。
+    int m_token;
 
 }STRU_LOGIN_RS;
 
@@ -308,9 +316,13 @@ struct STRU_AUDIO_REGISTER
     STRU_AUDIO_REGISTER():m_nType(DEF_PACK_AUDIO_REGISTER)
     {
         m_userid = 0;
+        //【安全修复-P0：音视频通道劫持】
+        m_token = 0;
     }
     PackType m_nType;//包类型
     int m_userid;
+    //【安全修复-P0：音视频通道劫持】登录时下发的会话令牌
+    int m_token;
 
 };
 
@@ -320,9 +332,13 @@ struct STRU_VIDEO_REGISTER
     STRU_VIDEO_REGISTER():m_nType(DEF_PACK_VIDEO_REGISTER)
     {
         m_userid = 0;
+        //【安全修复-P0：音视频通道劫持】
+        m_token = 0;
     }
     PackType m_nType;//包类型
     int m_userid;
+    //【安全修复-P0：音视频通道劫持】登录时下发的会话令牌
+    int m_token;
 
 };
 

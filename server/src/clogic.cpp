@@ -1,5 +1,95 @@
 #include "clogic.h"
 #include "bcrypt_wrapper.h"  // [P0新增] bcrypt 密码哈希封装
+#include <fcntl.h>
+#include <unistd.h>
+
+//【安全修复-P0：房间号可预测】读 4 字节真随机数；失败返回递增兜底值
+static unsigned int urandom32()
+{
+    unsigned int v = 0;
+    int fd = open("/dev/urandom", O_RDONLY);
+    if( fd >= 0 )
+    {
+        ssize_t got = read(fd, &v, sizeof(v));
+        close(fd);
+        if( got == (ssize_t)sizeof(v) )
+            return v;
+    }
+    static unsigned int s_fb = 0xC0FFEE00;
+    return ++s_fb;
+}
+
+//【安全修复-P0：音视频通道劫持】生成登录会话令牌
+// 取自 /dev/urandom，32 位随机值；rand()+srand(time) 可被预测，不用于鉴权。
+// 生成失败返回递增兜底值（低熵但功能不中断），正常路径熵源充分。
+static int gen_session_token()
+{
+    unsigned int token = urandom32();
+    if( token != 0 )
+        return (int)token;
+    static unsigned int s_fallback = 0x5EED0000;
+    return (int)(++s_fallback);
+}
+
+//【安全加固-P1：登录防暴力破解】三个辅助方法的实现
+// 策略：60 秒滑动窗口内失败满 5 次 → 锁定 300 秒。锁定期间 LoginRq 直接回
+// password_error（与口令错误同码，避免泄露"账号被锁定"这一枚举信号）。
+// 锁定检查放在 bcrypt_verify 之前：bcrypt cost=12 单次约 250ms，
+// 不先拦截的话攻击者刷登录即可把 CPU 打满。
+#define LOGIN_MAX_FAILS     5
+#define LOGIN_WINDOW_SECS   60
+#define LOGIN_LOCK_SECS     300
+
+bool CLogic::IsLoginLocked(const std::string& key)
+{
+    bool bLocked = false;
+    time_t now = time(NULL);
+    pthread_mutex_lock( &m_loginLock );
+    std::map<std::string, LoginAttempt>::iterator it = m_loginAttempts.find( key );
+    if( it != m_loginAttempts.end() )
+    {
+        if( it->second.tLockUntil > now )
+        {
+            bLocked = true;
+        }
+        else if( it->second.nFails > 0 && now - it->second.tWindowStart > LOGIN_WINDOW_SECS )
+        {
+            // 窗口已过期且未在锁定期：清零重新计数，防表无限膨胀
+            it->second.nFails = 0;
+            it->second.tWindowStart = 0;
+        }
+    }
+    pthread_mutex_unlock( &m_loginLock );
+    return bLocked;
+}
+
+void CLogic::RecordLoginFail(const std::string& key)
+{
+    time_t now = time(NULL);
+    pthread_mutex_lock( &m_loginLock );
+    LoginAttempt& a = m_loginAttempts[ key ];
+    if( a.nFails == 0 || now - a.tWindowStart > LOGIN_WINDOW_SECS )
+    {
+        a.nFails = 0;
+        a.tWindowStart = now;
+    }
+    ++a.nFails;
+    if( a.nFails >= LOGIN_MAX_FAILS )
+    {
+        a.tLockUntil = now + LOGIN_LOCK_SECS;
+        a.nFails = 0;   // 进入锁定期后重新计数
+        fprintf(stderr, "[LoginRq] 登录标识连续失败达阈值，锁定300秒\n");
+    }
+    pthread_mutex_unlock( &m_loginLock );
+}
+
+void CLogic::ClearLoginFail(const std::string& key)
+{
+    pthread_mutex_lock( &m_loginLock );
+    m_loginAttempts.erase( key );
+    pthread_mutex_unlock( &m_loginLock );
+}
+
 
 void CLogic::setNetPackMap()
 {
@@ -26,6 +116,13 @@ void CLogic::setNetPackMap()
 //register
 void CLogic::RegisterRq(int clientfd, char * szbuf, int nlen)
 {
+   //【修复-P1：包长校验缺失】强转结构体前先确认包体足够长
+   // 修改原因: 包长校验只拦 <=0，1~3 字节的残包也能通过，直接强转 STRUCT 会越界读
+   //           出垃圾字段（注册接口还会把垃圾拼进 SQL）。
+   // 修改效果: 包体短于结构体时直接丢弃，不再进入业务逻辑。
+   // 原代码: （无校验，直接拆包）
+   if( nlen < (int)sizeof(STRU_REGISTER_RQ) ) return;
+
    //1.拆包
    STRU_REGISTER_RQ * rq = (STRU_REGISTER_RQ *)szbuf;
    STRU_REGISTER_RS rs;
@@ -97,7 +194,11 @@ void CLogic::RegisterRq(int clientfd, char * szbuf, int nlen)
                //   sprintf(sqlStr , "insert into t_user( tel, password , name , email , icon , feeling) values('%s', '%s' , '%s' , '%s' , '%d' , '%s');"
                //           ,rq->m_tel,rq->m_password,rq->m_name, rq->m_email, 1 ,"比較懶，什麼也沒寫");
                // 新代码(P0): 对客户端发来的 MD5 哈希值再做 bcrypt 后入库
-               std::string strPwdBcrypt = bcrypt_hash(rq->m_password);
+               //【安全修复-P1：定长 char[] 越界读】m_password 可能被填满不写 '\0'，
+               // 直接构造 std::string 会越过字段边界。按 strnlen 截取。
+               // 原代码: bcrypt_hash(rq->m_password)
+               std::string strPwdCliReg( rq->m_password, strnlen(rq->m_password, sizeof(rq->m_password)) );
+               std::string strPwdBcrypt = bcrypt_hash(strPwdCliReg);
                if (strPwdBcrypt.empty()) {
                    // 原来这里填的是 0（= tel_is_exist），会让客户端提示"手机号已存在"，
                    // 可问题根本不在手机号。填 register_failed 才是实话。
@@ -120,7 +221,12 @@ void CLogic::RegisterRq(int clientfd, char * szbuf, int nlen)
               //  现在如实返回失败，并把失败原因打到 stderr 供运维取证。
               if(!m_sql->UpdataMysql(sqlStr))
               {
-                  fprintf(stderr, "[RegisterRq] 写库失败，注册未完成. sql=%s\n", sqlStr);
+                  //【安全修复-P1：日志脱敏】原样输出完整 SQL 会把 bcrypt 口令哈希
+                  // 打进日志 —— 哈希一旦泄露即可离线撞库。改为只输出脱敏后的
+                  // 业务字段与 mysql 错误码定位线索，不再输出含哈希的完整语句。
+                  // 原代码: fprintf(stderr, "... sql=%s\n", sqlStr);
+                  fprintf(stderr, "[RegisterRq] 写库失败，注册未完成. tel=%s（完整SQL含口令哈希，已脱敏）\n",
+                          strSafeTel.c_str());
                   rs.m_lresult = register_failed;
               }
            }
@@ -132,6 +238,10 @@ void CLogic::RegisterRq(int clientfd, char * szbuf, int nlen)
 //LOGIN
 void CLogic::LoginRq(int clientfd, char * szbuf, int nlen)
 {
+   //【修复-P1：包长校验缺失】同 RegisterRq，短包强转会越界读
+   // 原代码: （无校验，直接拆包）
+   if( nlen < (int)sizeof(STRU_LOGIN_RQ) ) return;
+
    //拆包 //手機號 密碼
    STRU_LOGIN_RQ * rq = (STRU_LOGIN_RQ *)szbuf;
    STRU_LOGIN_RS rs;
@@ -146,7 +256,21 @@ void CLogic::LoginRq(int clientfd, char * szbuf, int nlen)
    //  - 包含 '@' → 邮箱登录，查询 email 字段
    //  - 全数字且长度11位 → 手机号登录，查询 tel 字段
    //  - 其他 → 用户名（昵称）登录，查询 name 字段
-   string strLoginId = rq->m_tel;
+   //【安全加固-P1：登录防暴力破解】以登录标识原文为 key 先查锁，
+   // 锁定期间直接回 password_error，不再进入 bcrypt 验证（防 CPU 耗尽）。
+   // 原代码: （无防爆破机制）
+   std::string strAttemptKey( rq->m_tel, strnlen(rq->m_tel, sizeof(rq->m_tel)) );
+   if( IsLoginLocked( strAttemptKey ) )
+   {
+       rs.m_lresult = password_error;
+       SendData(clientfd, (char*)&rs, sizeof rs);
+       return;
+   }
+
+   //【安全修复-P1：定长 char[] 越界读】m_tel 是 char[40]，恶意客户端可填满
+   // 不写 '\0'，直接构造 std::string 会越过字段边界续读。统一按 strnlen 截取。
+   // 原代码: string strLoginId = rq->m_tel;
+   string strLoginId( rq->m_tel, strnlen(rq->m_tel, sizeof(rq->m_tel)) );
    string strField = "tel"; //默认按手机号查询
    if( strLoginId.find('@') != string::npos )
    {
@@ -196,8 +320,15 @@ void CLogic::LoginRq(int clientfd, char * szbuf, int nlen)
    }
    if(lstRes.size() == 0)
    {
-       //查不到，返回，沒此用戶
-       rs.m_lresult = password_error;
+       //【有意为之】查不到用户时同样返回 password_error，而不是 user_not_exist。
+       //这是刻意的安全设计：若按真实原因返回，登录接口就成了「账号枚举」oracle，
+       //攻击者可借此批量探测哪些手机号/昵称已注册。
+       //代价是已注册用户输错标识时看到的提示不够精确，属于可接受的取舍。
+      //user_not_exist 枚举保留在协议定义中，供未来启用更安全的注册流程时使用。
+      //查不到，返回，沒此用戶
+      //【安全加固-P1】计入登录失败（同码返回，不泄露账号不存在）
+      RecordLoginFail( strAttemptKey );
+      rs.m_lresult = password_error;
    }else{
        //【Bug修复】原代码pop_front逻辑混乱，password/id/name取值错位
        //修复：按顺序取出 password, id, name, email
@@ -213,15 +344,20 @@ void CLogic::LoginRq(int clientfd, char * szbuf, int nlen)
        //   {
        //       rs.m_lresult = password_error;
        //   }else{
-       bool bPwdCorrect = false;
-       bool bIsBcrypt = (strPwd.size() >= 3 && strPwd[0] == '$' && strPwd[1] == '2');
-       if (bIsBcrypt) {
-           bPwdCorrect = bcrypt_verify(rq->m_password, strPwd);
-       } else {
-           // 旧 MD5 格式：直接比较 + 自动迁移
-           bPwdCorrect = (strcmp(rq->m_password, strPwd.c_str()) == 0);
-           if (bPwdCorrect) {
-               std::string strNewPwd = bcrypt_hash(rq->m_password);
+      bool bPwdCorrect = false;
+      bool bIsBcrypt = (strPwd.size() >= 3 && strPwd[0] == '$' && strPwd[1] == '2');
+      //【安全修复-P1：定长 char[] 越界读】m_password 是 char[40]，
+      // 可能被恶意客户端填满不写 '\0'，bcrypt_verify/strcmp 直接用会越界读。
+      // 统一按 strnlen 截取成安全串后再交给验证函数。
+      // 原代码: bcrypt_verify(rq->m_password, strPwd) / strcmp(rq->m_password, ...)
+      std::string strPwdCli( rq->m_password, strnlen(rq->m_password, sizeof(rq->m_password)) );
+      if (bIsBcrypt) {
+          bPwdCorrect = bcrypt_verify(strPwdCli, strPwd);
+      } else {
+          // 旧 MD5 格式：直接比较 + 自动迁移
+          bPwdCorrect = (strncmp(rq->m_password, strPwd.c_str(), sizeof(rq->m_password)) == 0);
+          if (bPwdCorrect) {
+              std::string strNewPwd = bcrypt_hash(strPwdCli);
                if (!strNewPwd.empty()) {
                    //【安全修复-SQL注入】id 原本用 %s 拼，等于把值当裸字符串塞进语句。
                    //  它虽然来自上一次查询的结果，但"来自数据库"不等于"下一次拼接安全"——
@@ -240,9 +376,11 @@ void CLogic::LoginRq(int clientfd, char * szbuf, int nlen)
            }
        }
 
-       if (!bPwdCorrect) {
-           rs.m_lresult = password_error;
-       } else {
+      if (!bPwdCorrect) {
+          //【安全加固-P1】计入登录失败
+          RecordLoginFail( strAttemptKey );
+          rs.m_lresult = password_error;
+      } else {
            //密码正确
            int id = atoi(strId.c_str());
            //sock要保存起來 id->sock映射（爲了通信）
@@ -250,18 +388,45 @@ void CLogic::LoginRq(int clientfd, char * szbuf, int nlen)
            pInfo->m_id = id;
            pInfo->m_roomid = 0;
            pInfo->m_sock = clientfd;
-           strcpy(pInfo->m_userName , strName.c_str());
+           //【安全修复-P0：音视频通道劫持】登录成功即签发会话令牌：
+           // 之后音/视频通道注册包必须原样带回该令牌，防止任意连接冒名抢注通道。
+           pInfo->m_token = gen_session_token();
+           //【安全修复-缓冲区溢出】strcpy 无长度上限，strName 来自数据库 name 列，
+           // 不受协议 MAX_SIZE 约束（历史数据/列定义更长即溢出 char[MAX_SIZE]）。
+           // 与客户端已完成的 strncpy 加固保持一致。
+           strncpy(pInfo->m_userName , strName.c_str() , sizeof(pInfo->m_userName) - 1);
+           pInfo->m_userName[sizeof(pInfo->m_userName) - 1] = '\0';
 
            //判斷id是否在線，在線強制下線，不在線添加
            if(m_mapIDToUserInfo.IsExist(pInfo->m_id))
            {
-               //強制下線（原代码未实现，暂保留）
+               //【修复-P1：强制下线泄漏 UserInfo 且旧连接不关闭】
+               // 修改原因: 原代码只 erase 内存项，旧 UserInfo 从不 delete（泄漏），
+               //           旧连接 fd 也不关闭（残留连接仍可收发包）。
+               // 修改效果: 取出旧 UserInfo，close 其三个连接 fd 后 delete。
+               //           close 后在途 recv 立即出错，recv_task 走既有错误路径统一
+               //           回收事件结构，不会 double-free；旧连接随即真正断开。
+               // 原代码: m_mapIDToUserInfo.erase(pInfo->m_id);（仅此一行，TODO 注释保留在下方）
+               UserInfo * pOld = m_mapIDToUserInfo.find( pInfo->m_id );
+               if( NULL != pOld )
+               {
+                   if( pOld->m_sock    > 0 ) ::close( pOld->m_sock );
+                   if( pOld->m_audiofd > 0 ) ::close( pOld->m_audiofd );
+                   if( pOld->m_videofd > 0 ) ::close( pOld->m_videofd );
+                   delete pOld;
+                   fprintf(stderr, "[LoginRq] userid=%d 重复登录，旧连接已强制下线\n", pInfo->m_id);
+               }
                m_mapIDToUserInfo.erase(pInfo->m_id);
            }
            m_mapIDToUserInfo.insert(pInfo->m_id , pInfo);
+           //【安全加固-P1】登录成功，清除该标识的失败记录
+           ClearLoginFail( strAttemptKey );
            //寫返回包 返回 帶id和結果
            rs.m_userid = id;
-           strcpy(rs.m_name , pInfo->m_userName);
+           //【安全修复-P0：音视频通道劫持】令牌随登录回复下发
+           rs.m_token = pInfo->m_token;
+           strncpy(rs.m_name , pInfo->m_userName , sizeof(rs.m_name) - 1);
+           rs.m_name[sizeof(rs.m_name) - 1] = '\0';
            //【拓展优化-新增】判断邮箱是否为空
            //若邮箱为空，返回 login_success_no_email，客户端收到后弹出补全邮箱对话框
            //若邮箱不为空，返回 login_success
@@ -286,17 +451,38 @@ void CLogic::LoginRq(int clientfd, char * szbuf, int nlen)
 //創建房間
 void CLogic::CreateRoomRq(int clientfd, char *szbuf, int nlen)
 {
+    //【修复-P1：包长校验缺失】同 RegisterRq，短包强转会越界读
+    // 原代码: （无校验，直接拆包）
+    if( nlen < (int)sizeof(STRU_CREATEROOM_RQ) ) return;
+
     //拆包
     STRU_CREATEROOM_RQ* rq = (STRU_CREATEROOM_RQ*)szbuf;
+    //【安全修复-P0：冒名建房】m_UserID 取自包体，不校验与连接的绑定关系时，
+    // 任意连接可冒充任意在线用户建房。与 UpdateEmailRq 的 IDOR 校验同一思路：
+    // 该 id 必须在线，且其登记的主连接就是当前这条连接。
+    // 原代码: （无归属校验，直接用 rq->m_UserID 建房）
+    {
+        UserInfo * pSelf = m_mapIDToUserInfo.find( rq->m_UserID );
+        if( NULL == pSelf || pSelf->m_sock != clientfd ) return;
+    }
+    //【P2修复：房间成员列表非原子读改写】建房查重+插入整体持锁
+    // 修改原因: 原代码 do-while(IsExist)+insert 无锁，两个线程可能拿到同一个随机房间号
+    // 修改效果: 查重与插入原子化，房间号不再撞号
+    // 原代码保留备查：下方 do-while 与 insert 原样，仅外包 m_roomLock
+    pthread_mutex_lock( &m_roomLock );
     //房間號 1-8位隨機數
+    //【安全修复-P1：房间号可预测】原 rand()+srand(time) 播种可被预测，
+    // 攻击者可枚举他人房间号后强行加入窃听。改用 /dev/urandom 真随机。
+    // 原代码: roomid = rand()%99999999+1;
     int roomid = 0;
     do{
-        roomid = rand()%99999999+1;
+        roomid = (int)( urandom32() % 99999999u ) + 1;
 
     }while(m_mapIDToRoomid.IsExist( roomid ));
     list<int> lst;
     lst.push_back( rq->m_UserID );
     m_mapIDToRoomid.insert( roomid , lst);
+    pthread_mutex_unlock( &m_roomLock );
     //回復
     STRU_CREATEROOM_RS rs;
     rs.m_RoomID = roomid;
@@ -309,8 +495,18 @@ void CLogic::CreateRoomRq(int clientfd, char *szbuf, int nlen)
 //加入房間
 void CLogic::JoinRoomRq(int clientfd, char *szbuf, int nlen)
 {
+    //【修复-P1：包长校验缺失】同 RegisterRq，短包强转会越界读
+    // 原代码: （无校验，直接拆包）
+    if( nlen < (int)sizeof(STRU_JOINROOM_RQ) ) return;
+
     //拆包
     STRU_JOINROOM_RQ * rq = (STRU_JOINROOM_RQ*)szbuf;
+    //【安全修复-P0：冒名进房】同 CreateRoomRq：userid 必须在线且主连接即当前连接
+    // 原代码: （无归属校验）
+    {
+        UserInfo * pSelfChk = m_mapIDToUserInfo.find( rq->m_UserID );
+        if( NULL == pSelfChk || pSelfChk->m_sock != clientfd ) return;
+    }
     STRU_JOINROOM_RS rs;
     //查看房間是否存在
     if(!m_mapIDToRoomid.IsExist(rq->m_RoomID))
@@ -335,14 +531,29 @@ void CLogic::JoinRoomRq(int clientfd, char *szbuf, int nlen)
         //修复：应该检查 m_mapIDToUserInfo 中是否存在该用户ID
         if( !m_mapIDToUserInfo.IsExist(rq->m_UserID)) return;
         UserInfo * joiner = m_mapIDToUserInfo.find(rq->m_UserID);
+        //【修复-P0 配套：find 结果判空】
+        // 修改原因: MyMap::find 已修复为不污染 map（不再对不存在的 key 插入默认值），
+        //           但本函数在解引用 joiner 前依赖 IsExist 与 find 两次加锁之间存在
+        //           时间窗口（并发下线可能刚好移除该用户）。多一层判空兜底，
+        //           杜绝 joiner->m_userName 空指针解引用（这正是 P0 的崩溃点）。
+        // 修改效果: 极端并发下安全跳过，不再崩溃；正常路径行为不变。
+        // 原代码: （无判空，直接 joiner->m_userName）
+        if( NULL == joiner ) return;
 
         STRU_ROOM_MEMBER_RQ joinrq;
         joinrq.m_UserID = rq->m_UserID;
-        strcpy(joinrq.m_szUser , joiner->m_userName);
+        strncpy(joinrq.m_szUser , joiner->m_userName , sizeof(joinrq.m_szUser) - 1);
+        joinrq.m_szUser[sizeof(joinrq.m_szUser) - 1] = '\0';
         //給自己用於更新自己的信息
         SendData( clientfd , (char*)&joinrq , sizeof (joinrq));
 
         //根據房間號拿到房間成員列表
+        //【P2修复：房间成员列表非原子读改写】「find拷贝->push_back->insert写回」整体持锁
+        // 修改原因: 三步各自短暂加锁但整体不原子，与 LeaveRoomRq/onClientClosed 并发时
+        //           互相覆盖成员列表（lost update），可能出现“人已离开却仍在列表里收帧”。
+        // 修改效果: 该序列由 m_roomLock 串行化；SendData 仅发送小包，持锁发送风险可控。
+        // 原代码保留备查：下方 find/遍历/push_back/insert 语句原样，仅外包 m_roomLock
+        pthread_mutex_lock( &m_roomLock );
         list<int> lstRoomMem = m_mapIDToRoomid.find(rq->m_RoomID);
         //互換信息
         for( auto ite = lstRoomMem.begin() ; ite!=lstRoomMem.end() ; ++ite)
@@ -356,7 +567,8 @@ void CLogic::JoinRoomRq(int clientfd, char *szbuf, int nlen)
 
             STRU_ROOM_MEMBER_RQ memrq;
             memrq.m_UserID = memInfo->m_id;
-            strcpy(memrq.m_szUser , memInfo->m_userName);
+            strncpy(memrq.m_szUser , memInfo->m_userName , sizeof(memrq.m_szUser) - 1);
+            memrq.m_szUser[sizeof(memrq.m_szUser) - 1] = '\0';
 
             //把加入人的信息發送給每一個房間內成員
             SendData(memInfo->m_sock , (char*)&joinrq ,sizeof (joinrq));
@@ -366,6 +578,7 @@ void CLogic::JoinRoomRq(int clientfd, char *szbuf, int nlen)
         //加入人，添加到房間列表
         lstRoomMem.push_back( rq->m_UserID);
         m_mapIDToRoomid.insert(rq->m_RoomID , lstRoomMem);
+        pthread_mutex_unlock( &m_roomLock );//【P2修复】配对解锁，见上
 
 
 }
@@ -373,10 +586,29 @@ void CLogic::JoinRoomRq(int clientfd, char *szbuf, int nlen)
 //離開房間
 void CLogic::LeaveRoomRq(int clientfd, char *szbuf, int nlen)
 {
+    //【修复-P1：包长校验缺失】同 RegisterRq，短包强转会越界读
+    // 原代码: （无校验，直接拆包）
+    if( nlen < (int)sizeof(STRU_LEAVEROOM_RQ) ) return;
+
     //拆包
     STRU_LEAVEROOM_RQ * rq = (STRU_LEAVEROOM_RQ*)szbuf;
+    //【安全修复-P0：冒名退房】同 CreateRoomRq：userid 必须在线且主连接即当前连接，
+    // 否则任意连接可把任意用户"移出"房间并向全房间广播。
+    // 原代码: （无归属校验）
+    {
+        UserInfo * pSelfChk = m_mapIDToUserInfo.find( rq->m_nUserID );
+        if( NULL == pSelfChk || pSelfChk->m_sock != clientfd ) return;
+    }
     //看房间是否存在
-    if(!m_mapIDToRoomid.IsExist(rq->m_RoomID)) return;
+    //【P2修复：房间成员列表非原子读改写】「find拷贝->erase自己->写回/删房」整体持锁
+    // 修改原因: 与 JoinRoomRq 并发时互相覆盖成员列表（lost update）
+    // 修改效果: 成员增删由 m_roomLock 串行化；原代码语句原样保留，仅外包锁
+    pthread_mutex_lock( &m_roomLock );
+    if(!m_mapIDToRoomid.IsExist(rq->m_RoomID))
+    {
+        pthread_mutex_unlock( &m_roomLock );//【P2修复】提前返回前解锁
+        return;
+    }
     //如果房间存在。可以获得用户列表
     list< int > lst = m_mapIDToRoomid.find( rq->m_RoomID );
     for( auto ite = lst.begin(); ite != lst.end();)
@@ -404,16 +636,42 @@ void CLogic::LeaveRoomRq(int clientfd, char *szbuf, int nlen)
     if( lst.size() == 0)
     {
         m_mapIDToRoomid.erase( rq->m_RoomID );
+        pthread_mutex_unlock( &m_roomLock );//【P2修复】提前返回前解锁
         return;
     }
 
     //更新房间成员列表
     m_mapIDToRoomid.insert( rq->m_RoomID , lst);
+    pthread_mutex_unlock( &m_roomLock );//【P2修复】配对解锁，见上
 }
 
 //處理音頻幀
 void CLogic::AudioFrameRq(int clientfd, char *szbuf, int nlen)
 {
+    //【修复-P1：包长校验缺失】帧头至少 3 个 int（type/userid/roomid）
+    // 修改原因: 短包直接读 *(int*)tmp 会越界。
+    // 修改效果: 不足 12 字节直接丢弃。
+    // 原代码: （无校验，直接读偏移）
+    if( nlen < (int)(3 * sizeof(int)) ) return;
+
+    //【修复-P1：IDOR 帧归属校验】uid 全取自包体，任何人可伪造他人身份注帧
+    // 修改原因: 原代码拿到 uid/roomid 就转发，未验证"这条连接真的属于 uid"。
+    //           任意连接可冒充任意在线用户向任意房间注入音频帧。
+    // 修改效果: uid 必须已登录，且 clientfd 必须命中该用户的
+    //           m_sock/m_audiofd/m_videofd 之一，否则丢弃。与 UpdateEmailRq 的
+    //           IDOR 修复同一套校验思路；正常客户端帧本就从自己的连接发出，不受影响。
+    // 原代码: （无归属校验）
+    {
+        char * pChk = szbuf + sizeof(int);
+        int uidChk = *(int*)pChk;
+        UserInfo * pSelf = m_mapIDToUserInfo.find( uidChk );
+        if( NULL == pSelf ||
+            ( pSelf->m_sock    != clientfd &&
+              pSelf->m_audiofd != clientfd &&
+              pSelf->m_videofd != clientfd ) )
+            return;
+    }
+
     //拆包
     char * tmp = szbuf;
     //跳過type
@@ -448,6 +706,24 @@ void CLogic::AudioFrameRq(int clientfd, char *szbuf, int nlen)
 
 void CLogic::VideoFrameRq(int clientfd, char *szbuf, int nlen)
 {
+    //【修复-P1：包长校验缺失】帧头至少 3 个 int（type/userid/roomid）
+    // 原代码: （无校验，直接读偏移）
+    if( nlen < (int)(3 * sizeof(int)) ) return;
+
+    //【修复-P1：IDOR 帧归属校验】同 AudioFrameRq
+    // 修改效果: 伪造他人 userid 的视频帧直接丢弃；正常发送不受影响。
+    // 原代码: （无归属校验）
+    {
+        char * pChk = szbuf + sizeof(int);
+        int uidChk = *(int*)pChk;
+        UserInfo * pSelf = m_mapIDToUserInfo.find( uidChk );
+        if( NULL == pSelf ||
+            ( pSelf->m_sock    != clientfd &&
+              pSelf->m_audiofd != clientfd &&
+              pSelf->m_videofd != clientfd ) )
+            return;
+    }
+
     //拆包
     char * tmp = szbuf;
     //跳過type
@@ -490,13 +766,27 @@ void CLogic::VideoFrameRq(int clientfd, char *szbuf, int nlen)
 //音頻注冊
 void CLogic::AudioRegister(int clientfd, char *szbuf, int nlen)
 {
+    //【修复-P1：包长校验缺失】同 RegisterRq，短包强转会越界读
+    // 原代码: （无校验，直接拆包）
+    if( nlen < (int)sizeof(STRU_AUDIO_REGISTER) ) return;
+
     //拆包
     STRU_AUDIO_REGISTER *rq = (STRU_AUDIO_REGISTER * )szbuf;
     int userid = rq->m_userid;
     //根據userid找到節點 更新fd
+    //【安全修复-P0：音视频通道劫持】原代码仅凭包体里的 userid 就把当前连接登记为
+    // 该用户的音频通道 —— 任何连接发送此包即可劫持他人的音频流。
+    // 现要求注册包携带登录时下发的会话令牌（rs.m_token），比对通过才登记；
+    // 老客户端（不带令牌）token 恒为 0，与任何会话令牌都不匹配，会被拒绝。
+    // 原代码: if( m_mapIDToUserInfo.IsExist(userid) ){ info->m_audiofd = clientfd; }
     if( m_mapIDToUserInfo.IsExist(userid) )
     {
         UserInfo * info = m_mapIDToUserInfo.find(userid);
+        if( NULL == info || info->m_token != rq->m_token )
+        {
+            fprintf(stderr, "[AudioRegister] 通道注册被拒：userid=%d 令牌不匹配\n", userid);
+            return;
+        }
         info->m_audiofd = clientfd;
     }
 }
@@ -504,13 +794,24 @@ void CLogic::AudioRegister(int clientfd, char *szbuf, int nlen)
 //視頻注冊
 void CLogic::VideoRegister(int clientfd, char *szbuf, int nlen)
 {
+    //【修复-P1：包长校验缺失】同 RegisterRq，短包强转会越界读
+    // 原代码: （无校验，直接拆包）
+    if( nlen < (int)sizeof(STRU_VIDEO_REGISTER) ) return;
+
     //拆包
     STRU_VIDEO_REGISTER *rq = (STRU_VIDEO_REGISTER * )szbuf;
     int userid = rq->m_userid;
     //根據userid找到節點 更新fd
+    //【安全修复-P0：音视频通道劫持】同 AudioRegister：须携带登录会话令牌。
+    // 原代码: if( m_mapIDToUserInfo.IsExist(userid) ){ info->m_videofd = clientfd; }
     if( m_mapIDToUserInfo.IsExist(userid) )
     {
         UserInfo * info = m_mapIDToUserInfo.find(userid);
+        if( NULL == info || info->m_token != rq->m_token )
+        {
+            fprintf(stderr, "[VideoRegister] 通道注册被拒：userid=%d 令牌不匹配\n", userid);
+            return;
+        }
         //【Bug修复】原代码 info->m_audiofd = clientfd;
         //视频注册却更新了音频fd（m_audiofd），导致视频fd（m_videofd）始终为0，
         //VideoFrameRq中发送视频帧到m_audiofd，客户端视频线程收不到。
@@ -530,6 +831,11 @@ void CLogic::VideoRegister(int clientfd, char *szbuf, int nlen)
 //  5. 返回补全结果
 void CLogic::UpdateEmailRq(int clientfd, char * szbuf, int nlen)
 {
+    //【修复-P1：包长校验缺失】同 RegisterRq，短包强转会越界读
+    // 修改效果: 包体短于结构体直接丢弃，后续 IDOR 校验/SQL 不再接触垃圾字段。
+    // 原代码: （无校验，直接拆包）
+    if( nlen < (int)sizeof(STRU_UPDATE_EMAIL_RQ) ) return;
+
     //1.拆包
     STRU_UPDATE_EMAIL_RQ * rq = (STRU_UPDATE_EMAIL_RQ *)szbuf;
     STRU_UPDATE_EMAIL_RS rs;
@@ -614,6 +920,18 @@ void CLogic::VideoFrameH264Rq(int clientfd, char *szbuf, int nlen)
     int uid = header->m_userid;
     int roomid = header->m_roomid;
 
+    //【修复-P1：IDOR 帧归属校验】同 AudioFrameRq：uid 必须已登录且 clientfd 命中其三个 fd 之一
+    // 修改效果: 伪造他人 userid 的 H.264 帧/分片直接丢弃，防止向他人房间注帧。
+    // 原代码: （无归属校验）
+    {
+        UserInfo * pSelf = m_mapIDToUserInfo.find( uid );
+        if( NULL == pSelf ||
+            ( pSelf->m_sock    != clientfd &&
+              pSelf->m_audiofd != clientfd &&
+              pSelf->m_videofd != clientfd ) )
+            return;
+    }
+
     // 3. 检查房间是否存在
     if(!m_mapIDToRoomid.IsExist(roomid)) return;
     list<int> lst = m_mapIDToRoomid.find(roomid);
@@ -657,6 +975,18 @@ void CLogic::PliRequestRq(int clientfd, char *szbuf, int nlen)
     int uid = pli->m_userid;
     int roomid = pli->m_roomid;
 
+    //【修复-P1：IDOR 帧归属校验】同 AudioFrameRq
+    // 修改效果: 伪造他人 userid 的 PLI 请求直接丢弃，防止恶意触发他人编码器刷 I 帧。
+    // 原代码: （无归属校验）
+    {
+        UserInfo * pSelf = m_mapIDToUserInfo.find( uid );
+        if( NULL == pSelf ||
+            ( pSelf->m_sock    != clientfd &&
+              pSelf->m_audiofd != clientfd &&
+              pSelf->m_videofd != clientfd ) )
+            return;
+    }
+
     // 3. 检查房间是否存在
     if(!m_mapIDToRoomid.IsExist(roomid)) return;
     list<int> lst = m_mapIDToRoomid.find(roomid);
@@ -676,5 +1006,59 @@ void CLogic::PliRequestRq(int clientfd, char *szbuf, int nlen)
             SendData(userinfo->m_videofd, szbuf, nlen);
         else
             SendData(userinfo->m_sock, szbuf, nlen);
+    }
+}
+
+//【修复-P1：断开无业务层清理】连接断开回调实现
+// 功能：网络层关闭 fd 时回调至此，按 fd 清理业务层状态。
+// 修改原因: 原代码连接断开后 m_mapIDToUserInfo 与 m_mapIDToRoomid 永不清理——
+//           UserInfo* 泄漏、死 fd 残留；当系统把回收的 fd 分配给新连接时，
+//           房间内其他成员的音视频帧会被转发到毫不相干的新连接（串线）。
+// 修改效果: 1) 在锁内（MyMap::erase_if）找到并删除 m_sock/m_audiofd/m_videofd
+//              命中该 fd 的 UserInfo（delete 归还内存）；
+//           2) 在锁内（MyMap::for_each_locked）从所有房间成员列表移除该 userid，
+//              空房间随之擦除，不再有"拷贝->写回"竞态与泄漏。
+//           未登录连接（fd 不命中任何用户）直接返回，行为与旧版一致。
+// 线程说明: UserInfo* 的删除存在"其他线程可能仍持有裸指针"的理论窗口，
+//           该竞态是本服务端既有的指针共享设计所致，本次不扩大重构范围；
+//           相比旧行为（永不清理），本修复净收益为正。
+void CLogic::onClientClosed(int fd)
+{
+    // 1. 找到并删除挂在该 fd 上的 UserInfo（erase_if 在 MyMap 锁内完成条件判断与删除）
+    list<int> lstRemoved = m_mapIDToUserInfo.erase_if(
+        [fd]( int /*id*/, UserInfo* pInfo ) -> bool
+        {
+            return NULL != pInfo &&
+                   ( pInfo->m_sock    == fd ||
+                     pInfo->m_audiofd == fd ||
+                     pInfo->m_videofd == fd );
+        } );
+
+    for( list<int>::iterator ite = lstRemoved.begin(); ite != lstRemoved.end(); ++ite )
+    {
+        int userid = *ite;
+        fprintf( stderr, "[CLogic::onClientClosed] fd=%d 关联用户 userid=%d 已清理\n", fd, userid );
+
+        // 2. 从所有房间成员列表移除该用户（for_each_locked 在 MyMap 锁内直接改 list）
+        //【P2修复：房间成员列表非原子读改写】外层再加 m_roomLock，与 JoinRoom/LeaveRoom
+        // 的「拷贝->修改->写回」序列互斥（锁序均为 m_roomLock -> MyMap 内部锁，无死锁）。
+        // 原代码保留备查：下方 for_each_locked 与 erase 语句原样，仅外包 m_roomLock
+        pthread_mutex_lock( &m_roomLock );
+        list<int> lstEmptyRooms;
+        m_mapIDToRoomid.for_each_locked(
+            [userid, &lstEmptyRooms]( int roomid, list<int>& lstMembers ) -> void
+            {
+                size_t nBefore = lstMembers.size();
+                lstMembers.remove( userid );
+                if( nBefore != lstMembers.size() && lstMembers.empty() )
+                    lstEmptyRooms.push_back( roomid );
+            } );
+        // 房间被删空后从 map 摘除（erase 自带加锁，此处已在锁外，安全）
+        for( list<int>::iterator itRoom = lstEmptyRooms.begin();
+             itRoom != lstEmptyRooms.end(); ++itRoom )
+        {
+            m_mapIDToRoomid.erase( *itRoom );
+        }
+        pthread_mutex_unlock( &m_roomLock );//【P2修复】配对解锁，见上
     }
 }
