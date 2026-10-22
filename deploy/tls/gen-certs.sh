@@ -52,7 +52,7 @@ openssl req -newkey rsa:2048 -nodes \
 
 # SAN：同时支持 IP 与 DNS，避免客户端校验主机名失败
 #【P2修复：TLS SAN 缺 IP 条目】
-# 修改原因: 原固定只写 IP.1=127.0.0.1；当 SERVER_CN 是 IP（如 192.0.2.10）时
+# 修改原因: 原固定只写 IP.1=127.0.0.1；当 SERVER_CN 是 IP（如 192.0.2.10，示例用 TEST-NET 地址）时
 #           它被塞进 DNS.1，客户端按 IP 直连时主机名校验必失败。
 # 修改效果: 判断 SERVER_CN 形态——IP 则写入 IP 条目，域名则写入 DNS 条目。
 # 原代码保留备查：
