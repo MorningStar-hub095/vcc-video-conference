@@ -1,0 +1,134 @@
+﻿<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>WeChat - 业务流程图</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:"Microsoft YaHei",sans-serif;background:#f5f7fa;padding:40px}
+.container{max-width:1200px;margin:0 auto;background:white;border-radius:12px;box-shadow:0 4px 20px rgba(0,0,0,.08);overflow:hidden}
+.header{background:linear-gradient(135deg,#1a73e8,#0d47a1);color:white;padding:30px 40px}
+.header h1{font-size:26px;margin-bottom:6px}
+.header p{font-size:13px;opacity:.85}
+.section{padding:30px 40px}
+.section h2{font-size:18px;color:#1a73e8;margin-bottom:15px;padding-bottom:8px;border-bottom:2px solid #e8eaed}
+.mermaid{display:flex;justify-content:center;overflow-x:auto;margin:20px 0}
+.desc{background:#f8f9fa;border-left:4px solid #1a73e8;padding:12px 16px;margin:15px 0;font-size:13px;line-height:1.8;border-radius:0 6px 6px 0}
+.footer{text-align:center;padding:15px;color:#999;font-size:11px;border-top:1px solid #eee}
+@media print{body{padding:0;background:white}.container{box-shadow:none}}
+</style>
+</head>
+<body>
+<div class="container">
+<div class="header">
+<h1>WeChat 音视频会议系统 - 业务流程图</h1>
+<p>描述系统核心业务流程：用户登录、房间管理、音视频通信的完整业务链路</p>
+</div>
+
+<div class="section">
+<h2>一、用户登录/注册流程</h2>
+<div class="mermaid">
+flowchart TD
+    A([用户启动客户端]) --> B{已有账号?}
+    B -->|是| C[输入手机号+密码]
+    B -->|否| D[输入手机号+密码+用户名]
+    C --> E[MD5加盐哈希密码]
+    D --> F[MD5加盐哈希密码]
+    E --> G[TCP发送登录请求<br/>DEF_PACK_LOGIN_RQ]
+    F --> H[TCP发送注册请求<br/>DEF_PACK_REGISTER_RQ]
+    G --> I{服务端验证}
+    H --> J{服务端处理}
+    I -->|密码正确| K[返回登录成功<br/>用户ID+用户名+头像]
+    I -->|密码错误/用户不存在| L[返回错误码<br/>tel_not_exist/password_error]
+    J -->|手机号未注册| M[插入数据库<br/>返回注册成功]
+    J -->|手机号已存在| N[返回user_is_exist]
+    K --> O[关闭登录窗口<br/>显示主界面]
+    L --> C
+    M --> C
+    N --> D
+</div>
+<div class="desc">
+<strong>关键数据结构：</strong>STRU_LOGIN_RQ (type+tel+password) → STRU_LOGIN_RS (type+result+userId+userName+icon)<br/>
+<strong>数据库操作：</strong>SELECT tel,password FROM t_user WHERE tel=? → 验证MD5哈希
+</div>
+</div>
+
+<div class="section">
+<h2>二、房间管理流程</h2>
+<div class="mermaid">
+flowchart TD
+    A([主界面]) --> B{用户选择}
+    B -->|创建房间| C[TCP发送创建请求]
+    B -->|加入房间| D[输入房间号并校验格式]
+    C --> E[服务端分配roomId]
+    D --> F[TCP发送加入请求]
+    E --> G[返回roomId和成员列表]
+    F --> H{房间存在?}
+    H -->|是| I[返回roomId和成员列表]
+    H -->|否| J[返回房间不存在]
+    G --> K[创建RoomDialog]
+    I --> L[创建RoomDialog]
+    I --> M[服务端通知房间内其他成员]
+    M --> N[其他成员添加新成员窗口]
+    J --> D
+    K --> O[开启音视频采集]
+    L --> O
+</div>
+<div class="desc">
+<strong>房间状态：</strong>服务端维护 roomId → list&lt;userId&gt; 映射，支持多人同时在线<br/>
+<strong>退出流程：</strong>用户退出时服务端广播 DEF_PACK_LEAVEROOM_RQ 给其他成员
+</div>
+</div>
+
+<div class="section">
+<h2>三、音视频通信流程</h2>
+<div class="mermaid">
+flowchart TD
+    subgraph 发送端
+        A1[麦克风 SDL采集<br/>48kHz/20ms] --> A2[WebRTC VAD<br/>静音检测]
+        A2 --> A3[Opus编码<br/>VOIP+DTX+FEC]
+        A3 --> A4[SIG_audioFrame信号]
+        A4 --> A5[ckernel序列化<br/>type+userId+roomId+timestamp+data]
+        A5 --> A6[TCP发送至<br/>音频连接 m_pAVClient1]
+
+        V1[摄像头 OpenCV<br/>320x240/30fps] --> V2{H.264可用?}
+        V2 -->|是| V3[H264Encoder<br/>NVENC→QSV→libx264]
+        V2 -->|否| V4[JPEG软编码<br/>qt_image2jpg]
+        V3 --> V5[分片4KB<br/>DEF_PACK_VIDEO_FRAME_H264]
+        V4 --> V6[DEF_PACK_VIDEO_FRAME]
+        V5 --> V7[TCP发送至<br/>视频连接 m_pAVClient2]
+        V6 --> V7
+    end
+
+    subgraph 服务端
+        S1[接收音频包] --> S2[查找房间成员列表]
+        S2 --> S3[转发给除发送者外<br/>的所有成员]
+        S4[接收视频包] --> S5[查找房间成员列表]
+        S5 --> S6[转发给除发送者外<br/>的所有成员]
+    end
+
+    subgraph 接收端
+        R1[TCP接收音频] --> R2[Opus解码]
+        R2 --> R3[SDL播放<br/>48kHz回调]
+
+        R4[TCP接收视频] --> R5{H.264?}
+        R5 -->|是| R6[分片重组<br/>H264Decoder解码]
+        R5 -->|否| R7[JPEG解码]
+        R6 --> R8[AVSyncManager<br/>音频主时钟同步]
+        R7 --> R8
+        R8 --> R9[OpenGL渲染<br/>YUV420P三纹理/QT纹理]
+    end
+
+    A6 --> S1
+    V7 --> S4
+    S3 --> R1
+    S6 --> R4
+</div>
+</div>
+
+<div class="footer">WeChat 音视频会议系统 - 业务流程图 | 生成时间：2026-07-23</div>
+</div>
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10.9.1/dist/mermaid.min.js"></script>
+<script>mermaid.initialize({startOnLoad:true,theme:'default',securityLevel:'loose',flowchart:{useMaxWidth:false,htmlLabels:true}})</script>
+</body>
+</html>

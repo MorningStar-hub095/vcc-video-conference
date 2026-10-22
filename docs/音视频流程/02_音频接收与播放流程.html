@@ -1,0 +1,955 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<style>
+    body {
+        font-family: 'Microsoft YaHei', 'SimHei', sans-serif;
+        line-height: 1.8;
+        color: #333;
+        max-width: 100%;
+        padding: 20px;
+    }
+    h1 { color: #1a5276; font-size: 22px; border-bottom: 2px solid #1a5276; padding-bottom: 8px; margin-top: 30px; }
+    h2 { color: #2c3e50; font-size: 18px; margin-top: 25px; }
+    h3 { color: #34495e; font-size: 16px; margin-top: 20px; }
+    table { border-collapse: collapse; width: 100%; margin: 15px 0; font-size: 12px; }
+    th, td { border: 1px solid #ddd; padding: 6px 10px; text-align: left; }
+    th { background-color: #f2f2f2; font-weight: bold; }
+    tr:nth-child(even) { background-color: #f9f9f9; }
+    pre { background: #f5f5f5; padding: 12px; border-radius: 5px; overflow-x: auto; font-size: 11px; }
+    code { background: #f0f0f0; padding: 1px 4px; border-radius: 3px; font-size: 12px; }
+    pre code { background: none; padding: 0; }
+    .mermaid { margin: 15px 0; text-align: center; }
+    strong { color: #2c3e50; }
+    hr { border: none; border-top: 1px solid #ddd; margin: 20px 0; }
+    blockquote { border-left: 4px solid #3498db; margin: 10px 0; padding: 5px 15px; background: #eef6fb; font-size: 13px; }
+    ul, ol { padding-left: 25px; }
+    li { margin: 3px 0; }
+    p { margin: 8px 0; }
+</style>
+</head>
+<body>
+<h1 id="音频接收与播放流程">音频接收与播放流程</h1>
+<h2 id="1-概述">1. 概述</h2>
+<h3 id="11-职责">1.1 职责</h3>
+<p>音频接收与播放模块负责将远端用户通过网络传输过来的 Opus 编码音频数据进行接收、缓冲、解码并最终通过扬声器播放。整体流程为：</p>
+<blockquote>
+<p><strong>TCP 接收线程</strong> → <strong>协议分发</strong> → <strong>Qt 信号槽传递</strong> → <strong>音频队列缓冲</strong> → <strong>SDL 回调线程 Opus 解码</strong> → <strong>PCM 混音输出至扬声器</strong></p>
+</blockquote>
+<h3 id="12-关键文件">1.2 关键文件</h3>
+<table>
+<thead>
+<tr>
+<th>文件</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>AudioApi/audiowrite.h</code></td>
+<td>AudioWrite 类声明，定义了 SDL 音频设备、Opus 解码器、音频队列等核心成员</td>
+</tr>
+<tr>
+<td><code>AudioApi/audiowrite.cpp</code></td>
+<td>AudioWrite 类实现，包含构造/析构、音频入队槽函数、SDL 回调解码播放</td>
+</tr>
+<tr>
+<td><code>ckernel.cpp</code></td>
+<td>内核模块，负责 TCP 数据接收、协议分发、将音频帧通过信号发送给 AudioWrite</td>
+</tr>
+</tbody></table>
+<hr>
+<h2 id="2-流程图">2. 流程图</h2>
+<div class="mermaid">flowchart TD
+    A[TCP 接收线程] -->|网络数据到达| B[ckernel::slot_dealData]
+    B -->|协议映射表分发| C[ckernel::slot_dealAudioFrameRq]
+    C -->|提取音频数据<br>更新远程用户音频时钟| D[emit m_pAudioWrite->slot_playAudio]
+    D -->|Qt 信号槽<br>跨线程安全传递| E[AudioWrite::slot_playAudio]
+    E -->|std::mutex 加锁| F[入队 m_audioQueue<br>emplace_back]
+    F -->|SDL 回调线程<br>每 960 samples 触发| G[AudioWrite::audioCallback]
+    G -->|std::mutex 加锁<br>pop_front 出队| H[取出队列首帧]
+    H --> I[Opus 解码<br>60-120 字节 → 960 samples × 2 bytes = 1920 字节 PCM]
+    I --> J[SDL_MixAudioFormat<br>混音至输出缓冲区]
+    J --> K[扬声器播放]
+</div><hr>
+<h2 id="3-关键代码文件表格">3. 关键代码文件表格</h2>
+<table>
+<thead>
+<tr>
+<th>文件路径</th>
+<th>语言</th>
+<th>作用</th>
+<th>核心类/函数</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>AudioApi/audiowrite.h</code></td>
+<td>C++ 头文件</td>
+<td>AudioWrite 类声明，定义所有成员变量和方法</td>
+<td><code>class AudioWrite</code></td>
+</tr>
+<tr>
+<td><code>AudioApi/audiowrite.cpp</code></td>
+<td>C++ 源文件</td>
+<td>音频播放核心实现：Opus 解码器创建、SDL 播放设备管理、音频队列管理、回调解码播放</td>
+<td><code>AudioWrite()</code>、<code>~AudioWrite()</code>、<code>slot_playAudio()</code>、<code>audioCallback()</code></td>
+</tr>
+<tr>
+<td><code>ckernel.cpp</code></td>
+<td>C++ 源文件</td>
+<td>网络数据接收与协议分发，将音频帧转发给 AudioWrite</td>
+<td><code>slot_dealData()</code>、<code>slot_dealAudioFrameRq()</code></td>
+</tr>
+</tbody></table>
+<hr>
+<h2 id="4-完整代码逐行解析">4. 完整代码逐行解析</h2>
+<h3 id="41-audiowriteh--audiowrite-类声明">4.1 audiowrite.h — AudioWrite 类声明</h3>
+<pre><code class="language-cpp">#ifndef AUDIOWRITE_H          // 头文件保护宏：防止该头文件被重复包含，避免重复定义编译错误
+#define AUDIOWRITE_H          // 定义 AUDIOWRITE_H 宏，标记该头文件已被包含
+
+#include &lt;QObject&gt;            // 引入 Qt 核心基类 QObject，提供信号槽机制、对象树管理等功能
+#include &quot;World.h&quot;            // 引入全局头文件 World.h，其中包含 Opus、SDL 等库的头文件引用
+
+// AudioWrite 类：音频播放核心类
+// 继承自 QObject，使用 Qt 信号槽机制实现跨线程音频数据传递
+class AudioWrite : public QObject
+{
+    Q_OBJECT                  // Qt 元对象宏：启用信号槽机制、动态属性系统等 Qt 元对象功能
+                              // 该宏会在 moc（元对象编译器）阶段自动生成额外代码
+
+public:
+    // 构造函数
+    // 参数 parent：QObject 父对象指针，默认为 nullptr
+    // explicit 关键字：禁止隐式类型转换，防止编译器进行意外的隐式构造
+    // 功能：初始化 Opus 解码器、打开 SDL 音频播放设备
+    explicit AudioWrite(QObject *parent = nullptr);
+
+    // 析构函数
+    // 功能：释放 SDL 音频设备资源、销毁 Opus 解码器
+    ~AudioWrite();
+
+signals:
+    // 信号区：当前未定义任何自定义信号
+    // 该类仅作为音频数据的接收端（槽函数端），不需要发送信号
+
+public slots:
+    // 公有槽函数：接收外部传入的 Opus 编码音频数据
+    // 参数 bt：QByteArray 类型，包含一帧 Opus 编码的音频数据
+    // 功能：将编码数据线程安全地加入音频播放队列
+    // 调用方式：通过 Qt 信号槽连接，可安全地从任意线程调用
+    void slot_playAudio(QByteArray bt);
+
+private:
+    // ---- SDL 音频设备相关 ----
+    SDL_AudioDeviceID m_sdlDev;    // SDL 音频设备 ID，用于标识已打开的播放设备
+                                   // 类型：Uint32（SDL_AudioDeviceID 的底层类型）
+                                   // 初始值：0（未打开任何设备）
+                                   // 有效值：SDL_OpenAudioDevice 返回的非零正值表示成功
+
+    bool m_sdlIsOpen;              // SDL 音频设备是否已成功打开的标志
+                                   // 类型：bool
+                                   // 初始值：false（未打开）
+                                   // true = 设备已打开可播放，false = 设备不可用
+
+    // ---- 音频数据队列（生产者-消费者模型） ----
+    std::deque&lt;QByteArray&gt; m_audioQueue;  // 音频帧队列，存储待播放的 Opus 编码音频数据
+                                          // 类型：std::deque&lt;QByteArray&gt;
+                                          // 初始值：空队列
+                                          // 容量：无硬性上限，取决于网络接收速率与播放消耗速率
+                                          // 功能：作为生产者-消费者模式的共享缓冲区
+
+    std::mutex m_mutex;                   // 互斥锁，保护 m_audioQueue 的线程安全访问
+                                          // 类型：std::mutex（不可拷贝、不可移动）
+                                          // 功能：确保同一时刻只有一个线程操作音频队列
+
+    // ---- SDL 音频回调函数 ----
+    // static 成员函数：SDL 回调要求 C 风格函数指针，不能使用成员函数指针
+    // 参数 userdata：用户自定义数据指针，此处传入 AudioWrite 对象的 this 指针
+    // 参数 stream：SDL 提供的输出缓冲区，最终会被送往扬声器播放
+    // 参数 len：输出缓冲区长度（字节），由 SDL_AudioSpec.samples × channels × bytes_per_sample 决定
+    static void audioCallback(void *userdata, Uint8 *stream, int len);
+
+    // ---- Opus 解码器 ----
+    OpusDecoder *m_opusDecoder;    // Opus 解码器指针，用于将 Opus 编码数据解码为 PCM
+                                   // 类型：OpusDecoder*（libopus 库类型）
+                                   // 初始值：由 opus_decoder_create 在构造函数中创建
+                                   // 配置：48kHz 采样率、单声道
+};
+#endif                          // 结束头文件保护宏
+</code></pre>
+<hr>
+<h3 id="42-audiowritecpp--audiowrite-类实现">4.2 audiowrite.cpp — AudioWrite 类实现</h3>
+<h4 id="421-构造函数-audiowriteaudiowrite">4.2.1 构造函数 <code>AudioWrite::AudioWrite</code></h4>
+<pre><code class="language-cpp">#include &quot;audiowrite.h&quot;       // 引入 AudioWrite 类声明头文件
+
+AudioWrite::AudioWrite(QObject *parent) : QObject(parent)
+// 构造函数实现
+// 参数 parent：QObject 父对象指针，用于 Qt 对象树的内存管理
+// : QObject(parent)：调用父类 QObject 的构造函数，将自身注册到父对象的子对象列表中
+{
+    // ========== 第一部分：创建 Opus 解码器 ==========
+    int err;                  // 声明错误码变量，用于接收 opus_decoder_create 的返回状态
+                              // 类型：int
+                              // 初始值：未初始化（立即被 opus_decoder_create 赋值）
+
+    m_opusDecoder = opus_decoder_create(48000, 1, &amp;err);
+    // 创建 Opus 解码器实例
+    // 参数 48000：采样率（Hz），Opus 原生支持 8000/12000/16000/24000/48000
+    //            此处使用 48000Hz，是 Opus 的最优采样率，与采集端保持一致
+    // 参数 1：声道数，1 = 单声道（Mono），与采集端单声道配置一致
+    // 参数 &amp;err：指向 int 的指针，函数通过该参数返回错误码
+    // 返回值：OpusDecoder* 成功时返回非空指针，失败时返回 nullptr
+
+    if (err != OPUS_OK || !m_opusDecoder) {
+        // 判断解码器是否创建失败
+        // OPUS_OK = 0，表示操作成功
+        // 条件1：err != OPUS_OK —— opus_decoder_create 返回了错误码
+        // 条件2：!m_opusDecoder —— 返回指针为空（双重保护）
+        qDebug() &lt;&lt; &quot;[Opus] 解码器创建失败:&quot; &lt;&lt; opus_strerror(err);
+        // opus_strerror(err)：将错误码转换为可读的错误描述字符串
+        // 常见错误：OPUS_ALLOC_FAIL（内存分配失败）、OPUS_BAD_ARG（参数错误）
+    } else {
+        qDebug() &lt;&lt; &quot;[Opus] 解码器创建成功, 48kHz/单声道&quot;;
+        // 创建成功时输出确认日志
+    }
+
+    // ========== 第二部分：配置并打开 SDL 音频播放设备 ==========
+    SDL_AudioSpec wantedSpec;      // 期望的音频规格结构体
+                                   // 类型：SDL_AudioSpec
+                                   // 功能：向 SDL 提交期望的音频参数
+                                   // SDL 会尝试按此配置打开设备，若不支持则返回最接近的配置
+
+    SDL_AudioSpec obtainedSpec;    // 实际获得的音频规格结构体
+                                   // 类型：SDL_AudioSpec
+                                   // 功能：SDL 返回设备实际支持的音频参数
+                                   // 可能与 wantedSpec 不同（取决于硬件驱动能力）
+
+    SDL_zero(wantedSpec);          // 将 wantedSpec 结构体所有字段清零
+                                   // 等价于 memset(&amp;wantedSpec, 0, sizeof(SDL_AudioSpec))
+                                   // 确保未显式设置的字段为安全的零值
+
+    wantedSpec.freq = 48000;       // 采样率：48000 Hz
+                                   // 类型：int
+                                   // 取值范围：常见值 8000/16000/22050/44100/48000
+                                   // 功能：每秒采集/播放的样本数，需与 Opus 编解码器采样率一致
+
+    wantedSpec.format = AUDIO_S16LSB;  // 音频样本格式：16 位有符号整数，小端字节序
+                                       // 类型：SDL_AudioFormat（Uint16）
+                                       // S16 = Signed 16-bit，LSB = Least Significant Byte first
+                                       // 每个样本占 2 字节，取值范围 -32768 ~ +32767
+                                       // 需与 Opus 解码输出格式（opus_int16）匹配
+
+    wantedSpec.channels = 1;       // 声道数：1 = 单声道（Mono）
+                                   // 类型：Uint8
+                                   // 取值范围：1（单声道）或 2（立体声）
+                                   // 需与 Opus 解码器创建时的声道数一致
+
+    wantedSpec.samples = 960;      // 每次回调的样本数：960 samples
+                                   // 类型：Uint16
+                                   // 取值范围：通常为 2 的幂次方或特定帧长
+                                   // 功能：决定 audioCallback 的触发频率
+                                   // 计算：960 / 48000 = 0.02 秒 = 20ms 触发一次
+                                   // 与采集端帧长一致（960 samples/帧）
+
+    wantedSpec.callback = audioCallback;  // 音频回调函数指针
+                                          // 类型：void (*)(void*, Uint8*, int)
+                                          // 功能：SDL 音频子系统在需要新数据时调用此函数
+                                          // 此函数在 SDL 内部创建的独立线程中执行
+
+    wantedSpec.userdata = this;    // 回调函数的用户数据指针
+                                   // 类型：void*
+                                   // 功能：将 AudioWrite 对象自身指针传入回调函数
+                                   // 在 audioCallback 中通过此指针访问成员变量
+
+    m_sdlDev = SDL_OpenAudioDevice(NULL, 0, &amp;wantedSpec, &amp;obtainedSpec, 0);
+    // 打开 SDL 音频播放设备
+    // 参数 NULL：设备名，NULL 表示使用系统默认播放设备
+    // 参数 0：iscapture，0 = 播放设备（非采集），1 = 采集设备
+    // 参数 &amp;wantedSpec：期望的音频规格（输入参数）
+    // 参数 &amp;obtainedSpec：实际获得的音频规格（输出参数）
+    // 参数 0：allowed_changes，0 = 不允许任何参数变更，严格匹配 wantedSpec
+    //        若设置 SDL_AUDIO_ALLOW_ANY_CHANGE 等标志则允许 SDL 自动调整参数
+    // 返回值：SDL_AudioDeviceID 类型
+    //         0 表示打开失败，正值表示成功的设备 ID
+
+    if (m_sdlDev == 0) {
+        // 判断 SDL 音频设备是否打开失败
+        qDebug() &lt;&lt; &quot;[SDL] 打开播放设备失败:&quot; &lt;&lt; SDL_GetError();
+        // SDL_GetError()：获取 SDL 最近一次操作的错误描述字符串
+        m_sdlIsOpen = false;       // 标记设备未打开，后续 slot_playAudio 将不会入队数据
+    } else {
+        qDebug() &lt;&lt; &quot;[SDL] 播放设备已打开, devID:&quot; &lt;&lt; m_sdlDev
+                 // 输出 SDL 分配的设备 ID
+                 &lt;&lt; &quot;freq:&quot; &lt;&lt; obtainedSpec.freq
+                 // 输出实际获得的采样率（可能与 wantedSpec.freq 不同）
+                 &lt;&lt; &quot;samples:&quot; &lt;&lt; obtainedSpec.samples;
+                 // 输出实际获得的每次回调样本数
+        m_sdlIsOpen = true;        // 标记设备已成功打开
+        SDL_PauseAudioDevice(m_sdlDev, 0);
+        // 取消暂停，开始音频播放
+        // 参数 m_sdlDev：目标音频设备 ID
+        // 参数 0：0 = 取消暂停（开始播放），1 = 暂停
+        // 调用后 SDL 开始以约 20ms 间隔调用 audioCallback
+    }
+}
+</code></pre>
+<hr>
+<h4 id="422-析构函数-audiowriteaudiowrite">4.2.2 析构函数 <code>AudioWrite::~AudioWrite</code></h4>
+<pre><code class="language-cpp">AudioWrite::~AudioWrite()
+// 析构函数：释放 AudioWrite 对象占用的所有资源
+// 调用时机：对象被销毁时自动调用（如 delete 或对象超出作用域）
+{
+    // ========== 第一部分：关闭 SDL 音频设备 ==========
+    if (m_sdlIsOpen &amp;&amp; m_sdlDev != 0) {
+        // 安全检查：仅在设备确实已打开的情况下执行关闭操作
+        // 条件1：m_sdlIsOpen == true —— 构造函数中标记过设备已打开
+        // 条件2：m_sdlDev != 0 —— 设备 ID 有效
+
+        SDL_PauseAudioDevice(m_sdlDev, 1);
+        // 先暂停音频设备
+        // 参数 1：1 = 暂停播放
+        // 功能：暂停后 SDL 不再调用 audioCallback，避免在关闭设备过程中产生竞态条件
+
+        SDL_CloseAudioDevice(m_sdlDev);
+        // 关闭音频设备，释放相关系统资源
+        // 参数 m_sdlDev：要关闭的设备 ID
+        // 关闭后该设备 ID 不再有效
+
+        m_sdlDev = 0;              // 将设备 ID 置零，防止重复关闭
+        m_sdlIsOpen = false;       // 标记设备已关闭
+        qDebug() &lt;&lt; &quot;[SDL] 播放设备已关闭&quot;;
+    }
+
+    // ========== 第二部分：销毁 Opus 解码器 ==========
+    if (m_opusDecoder) {
+        // 检查解码器指针是否有效（非 nullptr）
+        opus_decoder_destroy(m_opusDecoder);
+        // 销毁 Opus 解码器，释放其占用的内存
+        // 参数 m_opusDecoder：要销毁的解码器实例指针
+        // 注意：销毁后该指针不可再使用
+        m_opusDecoder = nullptr;   // 将指针置空，防止悬空指针（dangling pointer）
+        qDebug() &lt;&lt; &quot;[Opus] 解码器已销毁&quot;;
+    }
+}
+</code></pre>
+<hr>
+<h4 id="423-音频数据入队槽函数-audiowriteslot_playaudio">4.2.3 音频数据入队槽函数 <code>AudioWrite::slot_playAudio</code></h4>
+<pre><code class="language-cpp">void AudioWrite::slot_playAudio(QByteArray bt)
+// 槽函数：接收一帧 Opus 编码音频数据并入队
+// 调用方式：通过 Qt 信号槽连接，由 ckernel 的信号触发
+// 线程上下文：通常在 Qt 主线程或信号发送者所在的线程中执行
+// 参数 bt：QByteArray 类型，包含一帧 Opus 编码后的音频数据
+//          数据来源：ckernel 从 TCP 接收并解析出的音频帧
+//          典型大小：60 ~ 120 字节（Opus 编码后的压缩数据）
+{
+    if (m_sdlIsOpen) {
+        // 仅在 SDL 播放设备已打开时才处理数据
+        // 如果设备未打开，直接丢弃数据（无法播放）
+
+        std::lock_guard&lt;std::mutex&gt; lck(m_mutex);
+        // RAII 风格的互斥锁：构造时自动加锁，析构时自动解锁
+        // m_mutex：与 audioCallback 共享的互斥锁
+        // 作用域：从本行开始到 if 块结束
+        // 保护对象：m_audioQueue 的写入操作
+        // 线程安全：防止多个发送线程同时写入队列
+        //           防止写入和读取（audioCallback）同时进行
+
+        m_audioQueue.emplace_back(bt);
+        // 将音频数据帧添加到队列尾部
+        // emplace_back：在队列尾部原地构造 QByteArray，避免不必要的拷贝
+        // 参数 bt：Opus 编码的音频数据帧
+        // 语义：生产者操作，将数据放入共享缓冲区
+    }
+}
+</code></pre>
+<hr>
+<h4 id="424-sdl-音频回调函数-audiowriteaudiocallback">4.2.4 SDL 音频回调函数 <code>AudioWrite::audioCallback</code></h4>
+<pre><code class="language-cpp">void AudioWrite::audioCallback(void *userdata, Uint8 *stream, int len)
+// SDL 音频回调函数：SDL 需要新音频数据时自动调用
+// 执行线程：SDL 内部创建的独立音频线程（非 Qt 主线程）
+// 调用频率：由 wantedSpec.samples 和 wantedSpec.freq 决定
+//          960 / 48000 = 20ms 调用一次
+// 参数 userdata：用户数据指针，构造时传入 this（AudioWrite 对象指针）
+//                类型：void*，需要强制转换为 AudioWrite*
+// 参数 stream：SDL 提供的输出音频缓冲区
+//              类型：Uint8*（无符号 8 位字节数组）
+//              功能：回调函数将 PCM 数据写入此缓冲区，SDL 将其送往扬声器
+//              大小：由 len 参数指定
+// 参数 len：输出缓冲区长度（字节）
+//           类型：int
+//           典型值：960 samples × 1 声道 × 2 字节/样本 = 1920 字节
+//           功能：告知回调函数需要填充多少字节的音频数据
+{
+    AudioWrite *audio = (AudioWrite *)userdata;
+    // 将 void* 类型的 userdata 强制转换为 AudioWrite* 指针
+    // 功能：在静态回调函数中访问 AudioWrite 对象的成员变量和方法
+    // 原理：构造时通过 wantedSpec.userdata = this 传入了对象指针
+
+    memset(stream, 0, len);
+    // 将 SDL 输出缓冲区清零
+    // 功能：填充静音数据作为默认值
+    // 原因：若队列为空或解码失败，输出静音而非残留噪音
+    //       SDL 会将此缓冲区的数据直接送到声卡播放
+    // 参数 stream：目标缓冲区
+    // 参数 0：填充的值（0 = 静音，因为 S16LSB 格式中 0 表示无声）
+    // 参数 len：填充长度
+
+    if (!audio-&gt;m_audioQueue.empty()) {
+        // 检查音频队列是否有待播放的数据帧
+        // 条件为 true：队列中有数据，可以取出来解码播放
+        // 条件为 false：队列为空，输出前面 memset 填充的静音数据
+
+        QByteArray recvBuffer = audio-&gt;m_audioQueue.front();
+        // 取出队列首部的音频帧（不移除）
+        // front()：返回队列首元素的引用，不修改队列
+        // recvBuffer：拷贝了一份队首数据（QByteArray 使用隐式共享/写时拷贝）
+        // 注意：此处先取数据，后面再加锁移除，减少持锁时间
+
+        {
+            std::lock_guard&lt;std::mutex&gt; lck(audio-&gt;m_mutex);
+            // 加锁保护队列的修改操作
+            // 使用独立的代码块 {} 限定锁的作用域
+            // 确保 pop_front 操作的线程安全性
+            audio-&gt;m_audioQueue.pop_front();
+            // 移除队列首部元素
+            // 此操作必须在锁的保护下进行
+            // 与 slot_playAudio 的 emplace_back 互斥
+        }
+        // 锁在此处自动释放（lock_guard 析构）
+
+        // ========== Opus 解码 ==========
+        opus_int16 decodedData[4096];
+        // 声明解码输出缓冲区
+        // 类型：opus_int16（即 int16_t，16 位有符号整数）
+        // 大小：4096 个样本
+        // 最大可存储：4096 samples × 2 字节 = 8190 字节 PCM 数据
+        // 实际使用：单帧解码通常输出 960 samples（1920 字节）
+        // 4096 的容量足够容纳各种 Opus 帧长的解码输出
+
+        int frameSizeDecoded = opus_decode(
+            audio-&gt;m_opusDecoder,           // Opus 解码器实例指针
+                                            // 类型：const OpusDecoder*
+                                            // 来源：构造函数中通过 opus_decoder_create 创建
+
+            (const unsigned char*)recvBuffer.data(),  // 输入数据指针
+                                            // 类型：const unsigned char*
+                                            // recvBuffer.data()：QByteArray 内部数据的原始指针
+                                            // 强制类型转换确保与 Opus API 类型匹配
+
+            recvBuffer.size(),              // 输入数据长度（字节）
+                                            // 类型：opus_int32
+                                            // 值：Opus 编码帧的大小，通常 60~120 字节
+                                            // 功能：告知解码器输入数据的完整长度
+
+            decodedData,                    // 解码输出缓冲区
+                                            // 类型：opus_int16*
+                                            // 功能：解码后的 PCM 数据将写入此数组
+
+            sizeof(decodedData)/sizeof(decodedData[0]),  // 输出缓冲区最大样本数
+                                            // 计算：8192 / 2 = 4096 samples
+                                            // 类型：int
+                                            // 功能：告知解码器输出缓冲区的容量，防止溢出
+
+            0                               // decode_fec 参数
+                                            // 类型：int
+                                            // 0 = 不使用前向纠错（FEC）解码
+                                            // 1 = 使用 FEC，用当前包恢复前一个丢失的包
+                                            // 此处设为 0，因为接收端有独立的丢包处理机制
+        );
+        // opus_decode 返回值：解码后的样本数（每样本 = channels × sizeof(opus_int16) 字节）
+        // 单声道情况下：返回值 = 解码出的样本数
+        // 典型返回值：960（对应 20ms @ 48kHz）
+        // 负值：表示错误码
+
+        if (frameSizeDecoded &lt; 0) {
+            // 解码出错处理
+            // frameSizeDecoded 为负值时，其绝对值对应 Opus 错误码
+            qDebug() &lt;&lt; &quot;[Opus] 解码错误:&quot; &lt;&lt; opus_strerror(frameSizeDecoded);
+            // 输出解码错误描述
+            // 常见错误：OPUS_INVALID_PACKET（无效数据包）、OPUS_BUFFER_TOO_SMALL（缓冲区过小）
+            return;
+            // 提前返回，保持 stream 为静音状态（已被 memset 清零）
+        }
+
+        SDL_MixAudioFormat(
+            stream,                         // 目标缓冲区（SDL 的输出缓冲区）
+                                            // 类型：Uint8*
+                                            // 功能：混音结果将写入此缓冲区
+
+            (uint8_t*)decodedData,          // 源数据（解码后的 PCM 数据）
+                                            // 类型：Uint8*
+                                            // 强制将 opus_int16* 转换为 Uint8*
+
+            AUDIO_S16LSB,                   // 音频格式标识
+                                            // 类型：SDL_AudioFormat
+                                            // AUDIO_S16LSB = 16 位有符号小端格式
+                                            // 必须与 stream 和 src 使用相同的格式
+
+            frameSizeDecoded * sizeof(opus_int16),  // 混音的字节数
+                                            // 计算：960 samples × 2 bytes = 1920 字节
+                                            // 等于一帧解码后的完整 PCM 数据量
+
+            100                             // 音量缩放因子
+                                            // 类型：int
+                                            // 取值范围：0 ~ 128
+                                            // 0 = 静音，128 = 最大音量（SDL 内部使用 0~128 范围）
+                                            // 100 ≈ 78% 音量，略有衰减避免削波失真
+                                            // SDL_MixAudioFormat 内部执行：volume/128 × sample
+        );
+    }
+    // 若 m_audioQueue 为空，函数直接返回，stream 保持 memset 的静音状态
+}
+</code></pre>
+<hr>
+<h2 id="5-参数说明表格">5. 参数说明表格</h2>
+<h3 id="51-audiowrite-成员变量">5.1 AudioWrite 成员变量</h3>
+<table>
+<thead>
+<tr>
+<th>参数名称</th>
+<th>数据类型</th>
+<th>初始值</th>
+<th>取值范围</th>
+<th>功能作用</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>m_sdlDev</code></td>
+<td><code>SDL_AudioDeviceID</code>（<code>Uint32</code>）</td>
+<td><code>0</code>（未初始化，由构造函数赋值）</td>
+<td><code>0</code> 表示无效/未打开；正值为有效设备 ID</td>
+<td>标识 SDL 音频播放设备，用于后续的暂停、恢复、关闭等操作</td>
+</tr>
+<tr>
+<td><code>m_sdlIsOpen</code></td>
+<td><code>bool</code></td>
+<td><code>false</code></td>
+<td><code>true</code> / <code>false</code></td>
+<td>标记 SDL 播放设备是否已成功打开，<code>slot_playAudio</code> 通过此标志判断是否接受音频数据</td>
+</tr>
+<tr>
+<td><code>m_audioQueue</code></td>
+<td><code>std::deque&lt;QByteArray&gt;</code></td>
+<td>空队列</td>
+<td>无硬性上限，取决于系统内存</td>
+<td>生产者-消费者模式的共享缓冲区，存储待解码播放的 Opus 编码音频帧</td>
+</tr>
+<tr>
+<td><code>m_mutex</code></td>
+<td><code>std::mutex</code></td>
+<td>默认构造（未锁定）</td>
+<td>二元状态：锁定/未锁定</td>
+<td>保护 <code>m_audioQueue</code> 的线程安全，确保入队和出队操作的互斥性</td>
+</tr>
+<tr>
+<td><code>m_opusDecoder</code></td>
+<td><code>OpusDecoder*</code></td>
+<td>由 <code>opus_decoder_create</code> 创建</td>
+<td>有效指针 / <code>nullptr</code></td>
+<td>Opus 解码器实例，将 Opus 压缩音频数据解码为 PCM 原始音频</td>
+</tr>
+</tbody></table>
+<h3 id="52-sdl-音频规格参数（wantedspec）">5.2 SDL 音频规格参数（wantedSpec）</h3>
+<table>
+<thead>
+<tr>
+<th>参数名称</th>
+<th>数据类型</th>
+<th>设定值</th>
+<th>取值范围</th>
+<th>功能作用</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>freq</code></td>
+<td><code>int</code></td>
+<td><code>48000</code></td>
+<td>常见：<code>8000</code>/<code>16000</code>/<code>22050</code>/<code>44100</code>/<code>48000</code></td>
+<td>音频采样率（Hz），决定每秒的样本数，需与 Opus 编解码器采样率一致</td>
+</tr>
+<tr>
+<td><code>format</code></td>
+<td><code>SDL_AudioFormat</code>（<code>Uint16</code>）</td>
+<td><code>AUDIO_S16LSB</code></td>
+<td><code>AUDIO_S8</code>/<code>AUDIO_U8</code>/<code>AUDIO_S16LSB</code>/<code>AUDIO_S16MSB</code>/<code>AUDIO_F32LSB</code> 等</td>
+<td>音频样本数据格式，S16LSB = 16 位有符号小端序，每样本 2 字节</td>
+</tr>
+<tr>
+<td><code>channels</code></td>
+<td><code>Uint8</code></td>
+<td><code>1</code></td>
+<td><code>1</code>（单声道）/ <code>2</code>（立体声）</td>
+<td>声道数，1 表示单声道，需与 Opus 编解码器声道数一致</td>
+</tr>
+<tr>
+<td><code>samples</code></td>
+<td><code>Uint16</code></td>
+<td><code>960</code></td>
+<td>常见：<code>256</code>/<code>512</code>/<code>960</code>/<code>1024</code>/<code>2048</code></td>
+<td>每次回调请求的样本数，960 @ 48kHz = 20ms 回调间隔</td>
+</tr>
+<tr>
+<td><code>callback</code></td>
+<td><code>void(*)(void*, Uint8*, int)</code></td>
+<td><code>audioCallback</code></td>
+<td>有效的函数指针</td>
+<td>SDL 需要新数据时调用的回调函数，在独立线程中执行</td>
+</tr>
+<tr>
+<td><code>userdata</code></td>
+<td><code>void*</code></td>
+<td><code>this</code>（AudioWrite 对象指针）</td>
+<td>任意指针</td>
+<td>传递给回调函数的用户自定义数据，用于在静态函数中访问成员变量</td>
+</tr>
+</tbody></table>
+<h3 id="53-sdl_openaudiodevice-参数">5.3 SDL_OpenAudioDevice 参数</h3>
+<table>
+<thead>
+<tr>
+<th>参数位置</th>
+<th>参数名</th>
+<th>值</th>
+<th>数据类型</th>
+<th>功能说明</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>1</td>
+<td>device</td>
+<td><code>NULL</code></td>
+<td><code>const char*</code></td>
+<td>设备名称，<code>NULL</code> 表示使用系统默认播放设备</td>
+</tr>
+<tr>
+<td>2</td>
+<td>iscapture</td>
+<td><code>0</code></td>
+<td><code>int</code></td>
+<td><code>0</code> = 打开播放设备，<code>1</code> = 打开采集设备</td>
+</tr>
+<tr>
+<td>3</td>
+<td>desired</td>
+<td><code>&amp;wantedSpec</code></td>
+<td><code>const SDL_AudioSpec*</code></td>
+<td>期望的音频规格（输入参数）</td>
+</tr>
+<tr>
+<td>4</td>
+<td>obtained</td>
+<td><code>&amp;obtainedSpec</code></td>
+<td><code>SDL_AudioSpec*</code></td>
+<td>实际获得的音频规格（输出参数）</td>
+</tr>
+<tr>
+<td>5</td>
+<td>allowed_changes</td>
+<td><code>0</code></td>
+<td><code>int</code></td>
+<td>允许的参数变更标志，<code>0</code> = 严格匹配不允许变更</td>
+</tr>
+<tr>
+<td>返回值</td>
+<td>—</td>
+<td><code>m_sdlDev</code></td>
+<td><code>SDL_AudioDeviceID</code>（<code>Uint32</code>）</td>
+<td><code>0</code> = 打开失败，正值 = 成功的设备 ID</td>
+</tr>
+</tbody></table>
+<h3 id="54-opus_decode-参数">5.4 opus_decode 参数</h3>
+<table>
+<thead>
+<tr>
+<th>参数位置</th>
+<th>参数名</th>
+<th>值</th>
+<th>数据类型</th>
+<th>功能说明</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>1</td>
+<td>st</td>
+<td><code>audio-&gt;m_opusDecoder</code></td>
+<td><code>OpusDecoder*</code></td>
+<td>Opus 解码器实例指针</td>
+</tr>
+<tr>
+<td>2</td>
+<td>data</td>
+<td><code>recvBuffer.data()</code></td>
+<td><code>const unsigned char*</code></td>
+<td>Opus 编码输入数据的字节指针</td>
+</tr>
+<tr>
+<td>3</td>
+<td>len</td>
+<td><code>recvBuffer.size()</code></td>
+<td><code>opus_int32</code></td>
+<td>输入编码数据的字节长度（通常 60~120 字节）</td>
+</tr>
+<tr>
+<td>4</td>
+<td>pcm</td>
+<td><code>decodedData</code></td>
+<td><code>opus_int16*</code></td>
+<td>解码输出 PCM 缓冲区（16 位有符号整数数组）</td>
+</tr>
+<tr>
+<td>5</td>
+<td>frame_size</td>
+<td><code>sizeof(decodedData)/sizeof(decodedData[0])</code> = <code>4096</code></td>
+<td><code>int</code></td>
+<td>输出缓冲区的最大样本数，防止解码溢出</td>
+</tr>
+<tr>
+<td>6</td>
+<td>decode_fec</td>
+<td><code>0</code></td>
+<td><code>int</code></td>
+<td><code>0</code> = 不使用 FEC 解码，<code>1</code> = 启用前向纠错解码</td>
+</tr>
+<tr>
+<td>返回值</td>
+<td>—</td>
+<td><code>frameSizeDecoded</code></td>
+<td><code>int</code></td>
+<td>实际解码出的样本数（<code>960</code> = 20ms@48kHz），负值为错误码</td>
+</tr>
+</tbody></table>
+<h3 id="55-sdl_mixaudioformat-参数">5.5 SDL_MixAudioFormat 参数</h3>
+<table>
+<thead>
+<tr>
+<th>参数位置</th>
+<th>参数名</th>
+<th>值</th>
+<th>数据类型</th>
+<th>功能说明</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>1</td>
+<td>dst</td>
+<td><code>stream</code></td>
+<td><code>Uint8*</code></td>
+<td>目标混音缓冲区（SDL 输出缓冲区）</td>
+</tr>
+<tr>
+<td>2</td>
+<td>src</td>
+<td><code>(uint8_t*)decodedData</code></td>
+<td><code>const Uint8*</code></td>
+<td>源音频数据（Opus 解码后的 PCM）</td>
+</tr>
+<tr>
+<td>3</td>
+<td>format</td>
+<td><code>AUDIO_S16LSB</code></td>
+<td><code>SDL_AudioFormat</code></td>
+<td>音频格式，必须与 src 和 dst 格式一致</td>
+</tr>
+<tr>
+<td>4</td>
+<td>len</td>
+<td><code>frameSizeDecoded * sizeof(opus_int16)</code></td>
+<td><code>Uint32</code></td>
+<td>混音字节数（通常 960 × 2 = 1920 字节）</td>
+</tr>
+<tr>
+<td>5</td>
+<td>volume</td>
+<td><code>100</code></td>
+<td><code>int</code></td>
+<td>音量缩放因子，范围 <code>0</code>（静音）~ <code>128</code>（最大），<code>100</code> ≈ 78%</td>
+</tr>
+</tbody></table>
+<hr>
+<h2 id="6-线程安全设计说明">6. 线程安全设计说明</h2>
+<h3 id="61-生产者-消费者模型">6.1 生产者-消费者模型</h3>
+<p>音频播放采用经典的 <strong>生产者-消费者（Producer-Consumer）</strong> 模型：</p>
+<pre><code>┌─────────────────────┐         ┌──────────────┐         ┌──────────────────┐
+│   生产者线程         │         │   共享缓冲区  │         │   消费者线程       │
+│  （Qt 信号槽线程）    │  入队    │  m_audioQueue │  出队    │ （SDL 回调线程）    │
+│ slot_playAudio()    │────────&gt;│  std::deque   │────────&gt;│  audioCallback()  │
+│                     │         │               │         │                   │
+│ 保护：m_mutex       │         │ 保护：m_mutex  │         │ 保护：m_mutex      │
+└─────────────────────┘         └──────────────┘         └──────────────────┘
+</code></pre>
+<ul>
+<li><strong>生产者</strong>：<code>slot_playAudio</code> 在 Qt 信号槽线程中被调用，将网络接收到的 Opus 编码数据入队</li>
+<li><strong>消费者</strong>：<code>audioCallback</code> 在 SDL 音频线程中被调用，从队列取出数据解码播放</li>
+<li><strong>缓冲区</strong>：<code>std::deque&lt;QByteArray&gt; m_audioQueue</code>，起到解耦和缓冲的作用</li>
+</ul>
+<h3 id="62-互斥锁使用分析">6.2 互斥锁使用分析</h3>
+<table>
+<thead>
+<tr>
+<th>操作</th>
+<th>线程</th>
+<th>持锁范围</th>
+<th>锁的作用</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>emplace_back(bt)</code></td>
+<td>Qt 信号槽线程</td>
+<td><code>slot_playAudio</code> 函数内整个 if 块</td>
+<td>保护队列写入，防止多个线程同时写入</td>
+</tr>
+<tr>
+<td><code>pop_front()</code></td>
+<td>SDL 回调线程</td>
+<td><code>audioCallback</code> 内 <code>{ }</code> 代码块</td>
+<td>保护队列移除，防止与写入操作并发冲突</td>
+</tr>
+</tbody></table>
+<h3 id="63-锁的粒度优化">6.3 锁的粒度优化</h3>
+<p>代码中采用了 <strong>最小化持锁时间</strong> 的设计策略：</p>
+<pre><code class="language-cpp">// 1. 先取出数据（此时数据仍留在队列中，front 不修改队列结构）
+QByteArray recvBuffer = audio-&gt;m_audioQueue.front();
+
+// 2. 加锁仅保护 pop_front 操作
+{
+    std::lock_guard&lt;std::mutex&gt; lck(audio-&gt;m_mutex);
+    audio-&gt;m_audioQueue.pop_front();
+}
+// 锁在此释放
+
+// 3. Opus 解码和 SDL 混音在无锁状态下执行（最耗时的操作）
+opus_decode(...);
+SDL_MixAudioFormat(...);
+</code></pre>
+<p>这种设计使得：</p>
+<ul>
+<li><strong>Opus 解码</strong>（计算密集）不需要持有锁，避免阻塞生产者线程</li>
+<li><strong>SDL 混音</strong>（计算密集）同样在无锁区域执行</li>
+<li>仅在修改队列结构的关键操作时持锁，最大化并发性能</li>
+</ul>
+<h3 id="64-注意事项">6.4 注意事项</h3>
+<ol>
+<li><p><strong>front() 和 pop_front() 的分离</strong>：<code>front()</code> 在锁外调用取数据，<code>pop_front()</code> 在锁内调用移除元素。在单消费者模型中（SDL 回调线程是唯一消费者），这是安全的，因为不会有其他线程在 <code>front()</code> 和 <code>pop_front()</code> 之间修改队列首部。</p>
+</li>
+<li><p><strong>SDL_zero 宏</strong>：<code>SDL_AudioSpec</code> 使用 <code>SDL_zero</code> 而非 <code>memset</code>，是 SDL 库推荐的安全初始化方式，确保结构体对齐和填充字节也被正确清零。</p>
+</li>
+</ol>
+<hr>
+<h2 id="7-opus-解码参数说明">7. Opus 解码参数说明</h2>
+<h3 id="71-opus-解码器创建参数">7.1 Opus 解码器创建参数</h3>
+<table>
+<thead>
+<tr>
+<th>参数</th>
+<th>值</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>采样率（<code>Fs</code>）</td>
+<td><code>48000</code> Hz</td>
+<td>Opus 的原生最优采样率。Opus 内部统一在 48kHz 处理，使用此采样率可避免额外的重采样开销</td>
+</tr>
+<tr>
+<td>声道数（<code>channels</code>）</td>
+<td><code>1</code>（单声道）</td>
+<td>单声道适合语音通话场景，数据量仅为立体声的一半</td>
+</tr>
+<tr>
+<td>返回值（<code>err</code>）</td>
+<td><code>OPUS_OK = 0</code></td>
+<td>成功；其他负值为错误码，如 <code>OPUS_ALLOC_FAIL(-7)</code>、<code>OPUS_BAD_ARG(-1)</code></td>
+</tr>
+</tbody></table>
+<h3 id="72-opus-解码帧长">7.2 Opus 解码帧长</h3>
+<table>
+<thead>
+<tr>
+<th>采样率</th>
+<th>帧长(samples)</th>
+<th>帧时长(ms)</th>
+<th>PCM 数据大小</th>
+<th>Opus 编码大小</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>48000 Hz</td>
+<td>120</td>
+<td>2.5 ms</td>
+<td>240 字节</td>
+<td>~15-30 字节</td>
+</tr>
+<tr>
+<td>48000 Hz</td>
+<td>240</td>
+<td>5 ms</td>
+<td>480 字节</td>
+<td>~20-40 字节</td>
+</tr>
+<tr>
+<td>48000 Hz</td>
+<td>480</td>
+<td>10 ms</td>
+<td>960 字节</td>
+<td>~30-60 字节</td>
+</tr>
+<tr>
+<td><strong>48000 Hz</strong></td>
+<td><strong>960</strong></td>
+<td><strong>20 ms</strong></td>
+<td><strong>1920 字节</strong></td>
+<td><strong>~60-120 字节</strong></td>
+</tr>
+<tr>
+<td>48000 Hz</td>
+<td>1920</td>
+<td>40 ms</td>
+<td>3840 字节</td>
+<td>~80-160 字节</td>
+</tr>
+<tr>
+<td>48000 Hz</td>
+<td>2880</td>
+<td>60 ms</td>
+<td>5760 字节</td>
+<td>~100-200 字节</td>
+</tr>
+</tbody></table>
+<blockquote>
+<p>本项目使用 <strong>960 samples / 20ms</strong> 的帧长，与采集端保持一致。</p>
+</blockquote>
+<h3 id="73-opus-编码数据到-pcm-数据的转换比">7.3 Opus 编码数据到 PCM 数据的转换比</h3>
+<pre><code>输入：Opus 编码帧 ≈ 60 ~ 120 字节
+输出：PCM 解码帧 = 960 samples × 1 声道 × 2 字节 = 1920 字节
+
+压缩比 = 1920 / 90（平均） ≈ 21:1
+压缩率 ≈ 95%
+</code></pre>
+<h3 id="74-decode_fec-参数说明">7.4 decode_fec 参数说明</h3>
+<table>
+<thead>
+<tr>
+<th>值</th>
+<th>行为</th>
+<th>使用场景</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>0</code></td>
+<td>不使用前向纠错</td>
+<td>正常解码，当前帧丢失时输出静音/PLC（包丢失隐藏）</td>
+</tr>
+<tr>
+<td><code>1</code></td>
+<td>使用 FEC 解码</td>
+<td>用当前包中嵌入的冗余信息恢复前一个丢失的包</td>
+</tr>
+</tbody></table>
+<blockquote>
+<p>本项目设置为 <code>0</code>，因为网络层有独立的丢包处理策略，不需要在解码层启用 FEC。</p>
+</blockquote>
+
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10.9.1/dist/mermaid.min.js"></script>
+<script>mermaid.initialize({startOnLoad:true, theme:'default', flowchart:{htmlLabels:true, curve:'basis'}, securityLevel:'loose'});</script>
+</body>
+</html>

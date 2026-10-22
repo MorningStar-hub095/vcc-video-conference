@@ -1,0 +1,1854 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<style>
+    body {
+        font-family: 'Microsoft YaHei', 'SimHei', sans-serif;
+        line-height: 1.8;
+        color: #333;
+        max-width: 100%;
+        padding: 20px;
+    }
+    h1 { color: #1a5276; font-size: 22px; border-bottom: 2px solid #1a5276; padding-bottom: 8px; margin-top: 30px; }
+    h2 { color: #2c3e50; font-size: 18px; margin-top: 25px; }
+    h3 { color: #34495e; font-size: 16px; margin-top: 20px; }
+    h4 { color: #34495e; font-size: 14px; margin-top: 15px; }
+    table { border-collapse: collapse; width: 100%; margin: 15px 0; font-size: 12px; }
+    th, td { border: 1px solid #ddd; padding: 6px 10px; text-align: left; }
+    th { background-color: #f2f2f2; font-weight: bold; }
+    tr:nth-child(even) { background-color: #f9f9f9; }
+    pre { background: #f5f5f5; padding: 12px; border-radius: 5px; overflow-x: auto; font-size: 11px; line-height: 1.4; }
+    code { background: #f0f0f0; padding: 1px 4px; border-radius: 3px; font-size: 12px; }
+    pre code { background: none; padding: 0; font-size: 11px; }
+    .mermaid { margin: 15px 0; text-align: center; page-break-inside: avoid; }
+    strong { color: #2c3e50; }
+    hr { border: none; border-top: 1px solid #ddd; margin: 20px 0; }
+    blockquote { border-left: 4px solid #3498db; margin: 10px 0; padding: 5px 15px; background: #eef6fb; font-size: 13px; }
+    ul, ol { padding-left: 25px; }
+    li { margin: 3px 0; }
+    p { margin: 8px 0; }
+</style>
+</head>
+<body>
+<h1 id="wechat-音视频会议系统---项目类图（完整重构版）">WeChat 音视频会议系统 - 项目类图（完整重构版）</h1>
+<blockquote>
+<p><strong>文档版本：</strong> v2.1
+<strong>最后更新：</strong> 2026-08-01
+<strong>更新说明：</strong> 新增 WebRTC VAD 静音检测（动态阈值/状态平滑/UI联动）相关成员与方法
+<strong>重构说明：</strong> 基于源码头文件全面重构，完整标注每个类的属性（名称、类型、可见性）和方法（名称、参数、返回值、可见性），使用标准 UML 符号标识所有类间关系。</p>
+</blockquote>
+<hr>
+<h2 id="一、整体架构分层">一、整体架构分层</h2>
+<pre><code>┌─────────────────────────────────────────────────────────────────────────────┐
+│                          UI 层（Qt Widgets 用户界面）                         │
+│  LoginDialog(QDialog)  WeChatDialog(QDialog)  RoomDialog(QDialog)           │
+│  UserShow(QWidget)     MyOpenGLWidget(QOpenGLWidget)                        │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                       核心调度层（业务中枢 - 单例模式）                         │
+│                              ckernel(QObject)                               │
+│  协议映射表 PFUN m_netPackMap[100] │ 三路TCP连接 │ 模块生命周期管理            │
+├──────────┬──────────┬───────────┬──────────┬────────────────────────────────┤
+│  音频层   │  视频采集层│ 视频编解码层│  渲染层   │    同步层                     │
+│AudioRead │VideoRead │H264Encoder│YuvGLWidget│  AVSyncManager(单例)          │
+│AudioWrite│ScreenRead│H264Decoder│MyOpenGLW │  SyncContext(结构体)           │
+│(SDL+Opus)│(OpenCV)  │(FFmpeg)   │(OpenGL)   │  (音频主时钟策略)               │
+├──────────┴──────────┴───────────┴──────────┴────────────────────────────────┤
+│                    网络传输层（接口抽象 + 中介者模式）                          │
+│  INet(抽象接口) ──实现── TcpClient / TcpServer / UdpNet                     │
+│  INetMediator(抽象中介者) ──继承── TcpClientMed / TcpServerMed / UdpMed     │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                         工具/协议层                                          │
+│  ThreadWorker(QObject)  SendVideoWorker  MD5  packdef.h(协议结构体)         │
+└─────────────────────────────────────────────────────────────────────────────┘
+</code></pre>
+<h3 id="uml-关系符号说明">UML 关系符号说明</h3>
+<table>
+<thead>
+<tr>
+<th>符号</th>
+<th>关系类型</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>`&lt;</td>
+<td>--`</td>
+<td>继承（泛化）</td>
+</tr>
+<tr>
+<td>`&lt;</td>
+<td>..`</td>
+<td>实现（接口）</td>
+</tr>
+<tr>
+<td><code>*--</code></td>
+<td>组合（Composition）</td>
+<td>强拥有关系，部分随整体创建/销毁，实线实心菱形</td>
+</tr>
+<tr>
+<td><code>o--</code></td>
+<td>聚合（Aggregation）</td>
+<td>弱拥有关系，部分可独立于整体存在，实线空心菱形</td>
+</tr>
+<tr>
+<td><code>--&gt;</code></td>
+<td>关联（Association）</td>
+<td>类之间有结构关系，实线箭头</td>
+</tr>
+<tr>
+<td><code>..&gt;</code></td>
+<td>依赖（Dependency）</td>
+<td>类之间有使用关系，虚线箭头</td>
+</tr>
+</tbody></table>
+<h3 id="可见性符号说明">可见性符号说明</h3>
+<table>
+<thead>
+<tr>
+<th>符号</th>
+<th>可见性</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>+</code></td>
+<td>public</td>
+<td>公有访问</td>
+</tr>
+<tr>
+<td><code>-</code></td>
+<td>private</td>
+<td>私有访问</td>
+</tr>
+<tr>
+<td><code>#</code></td>
+<td>protected</td>
+<td>受保护访问</td>
+</tr>
+</tbody></table>
+<hr>
+<h2 id="二、完整类图（mermaid-格式）">二、完整类图（Mermaid 格式）</h2>
+<h3 id="21-核心调度层">2.1 核心调度层</h3>
+<div class="mermaid">classDiagram
+    direction TB
+
+    class ckernel {
+        &lt;&lt;singleton, QObject&gt;&gt;
+        -WeChatDialog* m_pWeChatDlg
+        -LoginDialog* m_pLoginDlg
+        -RoomDialog* m_pRoomdialog
+        -INetMediator* m_pClient
+        -INetMediator* m_pAVClient[2]
+        -QString m_serverIP
+        -PFUN m_netPackMap[100]
+        -int m_id
+        -int m_roomid
+        -QString m_UserName
+        -AudioRead* m_pAudioRead
+        -map~int,AudioWrite*~ m_mapIDToAudioWrite
+        -VideoRead* m_pVideoRead
+        -ScreenRead* m_pScreenRead
+        -QSharedPointer~SendVideoWorker~ m_pSendVideoWorker
+        -H264Encoder* m_h264Encoder
+        -map~int,H264Decoder*~ m_mapIDToH264Decoder
+        -bool m_useH264
+        -int m_h264FrameSeq
+        -bool m_encodingPending
+        -map~int,map~int,H264FragmentGroup~~ m_h264Reassemble
+        +ckernel(QObject* parent)
+        +static ckernel* GetInstance()
+        +void setNetPackMap()
+        +void initConfig()
+        +void slot_destroy()
+        +void slot_loginCommit(QString tel, QString pass)
+        +void slot_registerCommit(QString tel, QString pass, QString name, QString email)
+        +void slot_createroom()
+        +void slot_joinroom()
+        +void slot_quitRoom()
+        +void slot_pauseAudio()
+        +void slot_startAudio()
+        +void slot_pauseVideo()
+        +void slot_startVideo()
+        +void slot_startScreen()
+        +void slot_pauseScreen()
+        +void slot_refreshVideo(int id, QImage&amp; img)
+        +void slot_audioFrame(QByteArray ba)
+        +void slot_muteStateChanged(bool isMute)
+        +void slot_sendVideoFrame(QImage img)
+        +void encodeAndSendVideoFrame(QImage img)
+        +void slot_SendVideo(char* buf, int nlen)
+        +void slot_dealData(uint sock, char* buf, int nlen)
+        +void slot_dealLoginRS(uint sock, char* buf, int nlen)
+        +void slot_dealRegisterRS(uint sock, char* buf, int nlen)
+        +void slot_dealCreateRoomRS(uint sock, char* buf, int nlen)
+        +void slot_dealJoinRoomRS(uint sock, char* buf, int nlen)
+        +void slot_dealRoomMemberRq(uint sock, char* buf, int nlen)
+        +void slot_dealLeaveRoomRq(uint sock, char* buf, int nlen)
+        +void slot_dealAudioFrameRq(uint sock, char* buf, int nlen)
+        +void slot_dealVideoFrameRq(uint sock, char* buf, int nlen)
+        +void slot_dealVideoFrameH264Rq(uint sock, char* buf, int nlen)
+        +void slot_dealPliRequest(uint sock, char* buf, int nlen)
+        +void slot_h264FrameDecoded(int userId, AVFrame* frame)
+        +void slot_dealUpdateEmailRS(uint sock, char* buf, int nlen)
+        ~void SIG_SendVideo(char* buf, int nlen)~
+    }
+
+    class H264FragmentGroup {
+        +int totalFragments
+        +int receivedCount
+        +QMap~int,QByteArray~ fragments
+        +qint64 timestamp
+        +int frameType
+    }
+
+    class PFUN {
+        &lt;&lt;typedef&gt;&gt;
+        void (ckernel::*)(uint sock, char* buf, int nlen)
+    }
+
+    ckernel *-- H264FragmentGroup : m_h264Reassemble 内部结构
+    ckernel ..&gt; PFUN : m_netPackMap 类型
+
+    note for ckernel "单例模式（Meyers' Singleton）\nC++11 线程安全局部静态变量\n协议映射表 m_netPackMap 实现 O(1) 消息分发\n策略模式：PFUN 函数指针数组"
+</div><h3 id="22-网络传输层（接口抽象--中介者模式）">2.2 网络传输层（接口抽象 + 中介者模式）</h3>
+<div class="mermaid">classDiagram
+    direction TB
+
+    class INet {
+        &lt;&lt;abstract, interface&gt;&gt;
+        #INetMediator* m_pMediator
+        -static bool m_isLoadlib
+        +INet()
+        +virtual ~INet()
+        +virtual bool InitNet(const char* szBufIP, unsigned short port)*
+        +virtual void UnInitNet()*
+        +virtual bool SendData(unsigned int lSendIP, char* buf, int nlen)*
+        +virtual bool IsConnected()
+        +static string GetIPString(long ip)
+        +static set~long~ GetValidIPList()
+        #virtual void RecvData()*
+    }
+
+    class TcpClient {
+        -SOCKET m_sock
+        -HANDLE m_hThreadHandle
+        -bool m_isStop
+        -atomic~bool~ m_isConnected
+        +TcpClient(INetMediator* pMediator)
+        +~TcpClient()
+        +bool InitNet(const char* szBufIP, unsigned short port)
+        +void UnInitNet()
+        +bool SendData(unsigned int lSendIP, char* buf, int nlen)
+        +bool IsConnected()
+        #static unsigned int __stdcall RecvThread(void* lpvoid)
+        #virtual void RecvData()
+    }
+
+    class TcpServer {
+        -SOCKET m_sock
+        -map~uint,SOCKET~ m_mapThreadIdToSocket
+        -list~HANDLE~ m_hThreadHandleLst
+        -bool m_isStop
+        +TcpServer(INetMediator* pMediator)
+        +~TcpServer()
+        +bool InitNet(const char* szBufIP, unsigned short port)
+        +void UnInitNet()
+        +bool SendData(unsigned int lSendIP, char* buf, int nlen)
+        #static unsigned int __stdcall RecvThread(void* lpvoid)
+        #static unsigned int __stdcall AcceptThread(void* lpvoid)
+        #virtual void RecvData()
+    }
+
+    class UdpNet {
+        -SOCKET m_sock
+        -HANDLE m_hThreadHandle
+        -bool m_isStop
+        -int m_port
+        +UdpNet(INetMediator* pMediator)
+        +~UdpNet()
+        +bool InitNet(const char* szBufIP, unsigned short port)
+        +void UnInitNet()
+        +bool SendData(unsigned int lSendIP, char* buf, int nlen)
+        #static unsigned int __stdcall RecvThread(void* lpvoid)
+        #virtual void RecvData()
+    }
+
+    class INetMediator {
+        &lt;&lt;abstract, QObject&gt;&gt;
+        #INet* m_pNet
+        #char m_szBufIP[18]
+        #unsigned short m_port
+        +INetMediator()
+        +virtual ~INetMediator()
+        +virtual bool OpenNet(const char* szBufIP, unsigned short port)*
+        +virtual void CloseNet()*
+        +virtual bool SendData(unsigned int lSendIP, char* buf, int nlen)*
+        +virtual void DealData(unsigned int lSendIP, char* buf, int nlen)*
+        +void setIpAndPort(const char* szBufIP, unsigned short port)
+        +virtual bool IsConnected()
+        +virtual void disConnect()
+        ~void SIG_ReadyData(uint lSendIP, char* buf, int nlen)~
+        ~void SIG_disConnect()~
+    }
+
+    class TcpClientMediator {
+        +TcpClientMediator()
+        +~TcpClientMediator()
+        +bool OpenNet(const char* szBufIP, unsigned short port)
+        +void CloseNet()
+        +bool SendData(unsigned int lSendIP, char* buf, int nlen)
+        +void DealData(unsigned int lSendIP, char* buf, int nlen)
+        +void disConnect()
+        +bool IsConnected()
+    }
+
+    class TcpServerMediator {
+        +TcpServerMediator()
+        +~TcpServerMediator()
+        +bool OpenNet(const char* szBufIP, unsigned short port)
+        +void CloseNet()
+        +bool SendData(unsigned int lSendIP, char* buf, int nlen)
+        +void DealData(unsigned int lSendIP, char* buf, int nlen)
+    }
+
+    class UdpMediator {
+        +UdpMediator()
+        +~UdpMediator()
+        +bool OpenNet(const char* szBufIP, unsigned short port)
+        +void CloseNet()
+        +bool SendData(unsigned int lSendIP, char* buf, int nlen)
+        +void DealData(unsigned int lSendIP, char* buf, int nlen)
+    }
+
+    INet &lt;|-- TcpClient : 继承
+    INet &lt;|-- TcpServer : 继承
+    INet &lt;|-- UdpNet : 继承
+
+    INetMediator &lt;|-- TcpClientMediator : 继承
+    INetMediator &lt;|-- TcpServerMediator : 继承
+    INetMediator &lt;|-- UdpMediator : 继承
+
+    INetMediator o-- INet : m_pNet 聚合
+    INet --&gt; INetMediator : m_pMediator 关联
+
+    TcpClientMediator ..&gt; TcpClient : creates 依赖
+    TcpServerMediator ..&gt; TcpServer : creates 依赖
+    UdpMediator ..&gt; UdpNet : creates 依赖
+
+    note for INet "接口模式（Interface Pattern）\n纯虚函数定义网络层抽象\nInitNet/SendData/UnInitNet/RecvData\n支持 TCP/UDP 无缝切换"
+    note for INetMediator "中介者模式（Mediator Pattern）\n桥接网络层与业务层\n通过 Qt 信号 SIG_ReadyData 解耦\nDealData() 将数据向上传递"
+</div><h3 id="23-音频层（sdl2--opus）">2.3 音频层（SDL2 + Opus）</h3>
+<div class="mermaid">classDiagram
+    direction TB
+
+    class AudioRead {
+        &lt;&lt;QObject&gt;&gt;
+        -SDL_AudioDeviceID m_sdlCaptureDev
+        -bool m_sdlIsOpen
+        -OpusEncoder* m_opusEncoder
+        -VadInst* handle
+        -int m_AudioState
+        -int m_vadMode
+        -float m_noiseLevel
+        -float m_noiseLevelEMA
+        -int m_consecutiveSilentFrames
+        -int m_consecutiveSpeechFrames
+        -QTimer* m_vadAdjustTimer
+        -bool m_currentMuteState
+        -bool m_pendingMuteState
+        -int m_muteConfirmFrames
+        -static const int MUTE_CONFIRM_THRESHOLD
+        +AudioRead(QObject* parent)
+        +~AudioRead()
+        +void start()
+        +void pause()
+        +void slot_adjustVadMode()
+        -float calculateRMS(int16_t* data, int samples)
+        -static void audioCallback(void* userdata, Uint8* stream, int len)
+        ~void SIG_audioFrame(QByteArray bt)~
+        ~void SIG_muteStateChanged(bool isMute)~
+    }
+
+    class AudioWrite {
+        &lt;&lt;QObject&gt;&gt;
+        -SDL_AudioDeviceID m_sdlDev
+        -bool m_sdlIsOpen
+        -deque~QByteArray~ m_audioQueue
+        -mutex m_mutex
+        -OpusDecoder* m_opusDecoder
+        +AudioWrite(QObject* parent)
+        +~AudioWrite()
+        +void slot_playAudio(QByteArray bt)
+        -static void audioCallback(void* userdata, Uint8* stream, int len)
+    }
+
+    note for AudioRead "音频采集（SDL 线程驱动）\nSDL 回调每 20ms 采集 960 采样\nWebRTC VAD 静音检测 → Opus 编码\n编码后 60-120 字节/帧"
+    note for AudioWrite "音频播放（生产者-消费者模式）\nslot_playAudio: mutex 加锁入队 deque\naudioCallback: mutex 加锁出队 → Opus 解码\nSDL_MixAudioFormat 混音播放"
+</div><h3 id="24-视频采集层（opencv--qt-screen）">2.4 视频采集层（OpenCV + Qt Screen）</h3>
+<div class="mermaid">classDiagram
+    direction TB
+
+    class VideoRead {
+        &lt;&lt;QObject&gt;&gt;
+        -QTimer* m_timer
+        -cv::VideoCapture cap
+        +VideoRead(QObject* parent)
+        +~VideoRead()
+        +void slot_openVideo()
+        +void slot_closeVideo()
+        +void slot_getVideoFrame()
+        ~void SIG_sendVideoFrame(QImage img)~
+    }
+
+    class ScreenRead {
+        &lt;&lt;QObject&gt;&gt;
+        -QTimer* m_timer
+        +ScreenRead(QObject* parent)
+        +~ScreenRead()
+        +void slot_openVideo()
+        +void slot_closeVideo()
+        +void slot_getScreenFrame()
+        ~void SIG_getScreenFrame(QImage img)~
+    }
+
+    class MyFaceDetect {
+        &lt;&lt;QObject&gt;&gt;
+        +MyFaceDetect()
+        +FaceDetectInit()
+        +detectAndDisplay(Mat frame, vector~Rect~ faces)
+    }
+
+    VideoRead ..&gt; MyFaceDetect : optional 依赖
+
+    note for VideoRead "摄像头采集\nOpenCV VideoCapture 多后端支持\nQTimer 每 23ms 触发采集\nBGR→RGB→scaled(640×480)\n缩放模式: Qt::IgnoreAspectRatio"
+    note for ScreenRead "桌面共享采集\nQScreen::grabWindow(0) 截图\nQTimer 每 40ms 触发（25fps）"
+</div><h3 id="25-视频编解码层（ffmpeg-h264）">2.5 视频编解码层（FFmpeg H.264）</h3>
+<div class="mermaid">classDiagram
+    direction TB
+
+    class H264Encoder {
+        &lt;&lt;QObject&gt;&gt;
+        -AVCodecContext* m_codecCtx
+        -AVFrame* m_frame
+        -AVPacket* m_pkt
+        -SwsContext* m_swsCtx
+        -int m_width
+        -int m_height
+        -int m_fps
+        -int64_t m_frameIndex
+        -bool m_requestKeyFrame
+        -QString m_encoderName
+        +H264Encoder(QObject* parent)
+        +~H264Encoder()
+        +bool init(int width, int height, int fps, int bitrate)
+        +QByteArray encode(const QImage&amp; img)
+        +void requestKeyFrame()
+        +void close()
+        +bool isReady() const
+        +int getWidth() const
+        +int getHeight() const
+        -bool initCodec(int width, int height, int fps, int bitrate)
+        -void freeResources()
+        ~void SIG_encoded(const QByteArray&amp; h264Data, bool isKeyFrame)~
+    }
+
+    class H264Decoder {
+        &lt;&lt;QObject&gt;&gt;
+        -AVCodecContext* m_codecCtx
+        -AVFrame* m_frame
+        -AVPacket* m_pkt
+        -bool m_initialized
+        +H264Decoder(QObject* parent)
+        +~H264Decoder()
+        +bool init()
+        +AVFrame* decode(const QByteArray&amp; h264Data)
+        +void close()
+        +bool isReady() const
+        -bool initCodec()
+        -void freeResources()
+        ~void SIG_decoded(AVFrame* frame)~
+    }
+
+    note for H264Encoder "H.264 编码器封装\nQImage(RGB888) → sws_scale → YUV420P\navcodec_send_frame → avcodec_receive_packet\n帧缓冲: av_frame_get_buffer + av_frame_make_writable\n编码前 QImage 深拷贝: img.copy()\n防多线程竞态"
+    note for H264Decoder "H.264 解码器封装\n每房间成员独立一个实例（map 映射）\n延迟初始化：首次 decode 时创建上下文\nav_frame_clone 零拷贝跨线程传递\n引用计数式 AVFrame 输出"
+</div><h3 id="26-渲染层（opengl）">2.6 渲染层（OpenGL）</h3>
+<div class="mermaid">classDiagram
+    direction TB
+
+    class YuvGLWidget {
+        &lt;&lt;QOpenGLWidget, QOpenGLFunctions&gt;&gt;
+        -GLuint m_texY
+        -GLuint m_texU
+        -GLuint m_texV
+        -bool m_texturesAllocated
+        -int m_texWidth
+        -int m_texHeight
+        -QOpenGLShaderProgram* m_shader
+        -QOpenGLVertexArrayObject* m_vao
+        -QOpenGLBuffer* m_vbo
+        -AVFrame* m_frame
+        -QImage m_image
+        -bool m_useImageMode
+        +YuvGLWidget(QWidget* parent)
+        +~YuvGLWidget()
+        +void slot_setFrame(AVFrame* frame)
+        +void slot_setImage(const QImage&amp; img)
+        #void initializeGL() override
+        #void paintGL() override
+        #void resizeGL(int w, int h) override
+        -bool initShader()
+        -void initQuad()
+        -void initTextures()
+        -void uploadYuvTextures(AVFrame* frame)
+        -void cleanupGL()
+        -void computeVertexCoords(float&amp; halfW, float&amp; halfH)
+    }
+
+    class MyOpenGLWidget {
+        &lt;&lt;QOpenGLWidget, QOpenGLFunctions&gt;&gt;
+        -QImage m_image
+        -GLuint m_texture
+        +MyOpenGLWidget(QWidget* parent)
+        +void slot_setImage(QImage img)
+        #void initializeGL() override
+        #void paintGL() override
+        #void resizeGL(int w, int h) override
+        #QSize getImageScaledSize(QSize size)
+    }
+
+    note for YuvGLWidget "YUV420P GPU 渲染控件\n接收 AVFrame，分别上传 Y/U/V 三张纹理\nFragment Shader 中 BT.601 矩阵 YUV→RGB\n首帧 glTexImage2D，后续 glTexSubImage2D\nVAO/VBO + Shader（现代 OpenGL）"
+    note for MyOpenGLWidget "QImage RGBA 纹理渲染控件\n适用于 JPEG 帧、桌面共享帧\n非 H.264 路径的渲染控件"
+</div><h3 id="27-音视频同步层（单例模式）">2.7 音视频同步层（单例模式）</h3>
+<div class="mermaid">classDiagram
+    direction TB
+
+    class AVSyncManager {
+        &lt;&lt;singleton&gt;&gt;
+        -map~int,SyncContext~ m_syncContexts
+        -mutex m_mutex
+        -double m_localAudioClock
+        -double m_localVideoClock
+        -mutex m_localMutex
+        -static const double SYNC_THRESHOLD_US
+        -static const int MAX_WAIT_MS
+        -static const int CLOCK_TIMEOUT_MS
+        +static AVSyncManager&amp; getInstance()
+        +void addUser(int userId)
+        +void removeUser(int userId)
+        +void updateAudioClock(int userId, double pts)
+        +int synchronizeVideo(int userId, double video_pts, double frameDelay)
+        +int synchronizeLocalVideo(double video_pts, double frameDelay)
+        +double getAudioClock(int userId)
+        +double getVideoClock(int userId)
+        +void resetUserClock(int userId)
+        +void resetAllClocks()
+        +void pauseUser(int userId)
+        +void resumeUser(int userId)
+        +void updateLocalAudioClock(double pts)
+        +double getLocalAudioClock()
+        +static qint64 getCurrentTimeUs()
+        -AVSyncManager()
+        -SyncContext&amp; getOrCreateContext(int userId)
+        -int computeSyncDelay(SyncContext&amp; ctx, double video_pts, double frameDelay)
+    }
+
+    class SyncContext {
+        &lt;&lt;struct&gt;&gt;
+        +double audioClock
+        +double videoClock
+        +qint64 lastAudioUpdateTime
+        +qint64 lastVideoUpdateTime
+        +bool isPaused
+        +SyncContext()
+    }
+
+    AVSyncManager *-- "0..*" SyncContext : m_syncContexts 组合
+
+    note for AVSyncManager "单例模式（Meyers' Singleton）\nC++11 线程安全局部静态变量\n策略：音频主时钟，视频跟随音频\n每用户独立时钟上下文（SyncContext）\n线程安全：std::mutex 保护共享数据"
+    note for SyncContext "每远端用户独立维护一套 audio_clock / video_clock\naudioClock: 音频主时钟（微秒）\nvideoClock: 视频辅助时钟（微秒）\nisPaused: 该用户是否暂停同步"
+</div><h3 id="28-ui-层">2.8 UI 层</h3>
+<div class="mermaid">classDiagram
+    direction TB
+
+    class LoginDialog {
+        &lt;&lt;QDialog&gt;&gt;
+        -Ui::LoginDialog* ui
+        +LoginDialog(QWidget* parent)
+        +~LoginDialog()
+        +void closeEvent(QCloseEvent* event)
+        -void on_pb_commit_clicked()
+        -void on_pb_clear_register_clicked()
+        -void on_pb_commit_register_clicked()
+        -void on_pb_clear_clicked()
+        -void on_cb_login_type_currentIndexChanged(int index)
+        ~void SIG_loginCommit(QString tel, QString password)~
+        ~void SIG_registerCommit(QString tel, QString password, QString name, QString email)~
+        ~void SIG_close()~
+    }
+
+    class WeChatDialog {
+        &lt;&lt;QDialog&gt;&gt;
+        -Ui::WeChatDialog* ui
+        +WeChatDialog(QWidget* parent)
+        +~WeChatDialog()
+        +void closeEvent(QCloseEvent* event)
+        +void setInfo(QString name, int icon)
+        -void on_pb_create_clicked()
+        -void on_pb_join_clicked()
+        -void on_pb_book_clicked()
+        -void on_pb_set_clicked()
+        ~void SIG_close()~
+        ~void SIG_createRoom()~
+        ~void SIG_joinRoom()~
+        ~void SIG_bookRoom()~
+        ~void SIG_settings()~
+    }
+
+    class RoomDialog {
+        &lt;&lt;QDialog&gt;&gt;
+        -Ui::RoomDialog* ui
+        -QVBoxLayout* m_mainLayout
+        -map~int,UserShow*~ m_mapIDToUserShow
+        -QRect m_normalGeometry
+        -bool m_isMaximized
+        +RoomDialog(QWidget* parent)
+        +~RoomDialog()
+        +void slot_setInfo(QString roomid)
+        +void slot_addUserShow(UserShow* user)
+        +void slot_refreshUser(int id, QImage&amp; img)
+        +void slot_refreshUserYuv(int id, AVFrame* frame)
+        +void slot_removeUserShow(UserShow* user)
+        +void slot_removeUserShow(int id)
+        +void slot_setAudioCheck(bool check)
+        +void updateMuteStatus(bool isMute)
+        +void slot_clearUserShow()
+        +void slot_setVideoCheck(bool check)
+        +void slot_setBigImgId(int id, QString name)
+        +void slot_setScreenCheck(bool check)
+        +bool slot_hasUser(int id)
+        -void on_pb_close_clicked()
+        -void on_pb_quit_clicked()
+        -void closeEvent(QCloseEvent* event)
+        -void on_cb_audio_clicked()
+        -void on_cb_video_clicked()
+        -void on_cb_desk_clicked()
+        -void on_pb_max_clicked()
+        -void on_pb_min_clicked()
+        ~void SIG_close()~
+        ~void SIG_AudioPause()~
+        ~void SIG_AudioStart()~
+        ~void SIG_VideoStart()~
+        ~void SIG_VideoPause()~
+        ~void SIG_ScreenStart()~
+        ~void SIG_ScreenPause()~
+    }
+
+    class UserShow {
+        &lt;&lt;QWidget&gt;&gt;
+        -Ui::UserShow* ui
+        -int m_id
+        -QString m_UserName
+        -QImage m_img
+        -QImage m_defaultImg
+        -QTimer m_timer
+        -QTime m_lastTime
+        -YuvGLWidget* m_glWidget
+        +UserShow(QWidget* parent)
+        +~UserShow()
+        +int getId() const
+        +void slot_setInfo(int id, QString name)
+        +void paintEvent(QPaintEvent* event)
+        +void slot_setImage(QImage&amp; img)
+        +void slot_setFrame(AVFrame* frame)
+        +void mousePressEvent(QMouseEvent* event)
+        +void resizeEvent(QResizeEvent* event)
+        +void slot_checkTimer()
+        ~void SIG_itemClicked(int id, QString name)~
+    }
+
+    RoomDialog o-- "1..*" UserShow : m_mapIDToUserShow 聚合
+    UserShow *-- "0..1" YuvGLWidget : m_glWidget 组合
+
+    note for UserShow "用户视频显示控件\n双模式渲染：\n  slot_setImage(QImage) → QPainter 绘制\n  slot_setFrame(AVFrame) → YuvGLWidget GPU 渲染\npaintEvent 中 m_img.scaled() 使用深拷贝数据\n防止 Qt 隐式共享浅拷贝导致的竞态崩溃"
+    note for RoomDialog "房间界面控制器\n管理多个 UserShow 控件（map 映射）\nslot_refreshUser: JPEG 路径（QImage）\nslot_refreshUserYuv: H.264 路径（AVFrame）\n双路径共存，由 ckernel 按编码模式选择"
+</div><h3 id="29-工具线程层">2.9 工具/线程层</h3>
+<div class="mermaid">classDiagram
+    direction TB
+
+    class ThreadWorker {
+        &lt;&lt;QObject&gt;&gt;
+        #QThread* m_pThread
+        +ThreadWorker(QObject* parent)
+        +~ThreadWorker()
+    }
+
+    class SendVideoWorker {
+        &lt;&lt;ThreadWorker&gt;&gt;
+        +void slot_SendVideo(char* buf, int nlen)
+    }
+
+    class worker {
+        &lt;&lt;ThreadWorker&gt;&gt;
+        +~worker()
+        +void slot_doWork()
+    }
+
+    class MD5 {
+        -ulong _state[4]
+        -ulong _count[2]
+        -byte _buffer[64]
+        -byte _digest[16]
+        -bool _finished
+        -static const byte PADDING[64]
+        -static const char HEX[16]
+        -static const size_t BUFFER_SIZE
+        +MD5()
+        +MD5(const void* input, size_t length)
+        +MD5(const string&amp; str)
+        +MD5(ifstream&amp; in)
+        +void update(const void* input, size_t length)
+        +void update(const string&amp; str)
+        +void update(ifstream&amp; in)
+        +const byte* digest()
+        +string toString()
+        +void reset()
+        -void update(const byte* input, size_t length)
+        -void final()
+        -void transform(const byte block[64])
+        -void encode(const ulong* input, byte* output, size_t length)
+        -void decode(const byte* input, ulong* output, size_t length)
+        -string bytesToHexString(const byte* input, size_t length)
+    }
+
+    ThreadWorker &lt;|-- SendVideoWorker : 继承
+    ThreadWorker &lt;|-- worker : 继承
+
+    note for ThreadWorker "模板方法模式（Template Method）\n基类管理 QThread 生命周期\n子类通过 moveToThread 移入工作线程\n信号驱动工作（slot_doWork/slot_SendVideo）"
+    note for SendVideoWorker "视频发送工作线程\nslot_SendVideo 转调 ckernel::slot_SendVideo\n将阻塞式 SendData 从 UI 线程移至工作线程"
+    note for MD5 "MD5 哈希工具类\n不可拷贝（private 拷贝构造）\n用于密码加盐哈希\n密钥: vC0nF2024$SecR1t^S4ltK3y!"
+</div><hr>
+<h2 id="三、完整类关系总图">三、完整类关系总图</h2>
+<div class="mermaid">classDiagram
+    direction TB
+
+    %% ===== 核心调度层 =====
+    class ckernel {
+        &lt;&lt;singleton, QObject&gt;&gt;
+        -INetMediator* m_pClient
+        -INetMediator* m_pAVClient[2]
+        -WeChatDialog* m_pWeChatDlg
+        -LoginDialog* m_pLoginDlg
+        -RoomDialog* m_pRoomdialog
+        -AudioRead* m_pAudioRead
+        -map~int,AudioWrite*~ m_mapIDToAudioWrite
+        -VideoRead* m_pVideoRead
+        -ScreenRead* m_pScreenRead
+        -H264Encoder* m_h264Encoder
+        -map~int,H264Decoder*~ m_mapIDToH264Decoder
+        -QSharedPointer~SendVideoWorker~ m_pSendVideoWorker
+        -bool m_useH264
+        -int m_h264FrameSeq
+        -bool m_encodingPending
+        -PFUN m_netPackMap[100]
+        -int m_id
+        -int m_roomid
+        -QString m_UserName
+        -QString m_serverIP
+        +static ckernel* GetInstance()
+        +void slot_muteStateChanged(bool isMute)
+        +void slot_sendVideoFrame(QImage img)
+        +void encodeAndSendVideoFrame(QImage img)
+        +void slot_dealData(uint sock, char* buf, int nlen)
+        +void slot_dealVideoFrameH264Rq(uint sock, char* buf, int nlen)
+        +void slot_dealPliRequest(uint sock, char* buf, int nlen)
+        +void slot_h264FrameDecoded(int userId, AVFrame* frame)
+    }
+
+    %% ===== 网络层 =====
+    class INet {
+        &lt;&lt;abstract&gt;&gt;
+        #INetMediator* m_pMediator
+        +virtual bool InitNet(const char*, unsigned short)*
+        +virtual void UnInitNet()*
+        +virtual bool SendData(uint, char*, int)*
+        #virtual void RecvData()*
+    }
+    class TcpClient {
+        -SOCKET m_sock
+        -atomic~bool~ m_isConnected
+        +bool InitNet(const char*, unsigned short)
+        +bool SendData(uint, char*, int)
+    }
+    class INetMediator {
+        &lt;&lt;abstract, QObject&gt;&gt;
+        #INet* m_pNet
+        +virtual bool OpenNet(const char*, unsigned short)*
+        +virtual void CloseNet()*
+        +virtual bool SendData(uint, char*, int)*
+        ~void SIG_ReadyData(uint, char*, int)~
+    }
+    class TcpClientMediator {
+        +bool OpenNet(const char*, unsigned short)
+        +bool SendData(uint, char*, int)
+        +bool IsConnected()
+    }
+
+    %% ===== 音频层 =====
+    class AudioRead {
+        &lt;&lt;QObject&gt;&gt;
+        -OpusEncoder* m_opusEncoder
+        -VadInst* handle
+        -int m_vadMode
+        -QTimer* m_vadAdjustTimer
+        +void start()
+        +void pause()
+        +void slot_adjustVadMode()
+        ~void SIG_audioFrame(QByteArray)~
+        ~void SIG_muteStateChanged(bool)~
+    }
+    class AudioWrite {
+        &lt;&lt;QObject&gt;&gt;
+        -OpusDecoder* m_opusDecoder
+        -deque~QByteArray~ m_audioQueue
+        -mutex m_mutex
+        +void slot_playAudio(QByteArray)
+    }
+
+    %% ===== 视频采集层 =====
+    class VideoRead {
+        &lt;&lt;QObject&gt;&gt;
+        -cv::VideoCapture cap
+        +void slot_getVideoFrame()
+        ~void SIG_sendVideoFrame(QImage)~
+    }
+    class ScreenRead {
+        &lt;&lt;QObject&gt;&gt;
+        +void slot_getScreenFrame()
+        ~void SIG_getScreenFrame(QImage)~
+    }
+
+    %% ===== 视频编解码层 =====
+    class H264Encoder {
+        &lt;&lt;QObject&gt;&gt;
+        -AVCodecContext* m_codecCtx
+        -AVFrame* m_frame
+        -SwsContext* m_swsCtx
+        +bool init(int, int, int, int)
+        +QByteArray encode(const QImage&amp;)
+        +void requestKeyFrame()
+    }
+    class H264Decoder {
+        &lt;&lt;QObject&gt;&gt;
+        -AVCodecContext* m_codecCtx
+        -AVFrame* m_frame
+        +AVFrame* decode(const QByteArray&amp;)
+        +bool isReady() const
+    }
+
+    %% ===== 渲染层 =====
+    class YuvGLWidget {
+        &lt;&lt;QOpenGLWidget&gt;&gt;
+        -GLuint m_texY, m_texU, m_texV
+        -QOpenGLShaderProgram* m_shader
+        -AVFrame* m_frame
+        +void slot_setFrame(AVFrame*)
+        +void slot_setImage(const QImage&amp;)
+        #void paintGL()
+    }
+    class MyOpenGLWidget {
+        &lt;&lt;QOpenGLWidget&gt;&gt;
+        -QImage m_image
+        -GLuint m_texture
+        +void slot_setImage(QImage)
+        #void paintGL()
+    }
+
+    %% ===== 同步层 =====
+    class AVSyncManager {
+        &lt;&lt;singleton&gt;&gt;
+        -map~int,SyncContext~ m_syncContexts
+        -mutex m_mutex
+        +static AVSyncManager&amp; getInstance()
+        +int synchronizeVideo(int, double, double)
+        +void updateAudioClock(int, double)
+    }
+    class SyncContext {
+        &lt;&lt;struct&gt;&gt;
+        +double audioClock
+        +double videoClock
+        +bool isPaused
+    }
+
+    %% ===== UI 层 =====
+    class LoginDialog {
+        &lt;&lt;QDialog&gt;&gt;
+        ~void SIG_loginCommit(QString, QString)~
+        ~void SIG_registerCommit(QString, QString, QString, QString)~
+    }
+    class WeChatDialog {
+        &lt;&lt;QDialog&gt;&gt;
+        ~void SIG_createRoom()~
+        ~void SIG_joinRoom()~
+    }
+    class RoomDialog {
+        &lt;&lt;QDialog&gt;&gt;
+        -map~int,UserShow*~ m_mapIDToUserShow
+        +void slot_addUserShow(UserShow*)
+        +void slot_refreshUserYuv(int, AVFrame*)
+        +void updateMuteStatus(bool isMute)
+    }
+    class UserShow {
+        &lt;&lt;QWidget&gt;&gt;
+        -QImage m_img
+        -YuvGLWidget* m_glWidget
+        +void slot_setImage(QImage&amp;)
+        +void slot_setFrame(AVFrame*)
+    }
+
+    %% ===== 工具层 =====
+    class ThreadWorker {
+        &lt;&lt;QObject&gt;&gt;
+        #QThread* m_pThread
+    }
+    class SendVideoWorker {
+        &lt;&lt;ThreadWorker&gt;&gt;
+        +void slot_SendVideo(char*, int)
+    }
+    class MD5 {
+        +string toString()
+        +void update(const string&amp;)
+    }
+
+    %% ===== 继承关系 =====
+    INet &lt;|-- TcpClient
+    INetMediator &lt;|-- TcpClientMediator
+    ThreadWorker &lt;|-- SendVideoWorker
+
+    %% ===== 聚合/组合关系 =====
+    INetMediator o-- INet : m_pNet
+    ckernel o-- "1" INetMediator : m_pClient 信令连接
+    ckernel o-- "2" INetMediator : m_pAVClient 音视频连接
+    ckernel o-- "1" LoginDialog : m_pLoginDlg
+    ckernel o-- "1" WeChatDialog : m_pWeChatDlg
+    ckernel o-- "1" RoomDialog : m_pRoomdialog
+    ckernel o-- "1" AudioRead : m_pAudioRead
+    ckernel o-- "0..*" AudioWrite : m_mapIDToAudioWrite
+    ckernel o-- "1" VideoRead : m_pVideoRead
+    ckernel o-- "1" ScreenRead : m_pScreenRead
+    ckernel o-- "1" H264Encoder : m_h264Encoder
+    ckernel o-- "0..*" H264Decoder : m_mapIDToH264Decoder
+    ckernel o-- "1" SendVideoWorker : m_pSendVideoWorker
+    RoomDialog o-- "1..*" UserShow : m_mapIDToUserShow
+    UserShow *-- "0..1" YuvGLWidget : m_glWidget
+    AVSyncManager *-- "0..*" SyncContext : m_syncContexts
+
+    %% ===== 依赖关系 =====
+    ckernel ..&gt; AVSyncManager : singleton 访问
+    ckernel ..&gt; MD5 : 密码哈希
+    TcpClientMediator ..&gt; TcpClient : creates
+    ckernel ..&gt; H264Encoder : 编码调度
+    ckernel ..&gt; H264Decoder : 解码管理
+
+    note for ckernel "ckernel 是系统业务中枢，采用单例模式\n通过协议映射表 m_netPackMap 实现 O(1) 消息分发\n持有三路独立 TCP 连接（信令+音频+视频）\n管理所有子模块的生命周期"
+</div><hr>
+<h2 id="四、协议结构体定义">四、协议结构体定义</h2>
+<div class="mermaid">classDiagram
+    direction TB
+
+    class STRU_REGISTER_RQ {
+        &lt;&lt;struct&gt;&gt;
+        +PackType m_nType
+        +char m_tel[60]
+        +char m_name[60]
+        +char m_password[60]
+        +char m_email[60]
+    }
+
+    class STRU_REGISTER_RS {
+        &lt;&lt;struct&gt;&gt;
+        +PackType m_nType
+        +int m_lresult
+    }
+
+    class STRU_LOGIN_RQ {
+        &lt;&lt;struct&gt;&gt;
+        +PackType m_nType
+        +char m_tel[40]
+        +char m_password[40]
+    }
+
+    class STRU_LOGIN_RS {
+        &lt;&lt;struct&gt;&gt;
+        +PackType m_nType
+        +int m_userid
+        +int m_lresult
+        +char m_name[60]
+    }
+
+    class STRU_CREATEROOM_RQ {
+        &lt;&lt;struct&gt;&gt;
+        +PackType m_nType
+        +int m_UserID
+    }
+
+    class STRU_CREATEROOM_RS {
+        &lt;&lt;struct&gt;&gt;
+        +PackType m_nType
+        +int m_RoomID
+        +int m_lresult
+    }
+
+    class STRU_JOINROOM_RQ {
+        &lt;&lt;struct&gt;&gt;
+        +PackType m_nType
+        +int m_UserID
+        +int m_RoomID
+    }
+
+    class STRU_JOINROOM_RS {
+        &lt;&lt;struct&gt;&gt;
+        +PackType m_nType
+        +int m_RoomID
+        +int m_lresult
+    }
+
+    class STRU_ROOM_MEMBER_RQ {
+        &lt;&lt;struct&gt;&gt;
+        +PackType m_nType
+        +int m_UserID
+        +char m_szUser[60]
+    }
+
+    class STRU_LEAVEROOM_RQ {
+        &lt;&lt;struct&gt;&gt;
+        +PackType m_nType
+        +int m_nUserID
+        +int m_RoomID
+        +char szUserName[60]
+    }
+
+    class STRU_AUDIO_REGISTER {
+        &lt;&lt;struct&gt;&gt;
+        +PackType m_nType
+        +int m_userid
+    }
+
+    class STRU_VIDEO_REGISTER {
+        &lt;&lt;struct&gt;&gt;
+        +PackType m_nType
+        +int m_userid
+    }
+
+    class STRU_UPDATE_EMAIL_RQ {
+        &lt;&lt;struct&gt;&gt;
+        +PackType m_nType
+        +int m_userid
+        +char m_email[60]
+    }
+
+    class STRU_UPDATE_EMAIL_RS {
+        &lt;&lt;struct&gt;&gt;
+        +PackType m_nType
+        +int m_lresult
+    }
+
+    class STRU_VIDEO_FRAME_H264_HEADER {
+        &lt;&lt;struct&gt;&gt;
+        +PackType m_nType
+        +int m_userid
+        +int m_roomid
+        +int m_min
+        +int m_sec
+        +int m_msec
+        +int m_frameType
+        +int m_frameSeq
+        +int m_totalFragments
+        +int m_fragmentIndex
+    }
+
+    class STRU_PLI_REQUEST {
+        &lt;&lt;struct&gt;&gt;
+        +PackType m_nType
+        +int m_userid
+        +int m_roomid
+    }
+
+    class UserInfo {
+        &lt;&lt;struct&gt;&gt;
+        +int m_sock
+        +int m_id
+        +int m_roomid
+        +char m_userName[60]
+    }
+
+    note for STRU_VIDEO_FRAME_H264_HEADER "H.264 分片传输包头\nframeType: 0=I帧, 1=P帧\nframeSeq: 帧序号（同一帧多片共享）\ntotalFragments: 总分片数\nfragmentIndex: 当前分片（0-based）\n后接 char m_h264Data[] 可变长数据\n分片大小: H264_FRAGMENT_SIZE=4096字节"
+</div><hr>
+<h2 id="五、关键业务流程---信号槽交互路径">五、关键业务流程 - 信号槽交互路径</h2>
+<h3 id="51-用户登录流程">5.1 用户登录流程</h3>
+<div class="mermaid">sequenceDiagram
+    participant U as 用户
+    participant LD as LoginDialog
+    participant CK as ckernel
+    participant NET as TcpClientMediator
+    participant SVR as 服务器
+
+    U-&gt;&gt;LD: 输入手机号/密码
+    U-&gt;&gt;LD: 点击登录按钮
+    LD-&gt;&gt;LD: on_pb_commit_clicked()
+    LD-&gt;&gt;LD: MD5加盐哈希密码
+    LD--&gt;&gt;CK: SIG_loginCommit(tel, password)
+    CK-&gt;&gt;CK: slot_loginCommit()
+    CK-&gt;&gt;CK: 构造 STRU_LOGIN_RQ 包
+    CK-&gt;&gt;NET: SendData(m_id, buf, len)
+    NET-&gt;&gt;SVR: TCP发送登录请求
+    SVR--&gt;&gt;NET: TCP返回登录响应
+    NET--&gt;&gt;CK: SIG_ReadyData(sock, buf, len)
+    CK-&gt;&gt;CK: slot_dealData → m_netPackMap 分发
+    CK-&gt;&gt;CK: slot_dealLoginRS()
+    alt 登录成功
+        CK-&gt;&gt;LD: hide()
+        CK-&gt;&gt;CK: show WeChatDialog
+    else 登录失败
+        CK-&gt;&gt;LD: QMessageBox提示错误
+    end
+</div><h3 id="52-创建加入房间流程">5.2 创建/加入房间流程</h3>
+<div class="mermaid">sequenceDiagram
+    participant U as 用户
+    participant WD as WeChatDialog
+    participant CK as ckernel
+    participant NET as TcpClientMediator
+    participant SVR as 服务器
+    participant RD as RoomDialog
+    participant AR as AudioRead
+    participant VR as VideoRead
+
+    U-&gt;&gt;WD: 点击创建房间
+    WD--&gt;&gt;CK: SIG_createRoom()
+    CK-&gt;&gt;CK: slot_createroom()
+    CK-&gt;&gt;NET: SendData(STRU_CREATEROOM_RQ)
+    NET-&gt;&gt;SVR: TCP发送
+    SVR--&gt;&gt;NET: 创建成功(返回RoomID)
+    NET--&gt;&gt;CK: SIG_ReadyData
+    CK-&gt;&gt;CK: slot_dealCreateRoomRS()
+    CK-&gt;&gt;CK: m_roomid = roomId
+    CK-&gt;&gt;WD: hide()
+    CK-&gt;&gt;RD: show()
+    CK-&gt;&gt;RD: slot_setInfo(roomid)
+    CK-&gt;&gt;AR: start() 开始音频采集
+    CK-&gt;&gt;VR: slot_openVideo() 开始视频采集
+    Note over CK: 注册音频/视频TCP连接
+    CK-&gt;&gt;NET: m_pAVClient[0] 发送 STRU_AUDIO_REGISTER
+    CK-&gt;&gt;NET: m_pAVClient[1] 发送 STRU_VIDEO_REGISTER
+</div><h3 id="53-音频采集到播放全链路">5.3 音频采集到播放全链路</h3>
+<div class="mermaid">sequenceDiagram
+    participant SDL_IN as SDL采集线程
+    participant AR as AudioRead
+    participant CK as ckernel
+    participant RD as RoomDialog
+    participant NET as 音频TCP连接
+    participant SVR as 服务器
+    participant CK2 as 远端ckernel
+    participant AW as AudioWrite
+    participant SDL_OUT as SDL播放线程
+
+    SDL_IN-&gt;&gt;AR: audioCallback(stream, 1920字节)
+    AR-&gt;&gt;AR: WebRTC VAD检测(返回0=静音/1=有声/-1=错误)
+    AR-&gt;&gt;AR: calculateRMS 更新 m_noiseLevel
+    AR-&gt;&gt;AR: 状态平滑(连续3帧≈60ms确认)
+    alt 静音状态切换
+        AR--&gt;&gt;CK: SIG_muteStateChanged(isMute)
+        CK-&gt;&gt;CK: slot_muteStateChanged()
+        CK-&gt;&gt;RD: updateMuteStatus(isMute)
+        RD-&gt;&gt;RD: cb_audio 显示 音频(无声)/音频
+    end
+    AR-&gt;&gt;AR: 静音帧 memset 清零(配合Opus DTX)
+    AR-&gt;&gt;AR: opus_encode(960samples → 60-120字节)
+    AR--&gt;&gt;CK: SIG_audioFrame(QByteArray)
+    CK-&gt;&gt;CK: slot_audioFrame()
+    CK-&gt;&gt;CK: 构造 STRU_AUDIO_FRAME 包
+    CK-&gt;&gt;CK: AVSyncManager::updateLocalAudioClock(pts)
+    CK-&gt;&gt;NET: m_pAVClient[audio_client] SendData()
+    NET-&gt;&gt;SVR: TCP音频连接发送
+    SVR--&gt;&gt;CK2: 透明转发
+    CK2-&gt;&gt;CK2: slot_dealAudioFrameRq()
+    CK2-&gt;&gt;CK2: AVSyncManager::updateAudioClock(userId, pts)
+    CK2--&gt;&gt;AW: slot_playAudio(opusData)
+    AW-&gt;&gt;AW: mutex加锁 入队 m_audioQueue
+    SDL_OUT-&gt;&gt;AW: audioCallback()
+    AW-&gt;&gt;AW: mutex加锁 出队
+    AW-&gt;&gt;AW: opus_decode(60-120字节 → 1920字节PCM)
+    AW-&gt;&gt;AW: SDL_MixAudioFormat() 混音播放
+
+    Note over AR: 并行支路: QTimer每5秒触发 slot_adjustVadMode
+    Note over AR: 按噪声EMA自适应切换VAD模式(1=宽松/2=中等/3=严格)
+</div><h3 id="54-视频采集到渲染全链路">5.4 视频采集到渲染全链路</h3>
+<div class="mermaid">sequenceDiagram
+    participant CAM as OpenCV摄像头
+    participant VR as VideoRead
+    participant CK as ckernel
+    participant ENC as H264Encoder
+    participant WORK as SendVideoWorker
+    participant NET as 视频TCP连接
+    participant SVR as 服务器
+    participant CK2 as 远端ckernel
+    participant DEC as H264Decoder
+    participant SYNC as AVSyncManager
+    participant RD as RoomDialog
+    participant US as UserShow
+    participant GL as YuvGLWidget
+
+    CAM-&gt;&gt;VR: cap.read(frame) BGR
+    VR-&gt;&gt;VR: cvtColor BGR→RGB
+    VR-&gt;&gt;VR: scaled(640×480, IgnoreAspectRatio)
+    VR--&gt;&gt;CK: SIG_sendVideoFrame(QImage)
+    CK-&gt;&gt;CK: slot_sendVideoFrame()
+    CK-&gt;&gt;ENC: encode(QImage)
+    ENC-&gt;&gt;ENC: img.copy() 深拷贝防竞态
+    ENC-&gt;&gt;ENC: av_frame_make_writable
+    ENC-&gt;&gt;ENC: sws_scale RGB24→YUV420P
+    ENC-&gt;&gt;ENC: avcodec_send_frame/receive_packet
+    ENC--&gt;&gt;CK: H264 NAL数据(QByteArray)
+    CK-&gt;&gt;CK: 构造 STRU_VIDEO_FRAME_H264_HEADER
+    CK-&gt;&gt;CK: 按4KB分片循环
+    CK--&gt;&gt;WORK: SIG_SendVideo(buf, len)
+    WORK-&gt;&gt;WORK: slot_SendVideo() 子线程执行
+    WORK-&gt;&gt;NET: SendData 分片发送
+    NET-&gt;&gt;SVR: TCP视频连接发送
+    SVR--&gt;&gt;CK2: 透明转发
+    CK2-&gt;&gt;CK2: slot_dealVideoFrameH264Rq()
+    CK2-&gt;&gt;CK2: 分片重组(m_h264Reassemble)
+    CK2-&gt;&gt;DEC: decode(h264Data)
+    DEC-&gt;&gt;DEC: avcodec_send_packet/receive_frame
+    DEC-&gt;&gt;DEC: av_frame_clone() 零拷贝
+    DEC--&gt;&gt;CK2: AVFrame YUV420P
+    CK2-&gt;&gt;SYNC: synchronizeVideo(userId, pts, frameDelay)
+    SYNC-&gt;&gt;SYNC: diff = video_pts - audioClock
+    alt diff &gt; 10ms
+        SYNC--&gt;&gt;CK2: waitMs (等待)
+        CK2-&gt;&gt;CK2: QThread::msleep(waitMs)
+    else diff ≤ 10ms
+        SYNC--&gt;&gt;CK2: 0 (立即显示)
+    end
+    CK2-&gt;&gt;RD: slot_refreshUserYuv(userId, frame)
+    RD-&gt;&gt;US: slot_setFrame(AVFrame)
+    US-&gt;&gt;GL: slot_setFrame(AVFrame)
+    GL-&gt;&gt;GL: uploadYuvTextures
+    GL-&gt;&gt;GL: GLSL BT.601 YUV→RGB 渲染
+</div><h3 id="55-pli-关键帧请求流程">5.5 PLI 关键帧请求流程</h3>
+<div class="mermaid">sequenceDiagram
+    participant SVR as 服务器
+    participant CK2 as 远端ckernel(发送方)
+    participant CK as ckernel(新加入成员)
+    participant RD as RoomDialog
+
+    SVR--&gt;&gt;CK: DEF_PACK_ROOM_MEMBER 新成员通知
+    CK-&gt;&gt;CK: slot_dealRoomMemberRq()
+    CK-&gt;&gt;CK: 创建 UserShow 控件
+    CK-&gt;&gt;RD: slot_addUserShow(user)
+    CK-&gt;&gt;CK: AVSyncManager::addUser(userId)
+    CK-&gt;&gt;CK: new H264Decoder 加入 m_mapIDToH264Decoder
+    Note over CK: 新成员需要关键帧才能解码
+    CK-&gt;&gt;CK: 构造 STRU_PLI_REQUEST
+    CK-&gt;&gt;SVR: 发送PLI请求
+    SVR--&gt;&gt;CK2: 转发PLI请求
+    CK2-&gt;&gt;CK2: slot_dealPliRequest()
+    CK2-&gt;&gt;CK2: m_h264Encoder-&gt;requestKeyFrame()
+    Note over CK2: 下一帧强制为I帧
+    CK2-&gt;&gt;SVR: 发送I帧
+    SVR--&gt;&gt;CK: 转发I帧
+    CK-&gt;&gt;CK: 解码I帧成功
+</div><hr>
+<h2 id="六、设计模式总结">六、设计模式总结</h2>
+<table>
+<thead>
+<tr>
+<th>设计模式</th>
+<th>应用位置</th>
+<th>具体实现</th>
+<th>UML 关系</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><strong>接口模式</strong></td>
+<td>INet → TcpClient/TcpServer/UdpNet</td>
+<td>纯虚函数 InitNet/SendData/UnInitNet/RecvData</td>
+<td>`INet &lt;</td>
+<td>-- TcpClient`</td>
+</tr>
+<tr>
+<td><strong>中介者模式</strong></td>
+<td>INetMediator → TcpClientMediator 等</td>
+<td>DealData() 桥接网络层与业务层</td>
+<td><code>INetMediator o-- INet</code></td>
+<td>Qt 信号 SIG_ReadyData 解耦网络与业务</td>
+</tr>
+<tr>
+<td><strong>单例模式</strong></td>
+<td>ckernel::GetInstance()</td>
+<td>Meyers 单例（C++11 线程安全局部静态变量）</td>
+<td><code>ckernel ..&gt; ckernel</code></td>
+<td>全局唯一业务中枢</td>
+</tr>
+<tr>
+<td><strong>单例模式</strong></td>
+<td>AVSyncManager::getInstance()</td>
+<td>Meyers 单例（C++11 线程安全）</td>
+<td><code>AVSyncManager ..&gt; AVSyncManager</code></td>
+<td>全局唯一同步管理器</td>
+</tr>
+<tr>
+<td><strong>观察者模式</strong></td>
+<td>Qt 信号槽机制</td>
+<td>connect(sender, SIGNAL, receiver, SLOT)</td>
+<td><code>--&gt;&gt; SIG_xxx</code></td>
+<td>模块间松耦合通信</td>
+</tr>
+<tr>
+<td><strong>策略模式</strong></td>
+<td>m_netPackMap[100] 协议映射表</td>
+<td>PFUN 函数指针数组，O(1) 消息分发</td>
+<td><code>ckernel ..&gt; PFUN</code></td>
+<td>m_netPackMap[type - 10000] = slot_dealXxx</td>
+</tr>
+<tr>
+<td><strong>生产者-消费者</strong></td>
+<td>AudioWrite::m_audioQueue</td>
+<td>std::deque + std::mutex</td>
+<td><code>AudioWrite *-- m_audioQueue</code></td>
+<td>SDL 回调线程消费，Qt 主线程生产</td>
+</tr>
+<tr>
+<td><strong>模板方法</strong></td>
+<td>ThreadWorker → SendVideoWorker</td>
+<td>基类管理 QThread 生命周期</td>
+<td>`ThreadWorker &lt;</td>
+<td>-- SendVideoWorker`</td>
+</tr>
+<tr>
+<td><strong>零拷贝</strong></td>
+<td>H264Decoder::decode() → AVFrame</td>
+<td>av_frame_clone 引用计数</td>
+<td><code>H264Decoder ..&gt; AVFrame</code></td>
+<td>跨线程传递不复制像素数据</td>
+</tr>
+<tr>
+<td><strong>组合模式</strong></td>
+<td>AVSyncManager → SyncContext</td>
+<td>每用户独立同步上下文</td>
+<td><code>AVSyncManager *-- SyncContext</code></td>
+<td>部分随整体创建/销毁</td>
+</tr>
+</tbody></table>
+<hr>
+<h2 id="七、协议类型常量表">七、协议类型常量表</h2>
+<table>
+<thead>
+<tr>
+<th>常量名</th>
+<th>值</th>
+<th>方向</th>
+<th>对应结构体</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>DEF_PACK_REGISTER_RQ</td>
+<td>10000</td>
+<td>C→S</td>
+<td>STRU_REGISTER_RQ</td>
+<td>注册请求</td>
+</tr>
+<tr>
+<td>DEF_PACK_REGISTER_RS</td>
+<td>10001</td>
+<td>S→C</td>
+<td>STRU_REGISTER_RS</td>
+<td>注册响应</td>
+</tr>
+<tr>
+<td>DEF_PACK_LOGIN_RQ</td>
+<td>10002</td>
+<td>C→S</td>
+<td>STRU_LOGIN_RQ</td>
+<td>登录请求</td>
+</tr>
+<tr>
+<td>DEF_PACK_LOGIN_RS</td>
+<td>10003</td>
+<td>S→C</td>
+<td>STRU_LOGIN_RS</td>
+<td>登录响应</td>
+</tr>
+<tr>
+<td>DEF_PACK_CREATEROOM_RQ</td>
+<td>10004</td>
+<td>C→S</td>
+<td>STRU_CREATEROOM_RQ</td>
+<td>创建房间请求</td>
+</tr>
+<tr>
+<td>DEF_PACK_CREATEROOM_RS</td>
+<td>10005</td>
+<td>S→C</td>
+<td>STRU_CREATEROOM_RS</td>
+<td>创建房间响应</td>
+</tr>
+<tr>
+<td>DEF_PACK_JOINROOM_RQ</td>
+<td>10006</td>
+<td>C→S</td>
+<td>STRU_JOINROOM_RQ</td>
+<td>加入房间请求</td>
+</tr>
+<tr>
+<td>DEF_PACK_JOINROOM_RS</td>
+<td>10007</td>
+<td>S→C</td>
+<td>STRU_JOINROOM_RS</td>
+<td>加入房间响应</td>
+</tr>
+<tr>
+<td>DEF_PACK_ROOM_MEMBER</td>
+<td>10008</td>
+<td>S→C</td>
+<td>STRU_ROOM_MEMBER_RQ</td>
+<td>房间成员通知</td>
+</tr>
+<tr>
+<td>DEF_PACK_AUDIO_FRAME</td>
+<td>10009</td>
+<td>C→S→C</td>
+<td>(内联结构)</td>
+<td>音频帧(转发)</td>
+</tr>
+<tr>
+<td>DEF_PACK_VIDEO_FRAME</td>
+<td>10010</td>
+<td>C→S→C</td>
+<td>(内联结构)</td>
+<td>视频帧-JPEG(转发)</td>
+</tr>
+<tr>
+<td>DEF_PACK_LEAVEROOM_RQ</td>
+<td>10011</td>
+<td>C→S</td>
+<td>STRU_LEAVEROOM_RQ</td>
+<td>离开房间请求</td>
+</tr>
+<tr>
+<td>DEF_PACK_LEAVEROOM_RS</td>
+<td>10012</td>
+<td>S→C</td>
+<td>STRU_ROOM_MEMBER_RQ</td>
+<td>离开房间通知</td>
+</tr>
+<tr>
+<td>DEF_PACK_AUDIO_REGISTER</td>
+<td>10013</td>
+<td>C→S</td>
+<td>STRU_AUDIO_REGISTER</td>
+<td>音频通道注册</td>
+</tr>
+<tr>
+<td>DEF_PACK_VIDEO_REGISTER</td>
+<td>10014</td>
+<td>C→S</td>
+<td>STRU_VIDEO_REGISTER</td>
+<td>视频通道注册</td>
+</tr>
+<tr>
+<td>DEF_PACK_UPDATE_EMAIL_RQ</td>
+<td>10015</td>
+<td>C→S</td>
+<td>STRU_UPDATE_EMAIL_RQ</td>
+<td>补全邮箱请求</td>
+</tr>
+<tr>
+<td>DEF_PACK_UPDATE_EMAIL_RS</td>
+<td>10016</td>
+<td>S→C</td>
+<td>STRU_UPDATE_EMAIL_RS</td>
+<td>补全邮箱响应</td>
+</tr>
+<tr>
+<td>DEF_PACK_VIDEO_FRAME_H264</td>
+<td>10017</td>
+<td>C→S→C</td>
+<td>STRU_VIDEO_FRAME_H264_HEADER</td>
+<td>视频帧-H264(转发)</td>
+</tr>
+<tr>
+<td>DEF_PACK_PLI_REQUEST</td>
+<td>10018</td>
+<td>C→S→C</td>
+<td>STRU_PLI_REQUEST</td>
+<td>PLI关键帧请求</td>
+</tr>
+<tr>
+<td>DEF_PACK_VIDEO_SPSPPS</td>
+<td>10019</td>
+<td>C→S→C</td>
+<td>(可选)</td>
+<td>H264 SPS/PPS参数集</td>
+</tr>
+</tbody></table>
+<hr>
+<h2 id="八、类间关系完整说明">八、类间关系完整说明</h2>
+<h3 id="81-继承关系（泛化）">8.1 继承关系（泛化）</h3>
+<table>
+<thead>
+<tr>
+<th>父类</th>
+<th>子类</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>INet</td>
+<td>TcpClient</td>
+<td>TCP 客户端实现</td>
+</tr>
+<tr>
+<td>INet</td>
+<td>TcpServer</td>
+<td>TCP 服务端实现</td>
+</tr>
+<tr>
+<td>INet</td>
+<td>UdpNet</td>
+<td>UDP 网络实现</td>
+</tr>
+<tr>
+<td>INetMediator</td>
+<td>TcpClientMediator</td>
+<td>TCP 客户端中介者</td>
+</tr>
+<tr>
+<td>INetMediator</td>
+<td>TcpServerMediator</td>
+<td>TCP 服务端中介者</td>
+</tr>
+<tr>
+<td>INetMediator</td>
+<td>UdpMediator</td>
+<td>UDP 中介者</td>
+</tr>
+<tr>
+<td>ThreadWorker</td>
+<td>SendVideoWorker</td>
+<td>视频发送工作线程</td>
+</tr>
+<tr>
+<td>ThreadWorker</td>
+<td>worker</td>
+<td>示例工作线程</td>
+</tr>
+<tr>
+<td>QObject</td>
+<td>ckernel, AudioRead, AudioWrite, VideoRead, ScreenRead, H264Encoder, H264Decoder, INetMediator, ThreadWorker</td>
+<td>Qt 对象基类</td>
+</tr>
+<tr>
+<td>QDialog</td>
+<td>LoginDialog, WeChatDialog, RoomDialog</td>
+<td>Qt 对话框基类</td>
+</tr>
+<tr>
+<td>QWidget</td>
+<td>UserShow</td>
+<td>Qt 窗口部件基类</td>
+</tr>
+<tr>
+<td>QOpenGLWidget</td>
+<td>YuvGLWidget, MyOpenGLWidget</td>
+<td>Qt OpenGL 控件基类</td>
+</tr>
+</tbody></table>
+<h3 id="82-聚合关系（aggregation---弱拥有）">8.2 聚合关系（Aggregation - 弱拥有）</h3>
+<table>
+<thead>
+<tr>
+<th>聚合方</th>
+<th>被聚合方</th>
+<th>多重性</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>ckernel</td>
+<td>INetMediator (m_pClient)</td>
+<td>1</td>
+<td>信令 TCP 连接</td>
+</tr>
+<tr>
+<td>ckernel</td>
+<td>INetMediator (m_pAVClient)</td>
+<td>2</td>
+<td>音频+视频 TCP 连接</td>
+</tr>
+<tr>
+<td>ckernel</td>
+<td>LoginDialog</td>
+<td>1</td>
+<td>登录对话框</td>
+</tr>
+<tr>
+<td>ckernel</td>
+<td>WeChatDialog</td>
+<td>1</td>
+<td>主界面对话框</td>
+</tr>
+<tr>
+<td>ckernel</td>
+<td>RoomDialog</td>
+<td>1</td>
+<td>房间对话框</td>
+</tr>
+<tr>
+<td>ckernel</td>
+<td>AudioRead</td>
+<td>1</td>
+<td>音频采集器</td>
+</tr>
+<tr>
+<td>ckernel</td>
+<td>AudioWrite</td>
+<td>0..*</td>
+<td>音频播放器（每成员一个）</td>
+</tr>
+<tr>
+<td>ckernel</td>
+<td>VideoRead</td>
+<td>1</td>
+<td>摄像头采集器</td>
+</tr>
+<tr>
+<td>ckernel</td>
+<td>ScreenRead</td>
+<td>1</td>
+<td>桌面共享采集器</td>
+</tr>
+<tr>
+<td>ckernel</td>
+<td>H264Encoder</td>
+<td>1</td>
+<td>H264 编码器</td>
+</tr>
+<tr>
+<td>ckernel</td>
+<td>H264Decoder</td>
+<td>0..*</td>
+<td>H264 解码器（每成员一个）</td>
+</tr>
+<tr>
+<td>ckernel</td>
+<td>SendVideoWorker</td>
+<td>1</td>
+<td>视频发送工作线程</td>
+</tr>
+<tr>
+<td>INetMediator</td>
+<td>INet</td>
+<td>1</td>
+<td>网络底层实现</td>
+</tr>
+<tr>
+<td>RoomDialog</td>
+<td>UserShow</td>
+<td>1..*</td>
+<td>用户显示控件（每成员一个）</td>
+</tr>
+</tbody></table>
+<h3 id="83-组合关系（composition---强拥有）">8.3 组合关系（Composition - 强拥有）</h3>
+<table>
+<thead>
+<tr>
+<th>组合方</th>
+<th>被组合方</th>
+<th>多重性</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>UserShow</td>
+<td>YuvGLWidget</td>
+<td>0..1</td>
+<td>YUV 渲染控件（延迟创建）</td>
+</tr>
+<tr>
+<td>AVSyncManager</td>
+<td>SyncContext</td>
+<td>0..*</td>
+<td>同步上下文（每用户一个）</td>
+</tr>
+<tr>
+<td>ckernel</td>
+<td>H264FragmentGroup</td>
+<td>0..*</td>
+<td>分片重组缓冲区（内部结构体）</td>
+</tr>
+</tbody></table>
+<h3 id="84-依赖关系（dependency---使用）">8.4 依赖关系（Dependency - 使用）</h3>
+<table>
+<thead>
+<tr>
+<th>依赖方</th>
+<th>被依赖方</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>ckernel</td>
+<td>AVSyncManager</td>
+<td>单例访问同步管理器</td>
+</tr>
+<tr>
+<td>ckernel</td>
+<td>MD5</td>
+<td>密码加盐哈希</td>
+</tr>
+<tr>
+<td>TcpClientMediator</td>
+<td>TcpClient</td>
+<td>创建 TcpClient 实例</td>
+</tr>
+<tr>
+<td>TcpServerMediator</td>
+<td>TcpServer</td>
+<td>创建 TcpServer 实例</td>
+</tr>
+<tr>
+<td>UdpMediator</td>
+<td>UdpNet</td>
+<td>创建 UdpNet 实例</td>
+</tr>
+<tr>
+<td>VideoRead</td>
+<td>MyFaceDetect</td>
+<td>可选人脸检测</td>
+</tr>
+<tr>
+<td>ckernel</td>
+<td>H264Encoder</td>
+<td>编码调度</td>
+</tr>
+<tr>
+<td>ckernel</td>
+<td>H264Decoder</td>
+<td>解码管理</td>
+</tr>
+</tbody></table>
+<h3 id="85-关联关系（association---结构关系）">8.5 关联关系（Association - 结构关系）</h3>
+<table>
+<thead>
+<tr>
+<th>关联方</th>
+<th>被关联方</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>INet</td>
+<td>INetMediator</td>
+<td>m_pMediator 反向关联中介者</td>
+</tr>
+</tbody></table>
+<hr>
+<h2 id="九、关键设计说明">九、关键设计说明</h2>
+<h3 id="91-三路-tcp-连接架构">9.1 三路 TCP 连接架构</h3>
+<pre><code>ckernel
+  ├── m_pClient (信令连接) ──→ TcpClientMediator ──→ TcpClient ──→ 服务器:8000
+  │     用途: 登录/注册/房间管理/成员通知
+  │     特点: 低频小包，要求即时响应
+  │
+  ├── m_pAVClient[0] (音频连接) ──→ TcpClientMediator ──→ TcpClient ──→ 服务器:8000
+  │     用途: Opus 音频帧转发
+  │     特点: 高频小包（50帧/秒），要求低延迟
+  │
+  └── m_pAVClient[1] (视频连接) ──→ TcpClientMediator ──→ TcpClient ──→ 服务器:8000
+        用途: H264 视频帧分片转发
+        特点: 中频大包（30帧/秒，4KB/分片），要求高吞吐
+</code></pre>
+<blockquote>
+<p><strong>设计说明：</strong> 三路 TCP 连接分离信令与媒体流，避免大视频帧阻塞信令通道。每路连接独立的 TcpClientMediator 实例，通过 SIG_ReadyData 信号统一汇入 ckernel::slot_dealData 处理。</p>
+</blockquote>
+<h3 id="92-双路径视频渲染架构">9.2 双路径视频渲染架构</h3>
+<pre><code>ckernel::slot_sendVideoFrame(QImage)
+  │
+  ├── H264 路径（m_useH264 = true）
+  │     ├── H264Encoder::encode(QImage) → QByteArray
+  │     ├── 按 4KB 分片 → STRU_VIDEO_FRAME_H264_HEADER + h264Data
+  │     ├── SendVideoWorker 子线程发送
+  │     └── 接收端: H264Decoder::decode → AVFrame → YuvGLWidget GPU 渲染
+  │
+  └── JPEG 路径（m_useH264 = false，兼容回退）
+        ├── QImage::save(&quot;JPG&quot;) → QByteArray
+        ├── STRU_VIDEO_FRAME + jpegData
+        └── 接收端: slot_refreshUser(QImage) → QPainter CPU 渲染
+</code></pre>
+<blockquote>
+<p><strong>设计说明：</strong> H264 路径使用 GPU 加速渲染（YuvGLWidget + OpenGL Shader），JPEG 路径使用 CPU 软渲染（QPainter）。UserShow 控件通过 m_glWidget 的可见性自动切换渲染路径。</p>
+</blockquote>
+<h3 id="93-qimage-隐式共享线程安全">9.3 QImage 隐式共享线程安全</h3>
+<div class="mermaid">classDiagram
+    direction LR
+
+    class VideoThread {
+        &lt;&lt;线程&gt;&gt;
+        +MatToQImage 构造QImage
+        +emit SIG_sendVideoFrame
+    }
+
+    class MainThread {
+        &lt;&lt;线程&gt;&gt;
+        +slot_setImage
+        +paintEvent_scaled
+    }
+
+    class WorkerThread {
+        &lt;&lt;线程&gt;&gt;
+        +encodeAndSendVideoFrame
+        +H264Encoder_encode
+    }
+
+    VideoThread ..&gt; MainThread : SIG_sendVideoFrame
+    VideoThread ..&gt; WorkerThread : QTimer_singleShot
+
+    note for MainThread "竞态风险点 QImage隐式共享COW\nm_img = img 浅拷贝 共享像素数据\npaintEvent读取时可能访问已释放内存\n修复方案 m_img = img.copy 深拷贝"
+    note for WorkerThread "竞态风险点 Lambda捕获QImage\nthis img 浅拷贝捕获\n异步执行时可能访问已释放内存\n修复方案 QImage imgCopy = img.copy 深拷贝"
+</div><blockquote>
+<p><strong>设计说明：</strong> Qt 的 QImage 采用隐式共享（Copy-On-Write）机制，赋值操作是浅拷贝。在三线程架构（Video/Main/Worker）中，浅拷贝会导致竞态条件：paintEvent 读取像素数据时，原始 QImage 可能已被销毁。修复方案是在 slot_setImage 和 Lambda 捕获前使用 <code>img.copy()</code> 强制深拷贝。</p>
+</blockquote>
+<h3 id="94-ffmpeg-帧缓冲区管理">9.4 FFmpeg 帧缓冲区管理</h3>
+<pre><code>H264Encoder::encode(QImage) 流程：
+  │
+  ├── 1. QImage 深拷贝：img.copy() → 独立像素数据
+  ├── 2. av_frame_make_writable(m_frame) → 确保 YUV 帧缓冲区可写
+  ├── 3. sws_scale(m_swsCtx, RGB→YUV420P) → 色彩空间转换
+  ├── 4. avcodec_send_frame(m_codecCtx, m_frame) → 发送帧到编码器
+  └── 5. avcodec_receive_packet(m_codecCtx, m_pkt) → 接收编码后的包
+
+H264Decoder::decode(QByteArray) 流程：
+  │
+  ├── 1. avcodec_send_packet(m_codecCtx, m_pkt) → 发送包到解码器
+  ├── 2. avcodec_receive_frame(m_codecCtx, m_frame) → 接收解码后的帧
+  └── 3. av_frame_clone(m_frame) → 引用计数 +1，零拷贝跨线程传递
+</code></pre>
+<blockquote>
+<p><strong>设计说明：</strong> 编码器使用 <code>av_frame_get_buffer</code> + <code>av_frame_make_writable</code> 标准组合管理帧缓冲区，支持引用计数。解码器使用 <code>av_frame_clone</code> 实现零拷贝跨线程传递，避免像素数据复制开销。</p>
+</blockquote>
+<hr>
+<blockquote>
+<p><strong>文档版本：</strong> v2.1
+<strong>最后更新：</strong> 2026-08-01
+<strong>更新说明：</strong> 新增 WebRTC VAD 静音检测（动态阈值/状态平滑/UI联动）相关成员与方法
+<strong>数据来源：</strong> 源码头文件静态分析（ckernel.h, INet.h, TcpClient.h, INetMediator.h, audioread.h, audiowrite.h, videoread.h, screenread.h, h264encoder.h, h264decoder.h, yuvglwidget.h, myopenglwidget.h, AVSyncManager.h, threadworker.h, md5.h, roomdialog.h, usershow.h, logindialog.h, wechatdialog.h, packdef.h）
+<strong>重构内容：</strong> 基于源码头文件全面重构类图，完整标注每个类的属性（名称、类型、可见性）和方法（名称、参数、返回值、可见性），使用标准 UML 符号标识所有类间关系（继承、实现、关联、聚合、组合、依赖），添加设计模式注释和关键设计说明。</p>
+</blockquote>
+
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10.9.1/dist/mermaid.min.js"></script>
+<script>mermaid.initialize({startOnLoad:true, theme:'default', flowchart:{htmlLabels:true, curve:'basis'}, securityLevel:'loose'});</script>
+</body>
+</html>

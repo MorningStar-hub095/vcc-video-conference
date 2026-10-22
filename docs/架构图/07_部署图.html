@@ -1,0 +1,134 @@
+﻿<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>WeChat - 部署图</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:"Microsoft YaHei",sans-serif;background:#f5f7fa;padding:40px}
+.container{max-width:1200px;margin:0 auto;background:white;border-radius:12px;box-shadow:0 4px 20px rgba(0,0,0,.08);overflow:hidden}
+.header{background:linear-gradient(135deg,#6d4c41,#4e342e);color:white;padding:30px 40px}
+.header h1{font-size:26px;margin-bottom:6px}
+.header p{font-size:13px;opacity:.85}
+.section{padding:30px 40px}
+.section h2{font-size:18px;color:#6d4c41;margin-bottom:15px;padding-bottom:8px;border-bottom:2px solid #e8eaed}
+.mermaid{display:flex;justify-content:center;overflow-x:auto;margin:20px 0}
+table{width:100%;border-collapse:collapse;font-size:13px;margin:15px 0}
+th{padding:10px;border:1px solid #ddd;text-align:left;background:#6d4c41;color:white}
+td{padding:8px;border:1px solid #ddd}
+tr:nth-child(even){background:#f9f9f9}
+.desc{background:#f8f9fa;border-left:4px solid #6d4c41;padding:12px 16px;margin:15px 0;font-size:13px;line-height:1.8;border-radius:0 6px 6px 0}
+.footer{text-align:center;padding:15px;color:#999;font-size:11px;border-top:1px solid #eee}
+@media print{body{padding:0;background:white}.container{box-shadow:none}}
+</style>
+</head>
+<body>
+<div class="container">
+<div class="header">
+<h1>WeChat 音视频会议系统 - 部署图</h1>
+<p>展示系统运行时的物理部署架构，包括客户端、服务端、数据库的部署拓扑</p>
+</div>
+
+<div class="section">
+<h2>一、系统部署拓扑</h2>
+<div class="mermaid">
+graph TB
+    subgraph 客户端A["客户端A - Windows PC"]
+        direction TB
+        APP_A[WeChat.exe<br/>Qt 5.12 MinGW 32-bit]
+        FF_A[avcodec-58.dll<br/>avutil-56.dll<br/>swscale-5.dll]
+        SDL_A[SDL2.dll]
+        OPUS_A[libopus]
+        OCV_A[OpenCV DLLs]
+        CFG_A[config.ini<br/>server_ip=192.0.2.130<br/>port=8000]
+    end
+
+    subgraph 客户端B["客户端B - Windows PC"]
+        direction TB
+        APP_B[WeChat.exe<br/>Qt 5.12 MinGW 32-bit]
+        FF_B[avcodec-58.dll<br/>avutil-56.dll<br/>swscale-5.dll]
+        SDL_B[SDL2.dll]
+        OPUS_B[libopus]
+        OCV_B[OpenCV DLLs]
+    end
+
+    subgraph 服务端["服务端 - Linux"]
+        direction TB
+        SRV[PlayerHallServer<br/>epoll多路复用]
+        MYSQL[(MySQL 5.x<br/>WeChat.t_user)]
+        SRV --> MYSQL
+    end
+
+    subgraph 网络
+        direction LR
+        TCP1["TCP连接1<br/>信令/音频/视频<br/>端口:8000"]
+    end
+
+    APP_A --> TCP1
+    APP_B --> TCP1
+    TCP1 --> SRV
+</div>
+</div>
+
+<div class="section">
+<h2>二、部署规格说明</h2>
+<table>
+<tr><th>节点</th><th>操作系统</th><th>运行环境</th><th>网络配置</th><th>关键依赖</th></tr>
+<tr><td>客户端</td><td>Windows 10/11</td><td>Qt 5.12.11 MinGW 32-bit</td><td>TCP连接 192.0.2.130:8000</td><td>FFmpeg 4.2.2, SDL2 2.0.10, Opus 1.4, OpenCV</td></tr>
+<tr><td>服务端</td><td>Linux (CentOS/Ubuntu)</td><td>GCC, epoll</td><td>监听 0.0.0.0:8000</td><td>MySQL 5.x, pthread</td></tr>
+<tr><td>数据库</td><td>同服务端</td><td>MySQL 5.x</td><td>localhost:3306</td><td>WeChat 数据库, t_user 表</td></tr>
+</table>
+</div>
+
+<div class="section">
+<h2>三、网络通信架构</h2>
+<div class="mermaid">
+graph LR
+    subgraph 客户端
+        C1["连接1: 主TCP<br/>登录/注册/房间管理<br/>音频帧转发"]
+        C2["连接2: 音频TCP<br/>音视频帧传输专用"]
+        C3["连接3: 视频TCP<br/>H.264分片传输专用"]
+    end
+
+    subgraph 服务端
+        S1["Epoll事件循环<br/>LT模式 + EPOLLONESHOT"]
+        S2["clogic 协议分发<br/>函数指针映射表"]
+        S3["房间管理<br/>roomId → list userId"]
+    end
+
+    C1 -->|port:8000| S1
+    C2 -->|port:8000| S1
+    C3 -->|port:8000| S1
+    S1 --> S2
+    S2 --> S3
+</div>
+<div class="desc">
+<strong>三路TCP设计原因：</strong>音视频数据量大，与信令共用一条连接会阻塞信令响应。分离后各通道独立收发，互不影响。<br/>
+<strong>TCP_NODELAY：</strong>客户端对三条连接均设置 TCP_NODELAY 禁用 Nagle 算法，降低小包延迟。<br/>
+<strong>服务端透明转发：</strong>服务端不解析音视频数据内容，仅根据 roomId 转发给房间内其他成员。
+</div>
+</div>
+
+<div class="section">
+<h2>四、协议包格式</h2>
+<table>
+<tr><th>协议常量</th><th>包类型</th><th>方向</th><th>数据内容</th></tr>
+<tr><td>DEF_PACK_LOGIN_RQ/RS</td><td>登录</td><td>双向</td><td>tel+password / userId+name+icon</td></tr>
+<tr><td>DEF_PACK_REGISTER_RQ/RS</td><td>注册</td><td>双向</td><td>tel+password+name / result</td></tr>
+<tr><td>DEF_PACK_CREATEROOM_RQ/RS</td><td>创建房间</td><td>双向</td><td>userId / roomId+成员列表</td></tr>
+<tr><td>DEF_PACK_JOINROOM_RQ/RS</td><td>加入房间</td><td>双向</td><td>userId+roomId / result+成员列表</td></tr>
+<tr><td>DEF_PACK_AUDIO_FRAME</td><td>音频帧</td><td>C→S→C</td><td>userId+roomId+timestamp+Opus数据</td></tr>
+<tr><td>DEF_PACK_VIDEO_FRAME</td><td>视频帧(JPEG)</td><td>C→S→C</td><td>userId+roomId+timestamp+JPEG数据</td></tr>
+<tr><td>DEF_PACK_VIDEO_FRAME_H264</td><td>视频帧(H264)</td><td>C→S→C</td><td>包头+frameType+frameSeq+分片信息+H264数据</td></tr>
+<tr><td>DEF_PACK_PLI_REQUEST</td><td>关键帧请求</td><td>C→S→C</td><td>userId+roomId</td></tr>
+<tr><td>DEF_PACK_ROOM_MEMBER_RQ</td><td>成员通知</td><td>S→C</td><td>userId+userName</td></tr>
+<tr><td>DEF_PACK_LEAVEROOM_RQ</td><td>离开房间</td><td>S→C</td><td>userId</td></tr>
+</table>
+</div>
+
+<div class="footer">WeChat 音视频会议系统 - 部署图 | 生成时间：2026-07-23</div>
+</div>
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10.9.1/dist/mermaid.min.js"></script>
+<script>mermaid.initialize({startOnLoad:true,theme:'default',securityLevel:'loose',flowchart:{useMaxWidth:false,htmlLabels:true}})</script>
+</body>
+</html>

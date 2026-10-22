@@ -1,0 +1,146 @@
+﻿<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>WeChat - 系统组件图</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:"Microsoft YaHei",sans-serif;background:#f5f7fa;padding:40px}
+.container{max-width:1200px;margin:0 auto;background:white;border-radius:12px;box-shadow:0 4px 20px rgba(0,0,0,.08);overflow:hidden}
+.header{background:linear-gradient(135deg,#546e7a,#37474f);color:white;padding:30px 40px}
+.header h1{font-size:26px;margin-bottom:6px}
+.header p{font-size:13px;opacity:.85}
+.section{padding:30px 40px}
+.section h2{font-size:18px;color:#546e7a;margin-bottom:15px;padding-bottom:8px;border-bottom:2px solid #e8eaed}
+.mermaid{display:flex;justify-content:center;overflow-x:auto;margin:20px 0}
+table{width:100%;border-collapse:collapse;font-size:13px;margin:15px 0}
+th{padding:10px;border:1px solid #ddd;text-align:left;background:#546e7a;color:white}
+td{padding:8px;border:1px solid #ddd}
+tr:nth-child(even){background:#f9f9f9}
+.footer{text-align:center;padding:15px;color:#999;font-size:11px;border-top:1px solid #eee}
+@media print{body{padding:0;background:white}.container{box-shadow:none}}
+</style>
+</head>
+<body>
+<div class="container">
+<div class="header">
+<h1>WeChat 音视频会议系统 - 系统组件图</h1>
+<p>展示系统的模块划分、组件依赖关系及接口定义</p>
+</div>
+
+<div class="section">
+<h2>一、组件依赖关系图</h2>
+<div class="mermaid">
+graph TB
+    subgraph 客户端应用
+        APP[WeChat.exe<br/>Qt Application]
+    end
+
+    subgraph UI层组件
+        LD[LoginDialog<br/>登录/注册界面]
+        WD[WeChatDialog<br/>主界面]
+        RD[RoomDialog<br/>会议房间]
+        US[UserShow<br/>用户视频控件]
+    end
+
+    subgraph 核心控制层
+        CK[ckernel<br/>业务调度中枢]
+    end
+
+    subgraph 音频处理层
+        AR[AudioRead<br/>SDL采集+Opus编码]
+        AW[AudioWrite<br/>Opus解码+SDL播放]
+    end
+
+    subgraph 视频处理层
+        VR[VideoRead<br/>OpenCV摄像头采集]
+        SR[ScreenRead<br/>Qt桌面截图]
+        FD[MyFaceDetect<br/>人脸识别]
+    end
+
+    subgraph 编解码层
+        ENC[H264Encoder<br/>FFmpeg H.264编码]
+        DEC[H264Decoder<br/>FFmpeg H.264解码]
+    end
+
+    subgraph 渲染层
+        YUV[YuvGLWidget<br/>OpenGL YUV渲染]
+        OGL[MyOpenGLWidget<br/>OpenGL QImage渲染]
+    end
+
+    subgraph 同步层
+        SYNC[AVSyncManager<br/>音视频同步管理]
+    end
+
+    subgraph 网络层
+        NET[INetMediator<br/>网络中介者]
+        TCP[TcpClient/TcpServer]
+        UDP[UdpNet]
+    end
+
+    subgraph 工具层
+        MD5U[MD5<br/>哈希工具]
+        THW[ThreadWorker<br/>线程管理]
+        SW[SendVideoWorker<br/>视频发送线程]
+    end
+
+    subgraph 第三方库
+        FF[FFmpeg 4.2.2<br/>avcodec/avutil/swscale]
+        SDL[SDL2 2.0.10<br/>音频采集/播放]
+        OPUS[Opus 1.4<br/>音频编解码]
+        OCV[OpenCV 4.x<br/>视频采集/人脸检测]
+        OGL_LIB[OpenGL 2.0+<br/>GPU渲染]
+        WRTC[WebRTC VAD<br/>静音检测]
+    end
+
+    APP --> LD & WD
+    WD --> RD
+    RD --> US
+    US --> YUV & OGL
+
+    CK --> LD & WD & RD
+    CK --> AR & AW
+    CK --> VR & SR
+    CK --> ENC & DEC
+    CK --> SYNC
+    CK --> NET
+    CK --> SW
+
+    VR --> FD
+    AR --> SDL & OPUS & WRTC
+    AW --> SDL & OPUS
+    ENC --> FF
+    DEC --> FF
+    YUV --> OGL_LIB
+    OGL --> OGL_LIB
+    VR --> OCV
+    FD --> OCV
+    NET --> TCP & UDP
+    CK --> MD5U
+    SW --> THW
+</div>
+</div>
+
+<div class="section">
+<h2>二、模块接口说明</h2>
+<table>
+<tr><th>组件</th><th>对外接口</th><th>依赖组件</th><th>说明</th></tr>
+<tr><td>ckernel</td><td>slot_* 系列槽函数</td><td>所有组件</td><td>业务调度中枢，接收所有信号并分发</td></tr>
+<tr><td>AudioRead</td><td>SIG_audioFrame(QByteArray)</td><td>SDL, Opus, VAD</td><td>音频采集+编码，输出Opus数据</td></tr>
+<tr><td>AudioWrite</td><td>slot_playAudio(QByteArray)</td><td>SDL, Opus</td><td>音频解码+播放，接收Opus数据</td></tr>
+<tr><td>VideoRead</td><td>SIG_sendVideoFrame(QImage)</td><td>OpenCV</td><td>视频采集，输出RGB QImage</td></tr>
+<tr><td>H264Encoder</td><td>encode(QImage,QByteArray&)</td><td>FFmpeg</td><td>H.264编码，输入QImage输出H264数据</td></tr>
+<tr><td>H264Decoder</td><td>decode(QByteArray,AVFrame**)</td><td>FFmpeg</td><td>H.264解码，输入H264数据输出AVFrame</td></tr>
+<tr><td>YuvGLWidget</td><td>slot_setFrame(AVFrame*)</td><td>OpenGL</td><td>YUV420P GPU渲染</td></tr>
+<tr><td>AVSyncManager</td><td>synchronizeVideo(uid,frame)</td><td>无</td><td>音视频同步计算，单例</td></tr>
+<tr><td>INetMediator</td><td>SIG_ReadyData(sock,buf,len)</td><td>INet</td><td>网络数据就绪信号</td></tr>
+<tr><td>MD5</td><td>GetMD5(string) string</td><td>无</td><td>MD5哈希计算</td></tr>
+</table>
+</div>
+
+<div class="footer">WeChat 音视频会议系统 - 系统组件图 | 生成时间：2026-07-23</div>
+</div>
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10.9.1/dist/mermaid.min.js"></script>
+<script>mermaid.initialize({startOnLoad:true,theme:'default',securityLevel:'loose',flowchart:{useMaxWidth:false,htmlLabels:true}})</script>
+</body>
+</html>

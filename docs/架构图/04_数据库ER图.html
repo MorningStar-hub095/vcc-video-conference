@@ -1,0 +1,94 @@
+﻿<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>WeChat - 数据库ER图</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:"Microsoft YaHei",sans-serif;background:#f5f7fa;padding:40px}
+.container{max-width:1000px;margin:0 auto;background:white;border-radius:12px;box-shadow:0 4px 20px rgba(0,0,0,.08);overflow:hidden}
+.header{background:linear-gradient(135deg,#8e24aa,#6a1b9a);color:white;padding:30px 40px}
+.header h1{font-size:26px;margin-bottom:6px}
+.header p{font-size:13px;opacity:.85}
+.section{padding:30px 40px}
+.section h2{font-size:18px;color:#8e24aa;margin-bottom:15px;padding-bottom:8px;border-bottom:2px solid #e8eaed}
+.mermaid{display:flex;justify-content:center;overflow-x:auto;margin:20px 0}
+table{width:100%;border-collapse:collapse;font-size:13px;margin:15px 0}
+th{padding:10px;border:1px solid #ddd;text-align:left}
+td{padding:8px;border:1px solid #ddd}
+th.header-row{background:#8e24aa;color:white}
+tr:nth-child(even){background:#f9f9f9}
+.desc{background:#f8f9fa;border-left:4px solid #8e24aa;padding:12px 16px;margin:15px 0;font-size:13px;line-height:1.8;border-radius:0 6px 6px 0}
+.footer{text-align:center;padding:15px;color:#999;font-size:11px;border-top:1px solid #eee}
+@media print{body{padding:0;background:white}.container{box-shadow:none}}
+</style>
+</head>
+<body>
+<div class="container">
+<div class="header">
+<h1>WeChat 音视频会议系统 - 数据库ER图</h1>
+<p>MySQL 数据库 WeChat 库的实体关系模型，包含用户表结构及数据约束</p>
+</div>
+
+<div class="section">
+<h2>一、ER 关系图</h2>
+<div class="mermaid">
+erDiagram
+    t_user {
+        int id PK "自增主键"
+        varchar tel UK "手机号(唯一)"
+        varchar password "MD5加盐哈希密码"
+        varchar name "用户名"
+        varchar email "邮箱(可选)"
+        int icon "头像编号(默认1)"
+        varchar feeling "个性签名(默认空)"
+    }
+</div>
+<div class="desc">
+<strong>设计说明：</strong>当前系统仅使用单表 t_user 存储用户信息。房间信息为内存态数据结构（服务端维护 roomId → list&lt;userId&gt; 映射），不持久化到数据库。
+</div>
+</div>
+
+<div class="section">
+<h2>二、表结构详细说明</h2>
+<table>
+<tr><th class="header-row" colspan="6">t_user 用户表</th></tr>
+<tr><th style="width:15%">字段名</th><th style="width:12%">数据类型</th><th style="width:10%">约束</th><th style="width:10%">默认值</th><th style="width:15%">用途</th><th style="width:38%">备注</th></tr>
+<tr><td>id</td><td>INT</td><td>PK, AUTO_INCREMENT</td><td>-</td><td>用户唯一标识</td><td>登录成功后返回给客户端，用于后续协议中的 userId 字段</td></tr>
+<tr><td>tel</td><td>VARCHAR(60)</td><td>UNIQUE, NOT NULL</td><td>-</td><td>登录手机号</td><td>作为登录凭证，注册时检查唯一性</td></tr>
+<tr><td>password</td><td>VARCHAR(60)</td><td>NOT NULL</td><td>-</td><td>密码哈希值</td><td>存储 MD5(原始密码 + 盐值) 结果，服务端比对哈希值</td></tr>
+<tr><td>name</td><td>VARCHAR(60)</td><td>NOT NULL</td><td>-</td><td>用户名/昵称</td><td>注册时填写，房间内显示</td></tr>
+<tr><td>email</td><td>VARCHAR(60)</td><td>-</td><td>''</td><td>邮箱地址</td><td>可选字段，支持更新个人信息</td></tr>
+<tr><td>icon</td><td>INT</td><td>-</td><td>1</td><td>头像编号</td><td>对应客户端预设的头像资源编号</td></tr>
+<tr><td>feeling</td><td>VARCHAR(260)</td><td>-</td><td>''</td><td>个性签名</td><td>用户状态描述</td></tr>
+</table>
+</div>
+
+<div class="section">
+<h2>三、数据库操作映射</h2>
+<table>
+<tr><th style="width:20%">操作</th><th style="width:40%">SQL 语句</th><th style="width:20%">触发时机</th><th style="width:20%">对应代码</th></tr>
+<tr><td>用户注册</td><td>INSERT INTO t_user(tel,password,name) VALUES(?,?,?)</td><td>收到 REGISTER_RQ</td><td>clogic.cpp RegisterRq()</td></tr>
+<tr><td>登录验证</td><td>SELECT tel,password FROM t_user WHERE tel=?</td><td>收到 LOGIN_RQ</td><td>TCPKernel.cpp HasRegisterRq()</td></tr>
+<tr><td>获取用户信息</td><td>SELECT id,name,icon,feeling FROM t_user WHERE id=?</td><td>登录成功后</td><td>TCPKernel.cpp</td></tr>
+<tr><td>更新邮箱</td><td>UPDATE t_user SET email=? WHERE id=?</td><td>收到 UPDATE_EMAIL_RQ</td><td>clogic.cpp UpdateEmailRq()</td></tr>
+</table>
+</div>
+
+<div class="section">
+<h2>四、协议与数据库字段映射</h2>
+<table>
+<tr><th style="width:25%">协议包</th><th style="width:35%">协议字段</th><th style="width:20%">对应数据库字段</th><th style="width:20%">说明</th></tr>
+<tr><td>STRU_LOGIN_RQ</td><td>m_tel, m_password</td><td>tel, password</td><td>登录请求</td></tr>
+<tr><td>STRU_LOGIN_RS</td><td>m_userId, m_UserName, m_icon</td><td>id, name, icon</td><td>登录响应</td></tr>
+<tr><td>STRU_REGISTER_RQ</td><td>m_tel, m_password, m_name</td><td>tel, password, name</td><td>注册请求</td></tr>
+<tr><td>STRU_UPDATE_EMAIL_RQ</td><td>m_userId, m_email</td><td>id, email</td><td>更新邮箱</td></tr>
+</table>
+</div>
+
+<div class="footer">WeChat 音视频会议系统 - 数据库ER图 | 生成时间：2026-07-23</div>
+</div>
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10.9.1/dist/mermaid.min.js"></script>
+<script>mermaid.initialize({startOnLoad:true,theme:'default',securityLevel:'loose'})</script>
+</body>
+</html>

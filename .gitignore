@@ -125,4 +125,3 @@ desktop.ini
 CMakeUserPresets.json
 
 # 内部安全审计报告（含漏洞利用细节与内网 IP），不随仓库发布
-docs/

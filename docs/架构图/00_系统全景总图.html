@@ -1,0 +1,328 @@
+﻿<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>WeChat 音视频会议系统 - 系统全景总图</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:"Microsoft YaHei",sans-serif;background:#fff;padding:30px;color:#333}
+.container{max-width:1200px;margin:0 auto}
+.header{background:linear-gradient(135deg,#1a237e,#283593);color:white;padding:30px;border-radius:12px;margin-bottom:25px}
+.header h1{font-size:24px;margin-bottom:6px}
+.header p{font-size:13px;opacity:.85}
+.section{margin-bottom:25px;background:white;border:1px solid #e8eaed;border-radius:10px;padding:20px 25px}
+.section h2{font-size:17px;color:#1a237e;margin-bottom:12px;padding-bottom:6px;border-bottom:2px solid #e8eaed}
+.mermaid{display:flex;justify-content:center;overflow-x:auto;margin:10px 0}
+.desc{background:#f8f9fa;border-left:4px solid #1a237e;padding:10px 14px;margin:10px 0;font-size:12px;line-height:1.8;border-radius:0 6px 6px 0}
+.footer{text-align:center;padding:15px;color:#999;font-size:11px}
+@media print{body{padding:10px}.section{break-inside:avoid}}
+</style>
+</head>
+<body>
+<div class="container">
+
+<div class="header">
+<h1>WeChat 音视频会议系统 - 系统全景总图</h1>
+<p>所有图表内容汇总：架构分层、类结构、业务流程、数据流、状态机、部署拓扑、数据库、用例</p>
+</div>
+
+<!-- 图1：系统架构全景 -->
+<div class="section">
+<h2>一、系统架构与数据流全景</h2>
+<div class="mermaid">
+graph TB
+    subgraph 客户端A
+        A_UI[UI层: LoginDialog / WeChatDialog / RoomDialog / UserShow]
+        A_CORE[核心: ckernel 业务调度中枢]
+        A_AUDIO[音频: AudioRead SDL采集+Opus编码 / AudioWrite Opus解码+SDL播放]
+        A_VIDEO[视频: VideoRead OpenCV采集 / ScreenRead 桌面截图]
+        A_ENC[编解码: H264Encoder NVENC/QSV/libx264 / H264Decoder DXVA2/CUVID/软解]
+        A_RENDER[渲染: YuvGLWidget OpenGL三纹理YUV420P / MyOpenGLWidget QImage纹理]
+        A_SYNC[同步: AVSyncManager 音频主时钟 10ms阈值]
+        A_NET[网络: INetMediator → TcpClient 三路TCP]
+    end
+
+    subgraph 服务端
+        S_NET[TcpServer epoll LT模式]
+        S_LOGIC[clogic 协议分发 函数指针映射表]
+        S_ROOM[房间管理 roomId到成员列表]
+        S_DB[(MySQL WeChat.t_user)]
+    end
+
+    subgraph 客户端B
+        B[同客户端A架构]
+    end
+
+    A_UI --> A_CORE
+    A_CORE --> A_AUDIO
+    A_CORE --> A_VIDEO
+    A_CORE --> A_ENC
+    A_CORE --> A_SYNC
+    A_CORE --> A_NET
+    A_VIDEO --> A_ENC
+    A_ENC --> A_NET
+    A_NET -->|TCP信令+音频+视频 三路独立| S_NET
+    S_NET --> S_LOGIC
+    S_LOGIC --> S_ROOM
+    S_LOGIC --> S_DB
+    S_LOGIC -->|透明转发| B
+</div>
+</div>
+
+<!-- 图2：音视频数据流 -->
+<div class="section">
+<h2>二、音视频数据流全景</h2>
+<div class="mermaid">
+flowchart LR
+    subgraph 发送端
+        MIC[麦克风 48kHz] --> SDL_R[SDL回调 20ms]
+        SDL_R --> VAD[WebRTC VAD]
+        VAD --> OPUS_ENC[Opus编码 VOIP+DTX]
+        OPUS_ENC --> TCP_SEND[TCP发送]
+
+        CAM[摄像头 OpenCV 320x240] --> SCALE[缩放]
+        SCALE --> H264E[H264编码]
+        H264E --> FRAG[分片 4KB]
+        FRAG --> TCP_SEND
+
+        DESK[桌面截图 1024x768] --> SCALE
+    end
+
+    subgraph 服务端转发
+        SRV[epoll接收 → clogic协议分发 → 房间成员遍历 → 转发]
+    end
+
+    subgraph 接收端
+        TCP_RECV[TCP接收] --> TYPE{包类型}
+        TYPE -->|音频| OPUS_DEC[Opus解码]
+        OPUS_DEC --> SDL_P[SDL播放]
+        SDL_P --> CLK1[更新audioClock]
+
+        TYPE -->|H264| REASM[分片重组]
+        REASM --> H264D[H264解码]
+        H264D --> SYNC[AVSyncManager]
+        CLK1 --> SYNC
+
+        SYNC --> WAIT{computeSyncDelay}
+        WAIT -->|超前大于10ms| SLEEP[Sleep等待]
+        WAIT -->|同步| SHOW[立即渲染]
+        WAIT -->|落后| SHOW
+        SLEEP --> GL[YuvGLWidget OpenGL渲染]
+        SHOW --> GL
+    end
+
+    TCP_SEND --> SRV
+    SRV --> TCP_RECV
+</div>
+<div class="desc">
+<strong>数据量：</strong>音频 PCM 96KB/s → Opus 4.5KB/s（压缩率95.3%）| 视频 H264 120KB/s（压缩率97%）| JPEG 300KB/s
+</div>
+</div>
+
+<!-- 图3：业务流程 -->
+<div class="section">
+<h2>三、业务流程全景</h2>
+<div class="mermaid">
+flowchart TD
+    subgraph 登录注册
+        S([启动]) --> F1{账号?}
+        F1 -->|有| F2[手机号+密码]
+        F1 -->|无| F3[手机号+密码+用户名]
+        F2 --> F4[MD5加盐哈希]
+        F3 --> F4
+        F4 --> F5{登录或注册}
+        F5 -->|LOGIN_RQ| F6{MySQL验证}
+        F5 -->|REGISTER_RQ| F7{手机号唯一?}
+        F6 -->|成功| F8[进入主界面]
+        F6 -->|失败| F2
+        F7 -->|是| F9[INSERT t_user]
+        F7 -->|否| F3
+        F9 --> F2
+    end
+
+    subgraph 房间管理
+        R1[主界面] --> R2{创建或加入}
+        R2 -->|创建| R3[CREATEROOM_RQ → 服务端分配roomId]
+        R2 -->|加入| R4[JOINROOM_RQ → 服务端查找房间]
+        R3 --> R5[RoomDialog 添加本用户]
+        R4 --> R6{房间存在?}
+        R6 -->|是| R7[RoomDialog 添加所有成员]
+        R6 -->|否| R4
+        R7 --> R8[服务端广播其他成员]
+    end
+
+    subgraph 房间内媒体状态
+        M1([无媒体]) -->|开麦克风| M2[仅音频]
+        M1 -->|开摄像头| M3[仅视频]
+        M2 -->|开摄像头| M4[音视频]
+        M3 -->|开麦克风| M4
+        M4 -->|开桌面共享| M5[屏幕共享]
+    end
+</div>
+</div>
+
+<!-- 图4：状态机 -->
+<div class="section">
+<h2>四、状态转换全景</h2>
+<div class="mermaid">
+stateDiagram-v2
+    state "音频采集状态机" as AudioSM {
+        [*] --> stopped
+        stopped --> playing : start / SDL_PauseAudioDevice 0
+        playing --> pausing : pause / SDL_PauseAudioDevice 1
+        pausing --> playing : start / SDL_PauseAudioDevice 0
+    }
+
+    state "编码器状态机" as EncoderSM {
+        [*] --> 查找编码器
+        查找编码器 --> NVENC : h264_nvenc
+        NVENC --> 就绪 : avcodec_open2 成功
+        查找编码器 --> QSV : nvenc失败
+        QSV --> 就绪 : 成功
+        查找编码器 --> libx264 : qsv失败
+        libx264 --> 就绪 : 成功
+        查找编码器 --> JPEG回退 : 全部失败
+        就绪 --> 编码中 : encode
+        编码中 --> 就绪 : 完成
+        就绪 --> [*] : cleanup
+    }
+
+    state "同步状态机" as SyncSM {
+        [*] --> 无时钟
+        无时钟 --> 音频就绪 : updateAudioClock
+        音频就绪 --> 同步显示 : diff小于10ms
+        音频就绪 --> 等待显示 : diff大于10ms 视频超前
+        音频就绪 --> 丢帧追赶 : diff小于负10ms 视频落后
+        等待显示 --> 同步显示 : Sleep后
+        丢帧追赶 --> 同步显示 : 立即显示
+    }
+</div>
+</div>
+
+<!-- 图5：类结构与设计模式 -->
+<div class="section">
+<h2>五、类结构与设计模式全景（27个类）</h2>
+<div class="mermaid">
+graph LR
+    subgraph 网络层-接口模式
+        INet[INet接口] -->|实现| TcpClient
+        INet -->|实现| TcpServer
+        INet -->|实现| UdpNet
+        IMed[INetMediator接口] -->|实现| TcpClientMed
+        IMed -->|实现| TcpServerMed
+        IMed -->|实现| UdpMed
+        IMed -->|组合| INet
+    end
+
+    subgraph 核心层
+        CK[ckernel 中介者]
+        CK -->|组合| IMed
+        CK -->|组合| LD[LoginDialog]
+        CK -->|组合| WD[WeChatDialog]
+        CK -->|组合| RD[RoomDialog]
+        CK -->|组合| AR[AudioRead]
+        CK -->|组合| AW[AudioWrite]
+        CK -->|组合| VR[VideoRead]
+        CK -->|组合| ENC[H264Encoder]
+        CK -->|使用| SYNC[AVSyncManager单例]
+        CK -->|使用| MD5[MD5工具]
+    end
+
+    subgraph 同步层-单例模式
+        SYNC -->|组合| SC[SyncContext 每用户]
+    end
+
+    subgraph 音频层
+        AR -->|SDL采集| SDL_LIB[SDL2]
+        AR -->|编码| OPUS_LIB[Opus]
+        AW -->|解码| OPUS_LIB
+        AW -->|播放| SDL_LIB
+    end
+
+    subgraph 视频层
+        VR -->|采集| OCV[OpenCV]
+        VR -->|组合| FD[MyFaceDetect]
+        FD -->|检测| OCV
+    end
+
+    subgraph 编解码层
+        ENC -->|RGB到YUV| FF[FFmpeg]
+        DEC[H264Decoder] -->|解码| FF
+    end
+
+    subgraph 渲染层
+        YUV[YuvGLWidget] -->|三纹理| OGL[OpenGL]
+        OGLW[MyOpenGLWidget] -->|纹理| OGL
+    end
+
+    subgraph UI层
+        RD -->|组合| US[UserShow]
+        US -->|组合| YUV
+        US -->|组合| OGLW
+    end
+
+    subgraph 线程层-模板方法
+        THW[ThreadWorker基类] -->|继承| SW[SendVideoWorker]
+    end
+</div>
+</div>
+
+<!-- 图6：部署拓扑 -->
+<div class="section">
+<h2>六、部署拓扑与数据库全景</h2>
+<div class="mermaid">
+graph LR
+    subgraph 客户端A
+        CA[WeChat.exe<br/>Qt5 + FFmpeg4.2 + SDL2<br/>+ Opus1.4 + OpenCV + OpenGL]
+    end
+    subgraph 客户端B
+        CB[WeChat.exe<br/>同客户端A]
+    end
+    subgraph 服务端
+        SV[PlayerHallServer<br/>Linux epoll LT模式<br/>clogic协议分发]
+        DB[(MySQL<br/>WeChat.t_user<br/>id/tel/password/name/email/icon/feeling)]
+        SV --> DB
+    end
+    CA -->|TCP连接1 信令| SV
+    CA -->|TCP连接2 音频| SV
+    CA -->|TCP连接3 视频| SV
+    CB -->|TCP连接1 信令| SV
+    CB -->|TCP连接2 音频| SV
+    CB -->|TCP连接3 视频| SV
+</div>
+<div class="desc">
+<strong>协议包格式：</strong>[4字节包长][PackType type][int userId] + 业务字段<br/>
+<strong>主要协议：</strong>LOGIN_RQ/RS | REGISTER_RQ/RS | CREATEROOM | JOINROOM | LEAVEROOM | AUDIO_FRAME | VIDEO_FRAME | VIDEO_FRAME_H264(分片4KB) | PLI_REQUEST(关键帧请求)
+</div>
+</div>
+
+<!-- 图7：用例全景 -->
+<div class="section">
+<h2>七、用户用例全景（13个用例）</h2>
+<div class="mermaid">
+graph LR
+    ACTOR((用户)) --> UC1[登录]
+    ACTOR --> UC2[注册]
+    ACTOR --> UC3[创建房间]
+    ACTOR --> UC4[加入房间]
+    ACTOR --> UC5[退出房间]
+    ACTOR --> UC6[开关摄像头]
+    ACTOR --> UC7[开关麦克风]
+    ACTOR --> UC8[桌面共享]
+    ACTOR --> UC9[查看成员]
+    ACTOR --> UC10[音视频通话]
+    ACTOR --> UC11[人脸标记]
+    ACTOR --> UC12[音视频同步]
+    ACTOR --> UC13[PLI关键帧]
+    SERVER((服务端)) --> UC10
+    SERVER --> UC9
+</div>
+</div>
+
+<div class="footer">WeChat 音视频会议系统 - 系统全景总图 | 生成时间：2026-07-23</div>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10.9.1/dist/mermaid.min.js"></script>
+<script>mermaid.initialize({startOnLoad:true,theme:'default',securityLevel:'loose',flowchart:{useMaxWidth:true,htmlLabels:true,curve:'basis'},stateDiagram:{useMaxWidth:true}})</script>
+</body>
+</html>

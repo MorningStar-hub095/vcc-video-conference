@@ -1,0 +1,156 @@
+﻿<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>WeChat - 活动图</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:"Microsoft YaHei",sans-serif;background:#f5f7fa;padding:40px}
+.container{max-width:1200px;margin:0 auto;background:white;border-radius:12px;box-shadow:0 4px 20px rgba(0,0,0,.08);overflow:hidden}
+.header{background:linear-gradient(135deg,#1565c0,#0d47a1);color:white;padding:30px 40px}
+.header h1{font-size:26px;margin-bottom:6px}
+.header p{font-size:13px;opacity:.85}
+.section{padding:30px 40px}
+.section h2{font-size:18px;color:#1565c0;margin-bottom:15px;padding-bottom:8px;border-bottom:2px solid #e8eaed}
+.mermaid{display:flex;justify-content:center;overflow-x:auto;margin:20px 0}
+.desc{background:#f8f9fa;border-left:4px solid #1565c0;padding:12px 16px;margin:15px 0;font-size:13px;line-height:1.8;border-radius:0 6px 6px 0}
+.footer{text-align:center;padding:15px;color:#999;font-size:11px;border-top:1px solid #eee}
+@media print{body{padding:0;background:white}.container{box-shadow:none}}
+</style>
+</head>
+<body>
+<div class="container">
+<div class="header">
+<h1>WeChat 音视频会议系统 - 活动图</h1>
+<p>描述系统核心操作的活动流程，覆盖视频编码发送、音频处理、同步等待等并行活动</p>
+</div>
+
+<div class="section">
+<h2>一、视频帧编码发送活动图</h2>
+<div class="mermaid">
+flowchart TD
+    A([开始]) --> B[OpenCV采集摄像头帧]
+    B --> B1[cvtColor BGR→RGB]
+    B1 --> B2[缩放 320x240]
+    B2 --> C{H.264编码器可用?}
+
+    C -->|是| D[H264Encoder.encode]
+    C -->|否| E[JPEG软编码 qt_image2jpg]
+
+    D --> D1[QImage→RGB24 指针]
+    D1 --> D2[sws_scale RGB→YUV420P]
+    D2 --> D3[avcodec_send_frame]
+    D3 --> D4[avcodec_receive_packet]
+    D4 --> F{编码成功?}
+
+    E --> F
+
+    F -->|是| G[构建协议包头]
+    F -->|否| Z([丢弃本帧])
+
+    G --> G1[type+userId+roomId+timestamp]
+    G1 --> H{H.264路径?}
+
+    H -->|是| I[添加H264专用头<br/>frameType+frameSeq<br/>totalFragments+fragmentIndex]
+    H -->|否| J[添加JPEG包头]
+
+    I --> K{数据 > 4KB?}
+    K -->|是| L[分片:每片4KB]
+    K -->|否| M[单片发送]
+    L --> N[SIG_SendVideo信号]
+    M --> N
+    J --> N
+
+    N --> O[SendVideoWorker子线程]
+    O --> P{发送延迟 > 300ms?}
+    P -->|是| Q[丢帧防止堆积]
+    P -->|否| R[TCP SendData发送]
+    R --> S([等待下一帧])
+    Q --> S
+    Z --> S
+
+    subgraph 图例
+        direction LR
+        L1[■ 蓝色=处理步骤]
+        L2[◆ 棱形=判断分支]
+        L3[● 圆形=起止]
+    end
+</div>
+</div>
+
+<div class="section">
+<h2>二、音频采集编码活动图</h2>
+<div class="mermaid">
+flowchart TD
+    A([SDL回调触发<br/>每20ms]) --> B[读取960采样<br/>1920字节 PCM数据]
+    B --> C{WebRTC VAD启用?}
+    C -->|是| D[WebRtcVad_Process]
+    D --> E{是静音帧?}
+    E -->|是| F[清零PCM数据]
+    E -->|否| G[保留原始数据]
+    C -->|否| G
+    F --> G
+
+    G --> H[opus_encode编码]
+    H --> I{编码成功?}
+    I -->|是| J[构建QByteArray<br/>Opus编码数据]
+    I -->|否| K[记录错误日志]
+
+    J --> L[SIG_audioFrame信号]
+    L --> M[ckernel::slot_audioFrame]
+    M --> N[序列化协议包<br/>type+userId+roomId+timestamp+data]
+    N --> O[TCP发送至音频连接]
+    O --> P([等待下次回调])
+    K --> P
+</div>
+</div>
+
+<div class="section">
+<h2>三、接收端音视频同步活动图</h2>
+<div class="mermaid">
+flowchart TD
+    A([数据到达]) --> B{包类型?}
+
+    B -->|音频帧| C1[Opus解码数据入队]
+    C1 --> C2[SDL回调取出数据]
+    C2 --> C3[opus_decode解码]
+    C3 --> C4[SDL_MixAudioFormat播放]
+    C4 --> C5[updateAudioClock<br/>更新音频时钟]
+    C5 --> Z1([继续接收])
+
+    B -->|视频帧| V1[H.264分片重组]
+    V1 --> V2[H264Decoder.decode]
+    V2 --> V3[avcodec_send_packet]
+    V3 --> V4[avcodec_receive_frame]
+    V4 --> V5[av_frame_clone<br/>引用计数+1]
+
+    V5 --> SYNC[AVSyncManager]
+    SYNC --> S1[updateVideoClock]
+    S1 --> S2[computeSyncDelay]
+    S2 --> S3{diff = video - audio}
+
+    S3 -->|diff > 10ms<br/>视频超前| W1[Sleep等待<br/>最大100ms]
+    W1 --> RENDER
+
+    S3 -->|diff 小于等于 10ms<br/>同步正常| RENDER
+
+    S3 -->|diff < -10ms<br/>视频落后| D1[立即显示<br/>追赶策略]
+    D1 --> RENDER
+
+    RENDER[RoomDialog<br/>slot_refreshUserYuv]
+    RENDER --> R2[UserShow<br/>slot_setFrame]
+    R2 --> R3[YuvGLWidget<br/>slot_setFrame]
+    R3 --> R4[av_frame_clone]
+    R4 --> R5[uploadYuvTextures<br/>Y/U/V三纹理]
+    R5 --> R6[paintGL<br/>GLSL BT.601<br/>YUV→RGB转换]
+    R6 --> R7[glDrawArrays<br/>渲染到屏幕]
+    R7 --> Z2([继续接收])
+</div>
+</div>
+
+<div class="footer">WeChat 音视频会议系统 - 活动图 | 生成时间：2026-07-23</div>
+</div>
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10.9.1/dist/mermaid.min.js"></script>
+<script>mermaid.initialize({startOnLoad:true,theme:'default',securityLevel:'loose',flowchart:{useMaxWidth:false,htmlLabels:true}})</script>
+</body>
+</html>

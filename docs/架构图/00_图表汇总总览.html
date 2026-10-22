@@ -1,0 +1,404 @@
+﻿<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>WeChat 音视频会议系统 - 图表汇总总览</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:"Microsoft YaHei","PingFang SC",sans-serif;background:#f0f2f5;padding:30px;color:#333}
+.container{max-width:1300px;margin:0 auto}
+.cover{background:linear-gradient(135deg,#1a237e,#283593,#3949ab);color:white;border-radius:16px;padding:50px;text-align:center;margin-bottom:30px;box-shadow:0 8px 32px rgba(26,35,126,.3)}
+.cover h1{font-size:32px;margin-bottom:10px;letter-spacing:2px}
+.cover p{font-size:15px;opacity:.85;line-height:1.6}
+.cover .meta{margin-top:20px;font-size:13px;opacity:.7}
+
+.toc{background:white;border-radius:12px;padding:30px 40px;margin-bottom:30px;box-shadow:0 2px 12px rgba(0,0,0,.06)}
+.toc h2{font-size:20px;color:#1a237e;margin-bottom:15px;border-bottom:2px solid #e8eaed;padding-bottom:8px}
+.toc-grid{display:grid;grid-template-columns:repeat(2,1fr);gap:10px}
+.toc-item{display:flex;align-items:center;padding:8px 12px;border-radius:6px;background:#f8f9fa;font-size:13px;transition:background .2s}
+.toc-item:hover{background:#e8eaf6}
+.toc-num{width:28px;height:28px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-weight:700;font-size:12px;color:white;margin-right:10px;flex-shrink:0}
+.toc-item a{color:#333;text-decoration:none}
+
+.card{background:white;border-radius:12px;margin-bottom:24px;box-shadow:0 2px 12px rgba(0,0,0,.06);overflow:hidden}
+.card-header{padding:20px 30px;display:flex;align-items:center;gap:15px}
+.card-badge{width:40px;height:40px;border-radius:10px;display:flex;align-items:center;justify-content:center;font-size:18px;font-weight:700;color:white;flex-shrink:0}
+.card-title{font-size:18px;font-weight:700}
+.card-subtitle{font-size:12px;color:#666;margin-top:2px}
+.card-body{padding:0 30px 20px}
+.card-desc{font-size:13px;line-height:1.8;color:#555;margin-bottom:12px;background:#f8f9fa;padding:12px 16px;border-radius:8px;border-left:4px solid #ccc}
+.card-table{width:100%;border-collapse:collapse;font-size:12px;margin-top:10px}
+.card-table th{background:#f1f3f4;padding:6px 10px;text-align:left;font-weight:600;border:1px solid #e0e0e0}
+.card-table td{padding:6px 10px;border:1px solid #e0e0e0}
+.card-link{display:inline-block;padding:4px 12px;background:#e8eaf6;color:#283593;border-radius:12px;font-size:12px;text-decoration:none;margin:2px}
+
+.color-01{background:#1a73e8}.color-02{background:#43a047}.color-03{background:#fb8c00}
+.color-04{background:#8e24aa}.color-05{background:#00897b}.color-06{background:#546e7a}
+.color-07{background:#6d4c41}.color-08{background:#1565c0}.color-09{background:#e53935}
+.color-00{background:#1a237e}
+
+.summary-section{background:white;border-radius:12px;padding:30px 40px;margin-bottom:30px;box-shadow:0 2px 12px rgba(0,0,0,.06)}
+.summary-section h2{font-size:20px;color:#1a237e;margin-bottom:15px;border-bottom:2px solid #e8eaed;padding-bottom:8px}
+.mermaid{display:flex;justify-content:center;overflow-x:auto;margin:15px 0}
+
+.stats{display:grid;grid-template-columns:repeat(4,1fr);gap:15px;margin-bottom:30px}
+.stat-card{background:white;border-radius:12px;padding:20px;text-align:center;box-shadow:0 2px 12px rgba(0,0,0,.06)}
+.stat-num{font-size:32px;font-weight:700;color:#1a237e}
+.stat-label{font-size:12px;color:#666;margin-top:4px}
+
+.footer{text-align:center;padding:20px;color:#999;font-size:11px}
+@media print{body{padding:10px;background:white}.container{max-width:100%}.card{break-inside:avoid}}
+</style>
+</head>
+<body>
+<div class="container">
+
+<!-- 封面 -->
+<div class="cover">
+<h1>WeChat 音视频会议系统</h1>
+<p>项目图表汇总总览文档</p>
+<p>涵盖 UML类图、业务流程图、用例图、时序图、ER图、状态图、组件图、部署图、活动图、数据流图 共10类图表</p>
+<div class="meta">项目技术栈：C++ / Qt 5 / FFmpeg / OpenGL / SDL2 / Opus / OpenCV / MySQL</div>
+</div>
+
+<!-- 统计卡片 -->
+<div class="stats">
+<div class="stat-card"><div class="stat-num">10</div><div class="stat-label">图表类型</div></div>
+<div class="stat-card"><div class="stat-num">27</div><div class="stat-label">UML类</div></div>
+<div class="stat-card"><div class="stat-num">4</div><div class="stat-label">时序场景</div></div>
+<div class="stat-card"><div class="stat-num">5</div><div class="stat-label">状态机</div></div>
+</div>
+
+<!-- 目录 -->
+<div class="toc">
+<h2>目录索引</h2>
+<div class="toc-grid">
+<div class="toc-item"><div class="toc-num color-00">00</div><a href="#sec00">系统全景总图 - 所有图表内容汇总</a></div>
+<div class="toc-item"><div class="toc-num color-01">01</div><a href="#sec01">业务流程图 - 用户登录/注册/房间管理/音视频通信</a></div>
+<div class="toc-item"><div class="toc-num color-02">02</div><a href="#sec02">用户用例图 - 13个用例/4个参与者</a></div>
+<div class="toc-item"><div class="toc-num color-03">03</div><a href="#sec03">系统时序图 - 登录/H264编码/解码同步/房间加入</a></div>
+<div class="toc-item"><div class="toc-num color-04">04</div><a href="#sec04">数据库ER图 - MySQL t_user表结构</a></div>
+<div class="toc-item"><div class="toc-num color-05">05</div><a href="#sec05">状态转换图 - 音频/TCP/房间/编码器/同步状态机</a></div>
+<div class="toc-item"><div class="toc-num color-06">06</div><a href="#sec06">组件图 - 10层组件依赖与接口</a></div>
+<div class="toc-item"><div class="toc-num color-07">07</div><a href="#sec07">部署图 - 客户端/服务端/数据库部署拓扑</a></div>
+<div class="toc-item"><div class="toc-num color-08">08</div><a href="#sec08">活动图 - 视频编码/音频处理/同步渲染</a></div>
+<div class="toc-item"><div class="toc-num color-09">09</div><a href="#sec09">数据流图 - 音频流/视频流/信令流/三通道全景</a></div>
+<div class="toc-item"><div class="toc-num color-00">10</div><a href="#sec10">UML类图 - 27个类的完整类关系</a></div>
+</div>
+</div>
+
+<!-- ==================== 各图详情 ==================== -->
+
+<!-- 01 业务流程图 -->
+<div class="card" id="sec01">
+<div class="card-header">
+<div class="card-badge color-01">01</div>
+<div><div class="card-title">业务流程图</div><div class="card-subtitle">Business Flow Diagram</div></div>
+</div>
+<div class="card-body">
+<div class="card-desc">
+<strong>用途：</strong>描述系统核心业务流程，覆盖用户登录/注册、房间创建/加入/退出、音视频采集编码传输的完整业务链路。帮助开发团队和业务方理解系统的端到端流程。<br/>
+<strong>包含内容：</strong>3个子流程图（登录注册流程、房间管理流程、音视频通信流程）
+</div>
+<table class="card-table">
+<tr><th style="width:15%">文件名</th><th style="width:12%">格式</th><th style="width:10%">大小</th><th>内容摘要</th></tr>
+<tr><td>01_业务流程图.pdf</td><td>PDF</td><td>363.7 KB</td><td>登录注册(MD5加盐) → 房间管理(创建/加入/退出) → 音视频通信(SDL采集+Opus编码+H264编码 → TCP传输 → 解码同步渲染)</td></tr>
+<tr><td>01_业务流程图.html</td><td>HTML</td><td>-</td><td>交互式版本，浏览器打开可缩放查看</td></tr>
+</table>
+<div style="margin-top:8px"><span class="card-link">Mermaid</span><span class="card-link">flowchart</span><span class="card-link">3个子图</span></div>
+</div>
+</div>
+
+<!-- 02 用户用例图 -->
+<div class="card" id="sec02">
+<div class="card-header">
+<div class="card-badge color-02">02</div>
+<div><div class="card-title">用户用例图</div><div class="card-subtitle">Use Case Diagram</div></div>
+</div>
+<div class="card-body">
+<div class="card-desc">
+<strong>用途：</strong>识别系统参与者（Actor）及其与系统的交互用例，定义功能边界。用于需求分析阶段确认系统功能范围，也是测试用例设计的基础。<br/>
+<strong>包含内容：</strong>用例总览图、用例详细说明表（前置条件/基本流程/异常流程）、用例关系图（include/extend）
+</div>
+<table class="card-table">
+<tr><th style="width:15%">文件名</th><th style="width:12%">格式</th><th style="width:10%">大小</th><th>内容摘要</th></tr>
+<tr><td>02_用户用例图.pdf</td><td>PDF</td><td>320.4 KB</td><td>13个用例(登录/注册/创建房间/加入房间/退出/摄像头/麦克风/桌面共享/音视频通话/人脸识别/同步/PLI) + 4个参与者(用户/服务端/麦克风/摄像头)</td></tr>
+</table>
+<div style="margin-top:8px"><span class="card-link">graph LR</span><span class="card-link">13个用例</span><span class="card-link">include/extend关系</span></div>
+</div>
+</div>
+
+<!-- 03 系统时序图 -->
+<div class="card" id="sec03">
+<div class="card-header">
+<div class="card-badge color-03">03</div>
+<div><div class="card-title">系统时序图</div><div class="card-subtitle">Sequence Diagram</div></div>
+</div>
+<div class="card-body">
+<div class="card-desc">
+<strong>用途：</strong>展示系统核心交互的时序关系，明确各组件之间的消息传递顺序和时间线。用于理解跨模块协作、定位时序相关的Bug、以及接口设计验证。<br/>
+<strong>包含内容：</strong>4个时序场景（用户登录、H.264视频编码发送、接收端解码同步渲染、新成员加入+PLI关键帧请求）
+</div>
+<table class="card-table">
+<tr><th style="width:15%">文件名</th><th style="width:12%">格式</th><th style="width:10%">大小</th><th>内容摘要</th></tr>
+<tr><td>03_系统时序图.pdf</td><td>PDF</td><td>410.6 KB</td><td>登录(LoginDialog→ckernel→TcpClient→服务端→MySQL) | H264编码(摄像头→OpenCV→H264Encoder→ckernel→TCP) | 解码同步(服务端→ckernel→H264Decoder→AVSyncManager→YuvGLWidget) | PLI(用户B加入→服务端广播→用户A requestKeyFrame)</td></tr>
+</table>
+<div style="margin-top:8px"><span class="card-link">sequenceDiagram</span><span class="card-link">4个场景</span><span class="card-link">alt/loop片段</span></div>
+</div>
+</div>
+
+<!-- 04 数据库ER图 -->
+<div class="card" id="sec04">
+<div class="card-header">
+<div class="card-badge color-04">04</div>
+<div><div class="card-title">数据库ER图</div><div class="card-subtitle">Entity-Relationship Diagram</div></div>
+</div>
+<div class="card-body">
+<div class="card-desc">
+<strong>用途：</strong>展示数据库的实体关系模型，包括表结构、字段约束、主外键关系。用于数据库设计评审、SQL开发参考、以及数据字典维护。<br/>
+<strong>包含内容：</strong>ER关系图、t_user表结构详细说明（7个字段）、数据库操作映射表（4个SQL操作）、协议与数据库字段映射
+</div>
+<table class="card-table">
+<tr><th style="width:15%">文件名</th><th style="width:12%">格式</th><th style="width:10%">大小</th><th>内容摘要</th></tr>
+<tr><td>04_数据库ER图.pdf</td><td>PDF</td><td>235.7 KB</td><td>t_user表(id/tel/password/name/email/icon/feeling) + 4个SQL操作(注册INSERT/登录SELECT/获取信息SELECT/更新邮箱UPDATE)</td></tr>
+</table>
+<div style="margin-top:8px"><span class="card-link">erDiagram</span><span class="card-link">单表设计</span><span class="card-link">SQL映射</span></div>
+</div>
+</div>
+
+<!-- 05 状态转换图 -->
+<div class="card" id="sec05">
+<div class="card-header">
+<div class="card-badge color-05">05</div>
+<div><div class="card-title">状态转换图</div><div class="card-subtitle">State Diagram</div></div>
+</div>
+<div class="card-body">
+<div class="card-desc">
+<strong>用途：</strong>描述系统各模块的状态变迁，明确状态间的转换条件和触发事件。用于理解模块生命周期、排查状态相关的Bug、以及状态机代码的实现参考。<br/>
+<strong>包含内容：</strong>5个状态机（音频采集状态机、TCP连接状态机、房间生命周期状态机、H.264编码器状态机、音视频同步状态机）
+</div>
+<table class="card-table">
+<tr><th style="width:15%">文件名</th><th style="width:12%">格式</th><th style="width:10%">大小</th><th>内容摘要</th></tr>
+<tr><td>05_状态转换图.pdf</td><td>PDF</td><td>460.9 KB</td><td>AudioRead(stopped/playing/pausing) | TCP(connecting/connected/receiving/sending) | Room(idle/lobby/inRoom{mediaOff/audioOn/videoOn/screenSharing}) | H264Encoder(uninitialized/initializing/ready/encoding/cleanup) | AVSync(noClock/audioReady/synchronized/waitVideo/dropVideo)</td></tr>
+</table>
+<div style="margin-top:8px"><span class="card-link">stateDiagram-v2</span><span class="card-link">5个状态机</span><span class="card-link">note注解</span></div>
+</div>
+</div>
+
+<!-- 06 组件图 -->
+<div class="card" id="sec06">
+<div class="card-header">
+<div class="card-badge color-06">06</div>
+<div><div class="card-title">系统组件图</div><div class="card-subtitle">Component Diagram</div></div>
+</div>
+<div class="card-body">
+<div class="card-desc">
+<strong>用途：</strong>展示系统的模块划分、组件依赖关系及对外接口定义。用于架构评审、模块解耦分析、以及新成员的项目导览。<br/>
+<strong>包含内容：</strong>组件依赖关系图（10层组件+6个第三方库）、模块接口说明表（10个组件的接口/依赖/说明）
+</div>
+<table class="card-table">
+<tr><th style="width:15%">文件名</th><th style="width:12%">格式</th><th style="width:10%">大小</th><th>内容摘要</th></tr>
+<tr><td>06_组件图.pdf</td><td>PDF</td><td>275.4 KB</td><td>UI层(LD/WD/RD/US) → 核心层(CK) → 音频层(AR/AW) → 视频层(VR/SR/FD) → 编解码层(ENC/DEC) → 渲染层(YUV/OGL) → 同步层(SYNC) → 网络层(NET) → 工具层(MD5/THW) → 第三方库(FFmpeg/SDL/Opus/OpenCV/OpenGL/WebRTC)</td></tr>
+</table>
+<div style="margin-top:8px"><span class="card-link">graph TB</span><span class="card-link">10层架构</span><span class="card-link">6个第三方库</span></div>
+</div>
+</div>
+
+<!-- 07 部署图 -->
+<div class="card" id="sec07">
+<div class="card-header">
+<div class="card-badge color-07">07</div>
+<div><div class="card-title">部署图</div><div class="card-subtitle">Deployment Diagram</div></div>
+</div>
+<div class="card-body">
+<div class="card-desc">
+<strong>用途：</strong>展示系统运行时的物理部署架构，包括客户端、服务端、数据库的部署拓扑和网络通信架构。用于运维部署、网络配置、以及系统架构评审。<br/>
+<strong>包含内容：</strong>部署拓扑图、部署规格说明表、网络通信架构图（三路TCP）、协议包格式表（10种协议）
+</div>
+<table class="card-table">
+<tr><th style="width:15%">文件名</th><th style="width:12%">格式</th><th style="width:10%">大小</th><th>内容摘要</th></tr>
+<tr><td>07_部署图.pdf</td><td>PDF</td><td>291.9 KB</td><td>客户端A/B(Windows+Qt+FFmpeg+SDL+Opus+OpenCV) ←TCP→ 服务端(Linux+epoll+MySQL) | 三路TCP(信令/音频/视频) | 10种协议包格式</td></tr>
+</table>
+<div style="margin-top:8px"><span class="card-link">graph TB</span><span class="card-link">C/S架构</span><span class="card-link">三路TCP</span></div>
+</div>
+</div>
+
+<!-- 08 活动图 -->
+<div class="card" id="sec08">
+<div class="card-header">
+<div class="card-badge color-08">08</div>
+<div><div class="card-title">活动图</div><div class="card-subtitle">Activity Diagram</div></div>
+</div>
+<div class="card-body">
+<div class="card-desc">
+<strong>用途：</strong>描述系统核心操作的活动流程，展示并行活动和分支判断。用于理解算法流程、代码走读辅助、以及性能瓶颈分析。<br/>
+<strong>包含内容：</strong>3个活动图（视频帧编码发送活动、音频采集编码活动、接收端音视频同步渲染活动）
+</div>
+<table class="card-table">
+<tr><th style="width:15%">文件名</th><th style="width:12%">格式</th><th style="width:10%">大小</th><th>内容摘要</th></tr>
+<tr><td>08_活动图.pdf</td><td>PDF</td><td>332.0 KB</td><td>视频编码(采集→BGR2RGB→缩放→H264/JPEG→分片→子线程发送→300ms丢帧) | 音频(回调→VAD→Opus→信号→序列化→TCP) | 同步(接收→解码→SyncManager→等待/追赶→OpenGL渲染)</td></tr>
+</table>
+<div style="margin-top:8px"><span class="card-link">flowchart TD</span><span class="card-link">3个活动流</span><span class="card-link">分支判断</span></div>
+</div>
+</div>
+
+<!-- 09 数据流图 -->
+<div class="card" id="sec09">
+<div class="card-header">
+<div class="card-badge color-09">09</div>
+<div><div class="card-title">数据流图</div><div class="card-subtitle">Data Flow Diagram</div></div>
+</div>
+<div class="card-body">
+<div class="card-desc">
+<strong>用途：</strong>描述系统中数据的完整流转路径，涵盖音频流、视频流、信令流三条独立数据通道。用于理解数据处理管线、带宽分析、以及优化瓶颈定位。<br/>
+<strong>包含内容：</strong>5个数据流图（顶层DFD、音频数据流、视频数据流、信令数据流、三通道全景图）+ 数据量统计
+</div>
+<table class="card-table">
+<tr><th style="width:15%">文件名</th><th style="width:12%">格式</th><th style="width:10%">大小</th><th>内容摘要</th></tr>
+<tr><td>09_数据流图.pdf</td><td>PDF</td><td>445.7 KB</td><td>音频流(PCM 96KB/s → Opus 4.5KB/s, 压缩率95.3%) | 视频流(H264 120KB/s vs JPEG 300KB/s, 压缩率97%) | 信令流(协议分发→DB/房间/转发) | 三通道并行全景</td></tr>
+</table>
+<div style="margin-top:8px"><span class="card-link">flowchart LR</span><span class="card-link">5个DFD</span><span class="card-link">数据量统计</span></div>
+</div>
+</div>
+
+<!-- 10 UML类图 -->
+<div class="card" id="sec10">
+<div class="card-header">
+<div class="card-badge color-00">10</div>
+<div><div class="card-title">UML 类图</div><div class="card-subtitle">Class Diagram</div></div>
+</div>
+<div class="card-body">
+<div class="card-desc">
+<strong>用途：</strong>展示系统全部27个自定义类的结构、继承关系、组合关系和依赖关系。用于面向对象设计评审、代码重构参考、以及新成员的架构导览。<br/>
+<strong>包含内容：</strong>架构分层总览表（27个类的中文职责说明）、完整Mermaid类图、音视频数据流全景图、设计模式总结表（7种设计模式）
+</div>
+<table class="card-table">
+<tr><th style="width:15%">文件名</th><th style="width:12%">格式</th><th style="width:10%">大小</th><th>内容摘要</th></tr>
+<tr><td>VCC项目类图.pdf</td><td>PDF</td><td>579.5 KB</td><td>27个类 | 7种设计模式(接口/中介者/单例/观察者/策略/生产者-消费者/模板方法) | 6层架构</td></tr>
+<tr><td>VCC项目类图.jpg</td><td>JPG</td><td>696.7 KB</td><td>图片版本，便于查阅与引用</td></tr>
+<tr><td>VCC项目类图.md</td><td>Markdown</td><td>24.8 KB</td><td>源文件，含Mermaid代码</td></tr>
+</table>
+<div style="margin-top:8px"><span class="card-link">classDiagram</span><span class="card-link">27个类</span><span class="card-link">7种设计模式</span></div>
+</div>
+</div>
+
+<!-- ==================== 系统全景总图 ==================== -->
+<div class="summary-section" id="sec00">
+<h2>系统全景总图 - 所有图表内容汇总</h2>
+<p style="font-size:13px;color:#666;margin-bottom:15px">以下总图将项目所有图表的实际内容整合为一张完整的系统全景图，覆盖：架构分层、类结构、业务流程、数据流、状态机、部署拓扑、数据库、用例。<br/>
+完整版请查看：<a href="00_系统全景总图.html" style="color:#1a73e8;font-weight:bold">00_系统全景总图.html</a> | <a href="00_系统全景总图.pdf" style="color:#1a73e8;font-weight:bold">00_系统全景总图.pdf</a></p>
+<div class="mermaid">
+graph TB
+    subgraph 需求分析阶段
+        UC[02 用户用例图<br/>功能边界定义]
+        DFD0[09 数据流图-顶层<br/>系统上下文]
+    end
+
+    subgraph 架构设计阶段
+        CLS[10 UML类图<br/>静态结构设计]
+        CMP[06 组件图<br/>模块划分与接口]
+        DEP[07 部署图<br/>物理部署架构]
+        ER[04 数据库ER图<br/>数据模型设计]
+    end
+
+    subgraph 详细设计阶段
+        SEQ[03 系统时序图<br/>交互时序设计]
+        ACT[08 活动图<br/>算法流程设计]
+        ST[05 状态转换图<br/>状态机设计]
+        BF[01 业务流程图<br/>业务逻辑设计]
+    end
+
+    subgraph 数据流专项
+        DFD_A[09-音频数据流<br/>PCM→Opus→TCP]
+        DFD_V[09-视频数据流<br/>RGB→H264→TCP]
+        DFD_S[09-信令数据流<br/>协议分发]
+    end
+
+    UC -->|用例驱动| CLS
+    UC -->|用例场景| SEQ
+    DFD0 -->|数据流细化| DFD_A
+    DFD0 -->|数据流细化| DFD_V
+    DFD0 -->|数据流细化| DFD_S
+
+    CLS -->|类交互| SEQ
+    CLS -->|类状态| ST
+    CMP -->|组件接口| SEQ
+    CMP -->|组件依赖| DEP
+    ER -->|数据协议| DEP
+
+    BF -->|业务流程| ACT
+    BF -->|状态变迁| ST
+    SEQ -->|时序中的活动| ACT
+    ST -->|状态中的活动| ACT
+
+    DFD_A -->|音频路径| SEQ
+    DFD_V -->|视频路径| SEQ
+    DFD_S -->|信令路径| SEQ
+
+    style UC fill:#e8f5e9,stroke:#43a047
+    style CLS fill:#e3f2fd,stroke:#1565c0
+    style SEQ fill:#fff3e0,stroke:#fb8c00
+    style ST fill:#e0f2f1,stroke:#00897b
+    style BF fill:#e3f2fd,stroke:#1a73e8
+    style ER fill:#f3e5f5,stroke:#8e24aa
+    style CMP fill:#eceff1,stroke:#546e7a
+    style DEP fill:#efebe9,stroke:#6d4c41
+    style ACT fill:#e3f2fd,stroke:#1565c0
+    style DFD0 fill:#ffebee,stroke:#e53935
+    style DFD_A fill:#ffebee,stroke:#e53935
+    style DFD_V fill:#ffebee,stroke:#e53935
+    style DFD_S fill:#ffebee,stroke:#e53935
+</div>
+</div>
+
+<!-- 图表分类矩阵 -->
+<div class="summary-section">
+<h2>图表分类矩阵</h2>
+<table class="card-table" style="font-size:13px">
+<tr>
+<th style="width:12%">分类维度</th>
+<th>静态结构</th>
+<th>动态行为</th>
+<th>数据模型</th>
+<th>物理部署</th>
+</tr>
+<tr>
+<td><strong>图表类型</strong></td>
+<td>UML类图、组件图</td>
+<td>时序图、状态图、活动图、业务流程图</td>
+<td>ER图、数据流图</td>
+<td>部署图</td>
+</tr>
+<tr>
+<td><strong>UML分类</strong></td>
+<td>结构图</td>
+<td>行为图</td>
+<td>结构图+行为图</td>
+<td>实现图</td>
+</tr>
+<tr>
+<td><strong>视角</strong></td>
+<td>设计者/开发者</td>
+<td>开发者/测试者</td>
+<td>开发者/DBA</td>
+<td>运维/架构师</td>
+</tr>
+<tr>
+<td><strong>生命周期</strong></td>
+<td>架构设计</td>
+<td>详细设计+编码</td>
+<td>数据库设计</td>
+<td>部署上线</td>
+</tr>
+</table>
+</div>
+
+<div class="footer">
+WeChat 音视频会议系统 - 图表汇总总览 | 共10类图表 | 生成时间：2026-07-23
+</div>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10.9.1/dist/mermaid.min.js"></script>
+<script>mermaid.initialize({startOnLoad:true,theme:'default',securityLevel:'loose',flowchart:{useMaxWidth:false,htmlLabels:true}})</script>
+</body>
+</html>

@@ -1,0 +1,215 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>WeChat - 系统时序图</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:"Microsoft YaHei",sans-serif;background:#f5f7fa;padding:40px}
+.container{max-width:1400px;margin:0 auto;background:white;border-radius:12px;box-shadow:0 4px 20px rgba(0,0,0,.08);overflow:hidden}
+.header{background:linear-gradient(135deg,#fb8c00,#e65100);color:white;padding:30px 40px}
+.header h1{font-size:26px;margin-bottom:6px}
+.header p{font-size:13px;opacity:.85}
+.section{padding:30px 40px}
+.section h2{font-size:18px;color:#fb8c00;margin-bottom:15px;padding-bottom:8px;border-bottom:2px solid #e8eaed}
+.mermaid{display:flex;justify-content:center;overflow-x:auto;margin:20px 0}
+.desc{background:#f8f9fa;border-left:4px solid #fb8c00;padding:12px 16px;margin:15px 0;font-size:13px;line-height:1.8;border-radius:0 6px 6px 0}
+.footer{text-align:center;padding:15px;color:#999;font-size:11px;border-top:1px solid #eee}
+@media print{body{padding:0;background:white}.container{box-shadow:none}}
+</style>
+</head>
+<body>
+<div class="container">
+<div class="header">
+<h1>WeChat 音视频会议系统 - 系统时序图</h1>
+<p>展示系统核心交互的时序关系，覆盖登录、视频通话、音视频同步等关键流程</p>
+</div>
+
+<div class="section">
+<h2>一、用户登录时序图</h2>
+<div class="mermaid">
+sequenceDiagram
+    actor 用户
+    participant LD as LoginDialog<br/>(登录界面)
+    participant CK as ckernel<br/>(核心控制器)
+    participant Med as TcpClientMediator<br/>(中介者)
+    participant Net as TcpClient<br/>(网络层)
+    participant SRV as 服务端<br/>(PlayerHallServer)
+    participant DB as MySQL<br/>(WeChat.t_user)
+
+    用户->>LD: 输入手机号+密码
+    用户->>LD: 点击登录
+    LD->>LD: MD5加盐哈希密码
+    LD->>CK: SIG_loginCommit(tel, password)
+    CK->>CK: 序列化 STRU_LOGIN_RQ
+    CK->>Med: SendData(sock, buf, len)
+    Med->>Net: SendData(sock, buf, len)
+    Net->>SRV: TCP发送(4字节包头+数据)
+    SRV->>DB: SELECT tel,password FROM t_user
+    DB-->>SRV: 返回查询结果
+    SRV->>SRV: MD5比对密码
+    SRV->>Net: TCP返回 STRU_LOGIN_RS
+    Net->>Med: SIG_ReadyData(sock, buf, len)
+    Med->>CK: slot_dealData(sock, buf, len)
+    CK->>CK: slot_dealLoginRS 解析结果
+    alt 登录成功
+        CK->>LD: 隐藏登录窗口
+        CK->>CK: 显示 WeChatDialog 主界面
+    else 登录失败
+        CK->>LD: 显示错误提示
+    end
+</div>
+</div>
+
+<div class="section">
+<h2>二、H.264 视频通话时序图</h2>
+<div class="mermaid">
+sequenceDiagram
+    participant Cam as 摄像头<br/>(OpenCV)
+    participant VR as VideoRead<br/>(视频采集)
+    participant Enc as H264Encoder<br/>(编码器)
+    participant CK as ckernel<br/>(控制器)
+    participant SW as SendVideoWorker<br/>(发送线程)
+    participant Net as TcpClient<br/>(网络)
+    participant SRV as 服务端
+
+    Cam->>VR: 帧数据 BGR
+    VR->>VR: cvtColor BGR→RGB
+    VR->>VR: 缩放 320x240
+    VR->>CK: SIG_sendVideoFrame(QImage)
+    CK->>Enc: encode(rgbImage)
+    Enc->>Enc: QImage→RGB24 data
+    Enc->>Enc: sws_scale RGB→YUV420P
+    Enc->>Enc: avcodec_send_frame
+    Enc->>Enc: avcodec_receive_packet
+    Enc-->>CK: 返回 H.264 ByteArray
+    CK->>CK: 序列化 H264包头+分片信息
+    CK->>SW: SIG_SendVideo(buf, len)
+    SW->>SW: 延迟>300ms则丢帧
+    SW->>Net: SendData(sock, buf, len)
+    Net->>SRV: TCP发送 H.264 分片
+</div>
+</div>
+
+<div class="section">
+<h2>三、接收端 H.264 解码+同步时序图</h2>
+<div class="mermaid">
+sequenceDiagram
+    participant SRV as 服务端
+    participant Net as TcpClient
+    participant CK as ckernel
+    participant Dec as H264Decoder
+    participant Sync as AVSyncManager<br/>(同步管理器)
+    participant RD as RoomDialog
+    participant US as UserShow
+    participant GL as YuvGLWidget<br/>(OpenGL渲染)
+    participant AW as AudioWrite<br/>(音频播放)
+
+    SRV->>Net: TCP转发 H.264 分片
+    Net->>CK: slot_dealData → slot_dealVideoFrameH264Rq
+    CK->>CK: 分片重组（按frameSeq+fragmentIndex）
+
+    rect rgb(255,243,224)
+        Note over CK,GL: 音视频同步流程
+        CK->>Dec: decode(h264Data)
+        Dec->>Dec: avcodec_send_packet
+        Dec->>Dec: avcodec_receive_frame
+        Dec->>Dec: av_frame_clone (引用计数+1)
+        Dec-->>CK: 返回 AVFrame*
+
+        CK->>Sync: updateVideoClock(userId, videoPts)
+        CK->>Sync: synchronizeVideo(userId, frame)
+        Sync->>Sync: computeSyncDelay(userId)
+        Sync->>Sync: diff = videoPts - audioClock
+        alt diff > 10ms (视频超前)
+            Sync->>Sync: Sleep(diff) 等待音频
+        else |diff| <= 10ms (同步正常)
+            Sync->>Sync: 立即显示
+        else diff < -10ms (视频落后)
+            Sync->>Sync: 立即显示（追赶）
+        end
+    end
+
+    CK->>RD: slot_refreshUserYuv(userId, frame)
+    RD->>US: slot_setFrame(frame)
+    US->>GL: slot_setFrame(frame)
+    GL->>GL: av_frame_clone (引用计数+1)
+    GL->>GL: uploadYuvTextures (Y/U/V三纹理)
+    GL->>GL: paintGL → GLSL BT.601 YUV→RGB
+    GL->>GL: glDrawArrays 渲染
+
+    Note over AW: 音频独立时钟更新
+    AW->>AW: Opus解码 → SDL播放
+    AW->>Sync: updateAudioClock(userId, audioPts)
+</div>
+</div>
+
+<div class="section">
+<h2>四、新成员加入房间时序图</h2>
+<div class="mermaid">
+sequenceDiagram
+    actor UserA as 用户A（已在房间）
+    actor UserB as 用户B（新加入）
+    participant CK_B as ckernel_B
+    participant SRV as 服务端
+    participant CK_A as ckernel_A
+    participant RD_A as RoomDialog_A
+
+    UserB->>CK_B: 点击加入房间
+    CK_B->>SRV: TCP发送 DEF_PACK_JOINROOM_RQ
+    SRV->>SRV: 查找房间成员列表
+    SRV->>CK_B: 返回加入成功 + 成员列表
+    CK_B->>CK_B: 创建RoomDialog
+
+    loop 对房间内每个已有成员
+        SRV->>CK_A: DEF_PACK_ROOM_MEMBER_RQ (新成员信息)
+        CK_A->>RD_A: slot_addUser(userId, userName)
+        RD_A->>RD_A: 创建UserShow视频窗口
+    end
+
+    loop 对房间内每个已有成员
+        SRV->>CK_B: DEF_PACK_ROOM_MEMBER_RQ (已有成员信息)
+        CK_B->>CK_B: 创建RoomDialog + 添加成员
+    end
+
+    CK_B->>CK_B: 请求关键帧 PLI
+    CK_B->>SRV: DEF_PACK_PLI_REQUEST
+    SRV->>CK_A: 转发PLI请求
+    CK_A->>CK_A: H264Encoder.requestKeyFrame()
+    Note over CK_A: 下一帧强制编码为I帧
+</div>
+</div>
+
+<div class="section">
+<h2>五、静音检测与 UI 联动时序</h2>
+<div class="desc">AudioRead 在 SDL 采集回调中完成 WebRTC VAD 检测与 RMS 能量计算，经连续 3 帧状态平滑确认后，通过 SIG_muteStateChanged 信号（Qt::QueuedConnection 跨线程）通知 ckernel，再由 ckernel 调用 RoomDialog::updateMuteStatus 更新音频按钮的文本、样式与 tooltip。另由 QTimer 每 5 秒触发 slot_adjustVadMode，按噪声 RMS 的 EMA 动态切换 VAD 灵敏度模式。</div>
+<div class="mermaid">
+sequenceDiagram
+    participant SDL as SDL采集线程
+    participant AR as AudioRead<br/>(音频采集)
+    participant CK as ckernel<br/>(核心控制器)
+    participant RD as RoomDialog<br/>(房间界面)
+
+    SDL->>AR: audioCallback(stream, 1920字节)
+    AR->>AR: WebRtcVad_Process(48kHz, 960采样)
+    AR->>AR: calculateRMS(samples, 960) 更新 m_noiseLevel
+    AR->>AR: 状态平滑(连续3帧确认, ≈60ms)
+    AR-->>CK: SIG_muteStateChanged(isMute)<br/>(Qt::QueuedConnection 跨线程)
+    CK->>CK: slot_muteStateChanged(isMute)
+    CK->>RD: updateMuteStatus(isMute)
+    alt isMute=true (进入静音)
+        RD->>RD: cb_audio 显示“音频(无声)” + 灰色 + tooltip
+    else isMute=false (退出静音)
+        RD->>RD: cb_audio 恢复显示“音频”
+    end
+
+    Note over AR: QTimer(主线程)每5秒触发 slot_adjustVadMode<br/>读 m_noiseLevel 的 EMA(α=0.95) 动态切换 VAD 模式<br/>RMS &lt; 0.02 → 模式1(宽松) | &lt; 0.10 → 模式2(中等) | ≥ 0.10 → 模式3(严格)
+</div>
+</div>
+
+<div class="footer">WeChat 音视频会议系统 - 系统时序图 | 生成时间：2026-07-23</div>
+</div>
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10.9.1/dist/mermaid.min.js"></script>
+<script>mermaid.initialize({startOnLoad:true,theme:'default',securityLevel:'loose',sequence:{useMaxWidth:false,actorMargin:50}})</script>
+</body>
+</html>

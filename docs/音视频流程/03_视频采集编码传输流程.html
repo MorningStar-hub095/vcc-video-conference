@@ -1,0 +1,1398 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<style>
+    body {
+        font-family: 'Microsoft YaHei', 'SimHei', sans-serif;
+        line-height: 1.8;
+        color: #333;
+        max-width: 100%;
+        padding: 20px;
+    }
+    h1 { color: #1a5276; font-size: 22px; border-bottom: 2px solid #1a5276; padding-bottom: 8px; margin-top: 30px; }
+    h2 { color: #2c3e50; font-size: 18px; margin-top: 25px; }
+    h3 { color: #34495e; font-size: 16px; margin-top: 20px; }
+    table { border-collapse: collapse; width: 100%; margin: 15px 0; font-size: 12px; }
+    th, td { border: 1px solid #ddd; padding: 6px 10px; text-align: left; }
+    th { background-color: #f2f2f2; font-weight: bold; }
+    tr:nth-child(even) { background-color: #f9f9f9; }
+    pre { background: #f5f5f5; padding: 12px; border-radius: 5px; overflow-x: auto; font-size: 11px; }
+    code { background: #f0f0f0; padding: 1px 4px; border-radius: 3px; font-size: 12px; }
+    pre code { background: none; padding: 0; }
+    .mermaid { margin: 15px 0; text-align: center; }
+    strong { color: #2c3e50; }
+    hr { border: none; border-top: 1px solid #ddd; margin: 20px 0; }
+    blockquote { border-left: 4px solid #3498db; margin: 10px 0; padding: 5px 15px; background: #eef6fb; font-size: 13px; }
+    ul, ol { padding-left: 25px; }
+    li { margin: 3px 0; }
+    p { margin: 8px 0; }
+</style>
+</head>
+<body>
+<h1 id="03-视频采集编码传输流程">03 视频采集编码传输流程</h1>
+<h2 id="一、概述">一、概述</h2>
+<h3 id="11-模块职责">1.1 模块职责</h3>
+<p>本文档详细描述视频会议系统中<strong>视频采集</strong>与<strong>H264编码</strong>的完整技术实现。该模块承担以下核心职责：</p>
+<table>
+<thead>
+<tr>
+<th>职责</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><strong>摄像头视频采集</strong></td>
+<td>通过 OpenCV 打开系统摄像头，以定时器驱动的方式逐帧捕获视频画面</td>
+</tr>
+<tr>
+<td><strong>桌面屏幕采集</strong></td>
+<td>通过 Qt 的 <code>QScreen</code> API 抓取主屏幕画面，实现桌面共享功能</td>
+</tr>
+<tr>
+<td><strong>H264 硬件/软件编码</strong></td>
+<td>将采集到的 RGB 图像通过 FFmpeg/libav 转换为 YUV420P 并编码为 H264 码流</td>
+</tr>
+<tr>
+<td><strong>编码器硬件回退链</strong></td>
+<td>自动检测可用的硬件编码器（NVIDIA NVENC、Intel QSV），不可用时回退到软件编码（libx264）</td>
+</tr>
+<tr>
+<td><strong>摄像头后端回退</strong></td>
+<td>在不同视频捕获后端（默认、MSMF、DirectShow）之间自动切换，提高兼容性</td>
+</tr>
+</tbody></table>
+<h3 id="12-关键文件一览">1.2 关键文件一览</h3>
+<table>
+<thead>
+<tr>
+<th>文件名</th>
+<th>类型</th>
+<th>职责</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>common.h</code></td>
+<td>头文件</td>
+<td>全局宏定义，包含 OpenCV 头文件引用和全局帧率常量</td>
+</tr>
+<tr>
+<td><code>videoread.h</code></td>
+<td>头文件</td>
+<td><code>VideoRead</code> 类声明——摄像头视频采集器</td>
+</tr>
+<tr>
+<td><code>videoread.cpp</code></td>
+<td>实现</td>
+<td><code>VideoRead</code> 类的完整实现——摄像头打开、帧采集、关闭</td>
+</tr>
+<tr>
+<td><code>h264encoder.h</code></td>
+<td>头文件</td>
+<td><code>H264Encoder</code> 类声明——H264 视频编码器</td>
+</tr>
+<tr>
+<td><code>h264encoder.cpp</code></td>
+<td>实现</td>
+<td><code>H264Encoder</code> 类的完整实现——编码器初始化、RGB→YUV 转换、H264 编码、资源释放</td>
+</tr>
+<tr>
+<td><code>screenread.h</code></td>
+<td>头文件</td>
+<td><code>ScreenRead</code> 类声明——桌面屏幕采集器</td>
+</tr>
+<tr>
+<td><code>screenread.cpp</code></td>
+<td>实现</td>
+<td><code>ScreenRead</code> 类的完整实现——屏幕抓取、缩放、定时采集</td>
+</tr>
+</tbody></table>
+<hr>
+<h2 id="二、业务流程图">二、业务流程图</h2>
+<h3 id="21-摄像头视频采集与编码流程">2.1 摄像头视频采集与编码流程</h3>
+<div class="mermaid">flowchart TD
+    A["用户点击"开始采集""]
+    B["VideoRead::slot_openVideo()"]
+    C["启动定时器 m_timer\n间隔 = 1000/FRAME_RATE - 10 ms"]
+    D["尝试默认后端打开摄像头\ncap.open(0) 重试3次"]
+    E{"摄像头是否打开成功？"}
+    F["尝试 MSMF 后端\ncap.open(0, CAP_MSMF) 重试3次"]
+    G{"摄像头是否打开成功？"}
+    H["尝试 DirectShow 后端\ncap.open(0, CAP_DSHOW) 重试3次"]
+    I{"摄像头是否打开成功？"}
+    J["弹出错误提示：视频没有打开"]
+    K["定时器触发 timeout 信号"]
+    L["VideoRead::slot_getVideoFrame()"]
+    M["cap.read(frame) 读取一帧"]
+    N{"读取是否成功？"}
+    O["cvtColor: BGR → RGB"]
+    P["Mat → QImage (RGB888)"]
+    Q["缩放到 IMAGE_WIDTH × IMAGE_HEIGHT"]
+    R["发送信号 SIG_sendVideoFrame"]
+    S["H264Encoder::encode()"]
+    T["QImage 格式检查\n确保为 RGB888"]
+    U["av_frame_make_writable"]
+    V["sws_scale: RGB → YUV420P"]
+    W["设置 PTS / 帧类型"]
+    X["avcodec_send_frame"]
+    Y["avcodec_receive_packet 循环"]
+    Z["发送信号 SIG_encoded"]
+
+    A --> B
+    B --> C
+    B --> D
+    D --> E
+    E -- 是 --> K
+    E -- 否 --> F
+    F --> G
+    G -- 是 --> K
+    G -- 否 --> H
+    H --> I
+    I -- 是 --> K
+    I -- 否 --> J
+    K --> L
+    L --> M
+    M --> N
+    N -- 否 --> K
+    N -- 是 --> O
+    O --> P
+    P --> Q
+    Q --> R
+    R --> S
+    S --> T
+    T --> U
+    U --> V
+    V --> W
+    W --> X
+    X --> Y
+    Y --> Z
+    Z --> K
+</div><h3 id="22-桌面屏幕采集流程">2.2 桌面屏幕采集流程</h3>
+<div class="mermaid">flowchart TD
+    A["用户点击"开始桌面共享""]
+    B["ScreenRead::slot_openVideo()"]
+    C["启动定时器 m_timer\n间隔 = 1000 / DESK_FRAME_RATE ms"]
+    D["定时器触发 timeout 信号"]
+    E["ScreenRead::slot_getScreenFrame()"]
+    F["QApplication::primaryScreen() 获取主屏幕"]
+    F1["QScreen::grabWindow(desktop->winId())\n抓取整个桌面"]
+    G["QPixmap::toImage() 转为 QImage"]
+    H["缩放到 DESK_IMAGE_WIDTH × DESK_IMAGE_HEIGHT\n使用 FastTransformation 保持速度"]
+    I["发送信号 SIG_getScreenFrame"]
+    J["下游编码器接收并编码"]
+    K["用户点击"停止桌面共享""]
+    L["ScreenRead::slot_closeVideo()"]
+    M["m_timer->stop()"]
+
+    A --> B
+    B --> C
+    C --> D
+    D --> E
+    E --> F
+    F --> F1
+    F1 --> G
+    G --> H
+    H --> I
+    I --> J
+    J --> D
+    K --> L
+    L --> M
+</div><hr>
+<h2 id="三、完整代码逐行解析">三、完整代码逐行解析</h2>
+<h3 id="31-commonh--全局帧率定义">3.1 common.h —— 全局帧率定义</h3>
+<pre><code class="language-cpp">#ifndef COMMON_H                      // 防止头文件被重复包含的宏守卫开始
+#define COMMON_H                      // 定义 COMMON_H 宏，标记该头文件已被包含
+
+#include &quot;highgui/highgui.hpp&quot;        // 引入 OpenCV highgui 模块（窗口显示、图像读写等高级GUI功能）
+#include &quot;imgproc/imgproc.hpp&quot;        // 引入 OpenCV imgproc 模块（图像处理：颜色转换、缩放、滤波等）
+#include &quot;core/core.hpp&quot;              // 引入 OpenCV core 模块（基础数据结构 Mat、数学运算等）
+#include &quot;opencv2\imgproc\types_c.h&quot;  // 引入 OpenCV C 风格类型定义（包含 CV_BGR2RGB 等旧式枚举宏）
+
+using namespace cv;                   // 将 cv 命名空间引入当前作用域，后续可直接使用 Mat、VideoCapture 等
+
+#define FRAME_RATE (30)               // 定义全局帧率常量：30 FPS，用于摄像头采集的定时器间隔计算
+
+#endif                                // 防止头文件被重复包含的宏守卫结束
+</code></pre>
+<p><strong>宏常量说明：</strong></p>
+<table>
+<thead>
+<tr>
+<th>宏名称</th>
+<th>值</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>FRAME_RATE</code></td>
+<td><code>30</code></td>
+<td>全局视频帧率，单位：帧/秒（FPS）。用于摄像头采集定时器的触发间隔计算：<code>1000/30 - 10 ≈ 23ms</code></td>
+</tr>
+</tbody></table>
+<hr>
+<h3 id="32-videoreadh--摄像头采集类声明">3.2 videoread.h —— 摄像头采集类声明</h3>
+<pre><code class="language-cpp">#ifndef VIDEOREAD_H                    // 防止头文件被重复包含的宏守卫开始
+#define VIDEOREAD_H                    // 定义 VIDEOREAD_H 宏
+
+#include &lt;QObject&gt;                     // 引入 Qt 对象基类，提供信号槽机制、对象树内存管理等
+#include &lt;QImage&gt;                      // 引入 Qt 图像类，用于在内存中表示和操作图像数据
+#include &lt;QTimer&gt;                      // 引入 Qt 定时器类，用于周期性触发帧采集
+#include &quot;common.h&quot;                    // 引入项目公共头文件，获取 OpenCV 头文件和 FRAME_RATE 宏
+
+#define IMAGE_WIDTH (320)              // 定义输出图像宽度：320 像素
+#define IMAGE_HEIGHT (240)             // 定义输出图像高度：240 像素
+
+class VideoRead : public QObject       // 定义 VideoRead 类，继承自 QObject 以使用信号槽机制
+{
+    Q_OBJECT                           // Qt 元对象宏，启用信号槽、属性系统等 Qt 元对象功能
+public:
+    explicit VideoRead(QObject *parent = nullptr);  // 构造函数，parent 默认为空（顶层对象）
+    ~VideoRead();                                      // 析构函数，负责释放定时器资源
+
+signals:
+    void SIG_sendVideoFrame(QImage img);  // 信号：发送一帧视频图像，参数为 QImage 格式的图像数据
+
+public slots:
+    void slot_getVideoFrame();             // 公共槽函数：获取一帧摄像头画面（由定时器 timeout 信号触发）
+    void slot_openVideo();                 // 公共槽函数：打开摄像头并启动定时采集
+    void slot_closeVideo();                // 公共槽函数：停止采集并关闭摄像头
+
+private:
+    QTimer * m_timer;                      // 定时器指针，用于周期性触发帧采集
+    cv::VideoCapture cap;                  // OpenCV 视频捕获对象，用于打开和读取摄像头数据
+};
+
+#endif                                   // 防止头文件被重复包含的宏守卫结束
+</code></pre>
+<p><strong>宏常量说明：</strong></p>
+<table>
+<thead>
+<tr>
+<th>宏名称</th>
+<th>值</th>
+<th>类型</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>IMAGE_WIDTH</code></td>
+<td><code>320</code></td>
+<td><code>int</code></td>
+<td>采集输出图像宽度（像素）。摄像头原始分辨率通常为 640×480 或更高，采集后缩放到此值以降低后续编码和传输的开销</td>
+</tr>
+<tr>
+<td><code>IMAGE_HEIGHT</code></td>
+<td><code>240</code></td>
+<td><code>int</code></td>
+<td>采集输出图像高度（像素）。配合 IMAGE_WIDTH 使用，保持 4:3 宽高比</td>
+</tr>
+</tbody></table>
+<hr>
+<h3 id="33-videoreadcpp--摄像头采集实现">3.3 videoread.cpp —— 摄像头采集实现</h3>
+<h4 id="331-构造函数-videoreadvideoread">3.3.1 构造函数 <code>VideoRead::VideoRead</code></h4>
+<pre><code class="language-cpp">VideoRead::VideoRead(QObject *parent) : QObject(parent)   // 构造函数实现，调用基类 QObject 的构造函数
+{
+    m_timer = new QTimer;            // 在堆上创建 QTimer 对象，用于定时触发帧采集
+    connect( m_timer , SIGNAL(timeout()) , this , SLOT(slot_getVideoFrame()) );
+    // 将 m_timer 的 timeout() 信号连接到当前对象的 slot_getVideoFrame() 槽函数
+    // 当定时器每次计时到期时，自动调用 slot_getVideoFrame() 采集一帧
+}
+</code></pre>
+<h4 id="332-析构函数-videoreadvideoread">3.3.2 析构函数 <code>VideoRead::~VideoRead</code></h4>
+<pre><code class="language-cpp">VideoRead::~VideoRead()              // 析构函数实现
+{
+    if(m_timer)                      // 检查定时器指针是否非空
+    {
+        m_timer-&gt;stop();             // 停止定时器，防止析构过程中仍有定时触发
+        delete  m_timer;             // 释放定时器占用的堆内存
+        m_timer = NULL;              // 将指针置空，防止悬空指针
+    }
+}
+</code></pre>
+<h4 id="333-帧采集槽函数-videoreadslot_getvideoframe">3.3.3 帧采集槽函数 <code>VideoRead::slot_getVideoFrame</code></h4>
+<pre><code class="language-cpp">void VideoRead::slot_getVideoFrame()                             // 定时器触发时被调用的帧采集函数
+{
+    Mat frame;                                                     // 声明 OpenCV Mat 对象，用于存储从摄像头读取的原始帧
+    if( !cap.read(frame) )                                         // 从 VideoCapture 对象读取一帧图像
+    {                                                              // 如果读取失败（摄像头断开、无数据等）
+        return;                                                    // 直接返回，不发送信号，等待下次定时触发
+    }
+    cvtColor(frame, frame, CV_BGR2RGB);                            // 颜色空间转换：OpenCV 默认的 BGR 格式转为 RGB 格式
+                                                                   // 因为 QImage::Format_RGB888 需要 RGB 排列
+    QImage image(                                                  // 将 OpenCV Mat 数据包装为 QImage 对象
+        (unsigned const char*)frame.data,                          // 图像数据首地址（强制转换为 unsigned const char*）
+        frame.cols,                                                // 图像宽度（列数），由 Mat 自动维护
+        frame.rows,                                                // 图像高度（行数），由 Mat 自动维护
+        QImage::Format_RGB888                                      // 像素格式：每个像素 3 字节，R-G-B 各 8 位
+    );
+    image = image.scaled(                                          // 对图像进行缩放
+        IMAGE_WIDTH,                                               // 目标宽度：320 像素
+        IMAGE_HEIGHT,                                              // 目标高度：240 像素
+        Qt::KeepAspectRatio                                        // 保持原始宽高比，避免画面变形
+    );
+    Q_EMIT SIG_sendVideoFrame( image );                            // 发射信号，将处理后的图像发送给下游（如编码器、UI显示）
+}
+</code></pre>
+<h4 id="334-打开摄像头槽函数-videoreadslot_openvideo">3.3.4 打开摄像头槽函数 <code>VideoRead::slot_openVideo</code></h4>
+<pre><code class="language-cpp">void VideoRead::slot_openVideo()                                 // 打开摄像头并启动定时采集
+{
+    m_timer-&gt;start( 1000/FRAME_RATE - 10 );                       // 启动定时器，间隔 = 1000/30 - 10 = 23ms
+                                                                   // 减去 10ms 是为了补偿处理时间，尽量贴近目标帧率
+    bool bOpenSuccess = false;                                     // 标志变量：记录摄像头是否成功打开
+
+    // === 第一阶段：尝试使用默认后端 ===
+    for( int i = 0; i &lt; 3 &amp;&amp; !bOpenSuccess; i++ )                 // 最多重试 3 次
+    {
+        cap.open( 0 );                                             // 打开设备号为 0 的摄像头（系统默认摄像头）
+                                                                   // 使用 OpenCV 自动选择的默认后端
+        if( cap.isOpened() )                                       // 检查摄像头是否成功打开
+        {
+            bOpenSuccess = true;                                   // 标记成功
+            break;                                                 // 跳出重试循环
+        }
+        QThread::msleep( 100 );                                    // 打开失败，等待 100ms 后重试
+    }
+
+    // === 第二阶段：尝试使用 MSMF 后端 ===
+    if( !bOpenSuccess )                                            // 如果默认后端失败
+    {
+        for( int i = 0; i &lt; 3 &amp;&amp; !bOpenSuccess; i++ )             // 最多重试 3 次
+        {
+            cap.open( 0, cv::CAP_MSMF );                           // 使用 Microsoft Media Foundation 后端打开摄像头
+            if( cap.isOpened() )                                   // 检查是否成功
+            {
+                bOpenSuccess = true;                               // 标记成功
+                break;                                             // 跳出
+            }
+            QThread::msleep( 100 );                                // 失败则等待 100ms 重试
+        }
+    }
+
+    // === 第三阶段：尝试使用 DirectShow 后端 ===
+    if( !bOpenSuccess )                                            // 如果 MSMF 后端也失败
+    {
+        for( int i = 0; i &lt; 3 &amp;&amp; !bOpenSuccess; i++ )             // 最多重试 3 次
+        {
+            cap.open( 0, cv::CAP_DSHOW );                          // 使用 DirectShow 后端打开摄像头
+                                                                   // DirectShow 是 Windows 传统的多媒体框架
+            if( cap.isOpened() )                                   // 检查是否成功
+            {
+                bOpenSuccess = true;                               // 标记成功
+                break;                                             // 跳出
+            }
+            QThread::msleep( 100 );                                // 失败则等待 100ms 重试
+        }
+    }
+
+    // === 全部失败处理 ===
+    if( !bOpenSuccess )                                            // 如果三种后端均未能打开摄像头
+    {
+        QMessageBox::information(                                  // 弹出消息对话框通知用户
+            NULL,                                                  // 父窗口指针（NULL 表示无父窗口）
+            tr(&quot;提示&quot;),                                              // 对话框标题
+            tr(&quot;视频没有打开&quot;)                                        // 对话框内容
+        );
+        return;                                                    // 返回，不启动采集流程
+    }
+}
+</code></pre>
+<h4 id="335-关闭摄像头槽函数-videoreadslot_closevideo">3.3.5 关闭摄像头槽函数 <code>VideoRead::slot_closeVideo</code></h4>
+<pre><code class="language-cpp">void VideoRead::slot_closeVideo()                                // 停止采集并关闭摄像头
+{
+    m_timer-&gt;stop();                                               // 停止定时器，不再触发新的帧采集
+    if(cap.isOpened())                                             // 检查摄像头是否处于打开状态
+        cap.release();                                             // 释放摄像头资源（关闭设备句柄）
+}
+</code></pre>
+<hr>
+<h3 id="34-h264encoderh--h264-编码器声明">3.4 h264encoder.h —— H264 编码器声明</h3>
+<pre><code class="language-cpp">#ifndef H264ENCODER_H                  // 防止头文件被重复包含的宏守卫开始
+#define H264ENCODER_H                  // 定义 H264ENCODER_H 宏
+
+#include &lt;QObject&gt;                     // 引入 Qt 对象基类
+#include &lt;QImage&gt;                      // 引入 Qt 图像类
+#include &lt;QByteArray&gt;                  // 引入 Qt 字节数组类，用于存储编码后的 H264 裸流数据
+
+extern &quot;C&quot;                             // 以 C 语言链接方式引入 FFmpeg 头文件（FFmpeg 是 C 库）
+{                                      // 因为 C++ 编译器会对符号名进行修饰（name mangling），
+                                       // 而 FFmpeg 库是用 C 编译的，需要 extern &quot;C&quot; 来匹配符号
+#include &quot;libavcodec/avcodec.h&quot;        // FFmpeg 编解码器核心 API（AVCodecContext, avcodec_open2 等）
+#include &quot;libavutil/imgutils.h&quot;        // FFmpeg 图像工具函数（av_image_alloc 等）
+#include &quot;libavutil/opt.h&quot;             // FFmpeg 选项设置 API（av_opt_set 等）
+#include &quot;libswscale/swscale.h&quot;        // FFmpeg 图像缩放/像素格式转换库（SwsContext, sws_scale 等）
+}
+
+class H264Encoder : public QObject     // 定义 H264Encoder 类，继承自 QObject
+{
+    Q_OBJECT                           // Qt 元对象宏，启用信号槽机制
+
+public:
+    explicit H264Encoder(QObject *parent = nullptr);   // 构造函数
+    ~H264Encoder() override;                           // 析构函数（override 标记覆盖基类虚函数）
+
+    bool init(int width, int height, int fps = 30, int bitrate = 200000);
+    // 初始化编码器
+    // width:    视频宽度（像素）
+    // height:   视频高度（像素）
+    // fps:      帧率（默认 30 FPS）
+    // bitrate:  比特率（默认 200000 bps = 200 kbps）
+
+    QByteArray encode(const QImage &amp;img);
+    // 编码一帧图像，返回 H264 裸流数据
+
+    void requestKeyFrame();
+    // 请求下一帧编码为关键帧（I帧）
+
+    void close();
+    // 关闭编码器，释放所有资源
+
+    bool isReady() const { return m_codecCtx != nullptr; }
+    // 内联函数：检查编码器是否已初始化就绪
+
+signals:
+    void SIG_encoded(const QByteArray &amp;h264Data, bool isKeyFrame);
+    // 信号：编码完成时发射，参数为 H264 裸流数据和是否为关键帧
+
+private:
+    AVCodecContext  *m_codecCtx;         // FFmpeg 编解码器上下文，存储编码器的全部配置和运行时状态
+    AVFrame         *m_frame;            // FFmpeg 帧结构，代表待编码的原始图像数据（YUV420P 格式）
+    AVPacket        *m_pkt;              // FFmpeg 数据包结构，存储编码输出的 H264 压缩数据
+    SwsContext      *m_swsCtx;           // FFmpeg 像素格式转换上下文，用于 RGB → YUV420P 的实时转换
+    uint8_t         *m_yuvBuffer;        // YUV 数据缓冲区指针（当前版本由 AVFrame 内部管理，此字段备用）
+    int              m_width;            // 视频宽度（像素）
+    int              m_height;           // 视频高度（像素）
+    int              m_fps;              // 帧率（FPS）
+    int64_t          m_frameIndex;       // 帧序号计数器，用于设置每帧的 PTS（呈现时间戳）
+    bool             m_requestKeyFrame;  // 标志位：是否请求下一帧为关键帧
+
+    bool initCodec(int width, int height, int fps, int bitrate);
+    // 内部方法：执行编码器初始化的详细逻辑
+
+    void freeResources();
+    // 内部方法：释放所有 FFmpeg 资源
+};
+
+#endif                                 // 防止头文件被重复包含的宏守卫结束
+</code></pre>
+<hr>
+<h3 id="35-h264encodercpp--h264-编码器实现">3.5 h264encoder.cpp —— H264 编码器实现</h3>
+<h4 id="351-构造函数-h264encoderh264encoder">3.5.1 构造函数 <code>H264Encoder::H264Encoder</code></h4>
+<pre><code class="language-cpp">H264Encoder::H264Encoder(QObject *parent)       // 构造函数实现
+    : QObject(parent)                             // 初始化列表：调用基类构造函数
+    , m_codecCtx(nullptr)                         // 编解码器上下文指针初始化为空
+    , m_frame(nullptr)                            // 帧结构指针初始化为空
+    , m_pkt(nullptr)                              // 数据包指针初始化为空
+    , m_swsCtx(nullptr)                           // 像素格式转换上下文指针初始化为空
+    , m_yuvBuffer(nullptr)                        // YUV 缓冲区指针初始化为空
+    , m_width(0)                                  // 视频宽度初始化为 0
+    , m_height(0)                                 // 视频高度初始化为 0
+    , m_fps(30)                                   // 帧率默认初始化为 30 FPS
+    , m_frameIndex(0)                             // 帧序号初始化为 0
+    , m_requestKeyFrame(false)                    // 关键帧请求标志初始化为 false
+{
+}
+</code></pre>
+<h4 id="352-析构函数-h264encoderh264encoder">3.5.2 析构函数 <code>H264Encoder::~H264Encoder</code></h4>
+<pre><code class="language-cpp">H264Encoder::~H264Encoder()                     // 析构函数实现
+{
+    close();                                       // 调用 close() 释放所有编码器资源
+}
+</code></pre>
+<h4 id="353-初始化函数-h264encoderinit">3.5.3 初始化函数 <code>H264Encoder::init</code></h4>
+<pre><code class="language-cpp">bool H264Encoder::init(int width, int height, int fps, int bitrate)
+{                                                  // 编码器初始化函数
+    if (m_codecCtx) {                              // 检查编码器是否已经初始化过
+        qWarning() &lt;&lt; &quot;H264Encoder already initialized&quot;;  // 打印警告日志
+        return false;                              // 返回失败，防止重复初始化
+    }
+
+    m_width = width;                               // 保存视频宽度到成员变量
+    m_height = height;                             // 保存视频高度到成员变量
+    m_fps = fps;                                   // 保存帧率到成员变量
+
+    // === 硬件编码器探测：优先尝试硬件加速 ===
+    const char *encoder_names[] = {                // 编码器名称数组，按优先级排列
+        &quot;h264_nvenc&quot;,                              // NVIDIA GPU 硬件编码器（需要 NVIDIA 显卡 + 驱动）
+        &quot;h264_qsv&quot;,                                // Intel Quick Sync Video 硬件编码器（需要 Intel 集成显卡）
+        &quot;libx264&quot;                                  // 软件编码器（x264 开源实现，兼容性最好但 CPU 占用高）
+    };
+    const AVCodec *codec = nullptr;                // 编解码器描述结构指针
+    for (size_t i = 0; i &lt; sizeof(encoder_names)/sizeof(encoder_names[0]); ++i)
+    {                                              // 遍历编码器列表
+        codec = avcodec_find_encoder_by_name(encoder_names[i]);
+        // 按名称查找编码器，如果对应的编解码库可用则返回非空指针
+        if (codec) {                               // 找到了可用的编码器
+            qDebug() &lt;&lt; &quot;H264Encoder: using encoder&quot; &lt;&lt; encoder_names[i];
+            break;                                 // 停止遍历，使用当前找到的编码器
+        }
+    }
+    if (!codec) {                                  // 如果所有按名称查找都失败
+        codec = avcodec_find_encoder(AV_CODEC_ID_H264);
+        // 按编解码器 ID 查找 H264 编码器（最终兜底方案）
+    }
+    if (!codec) {                                  // 如果仍然找不到任何 H264 编码器
+        qCritical() &lt;&lt; &quot;H264Encoder: codec H264 not found&quot;;
+        return false;                              // 返回失败
+    }
+
+    // === 分配编解码器上下文 ===
+    m_codecCtx = avcodec_alloc_context3(codec);    // 为找到的编码器分配上下文结构
+    if (!m_codecCtx) {                             // 分配失败
+        qCritical() &lt;&lt; &quot;H264Encoder: alloc context failed&quot;;
+        return false;
+    }
+
+    // === 配置编码参数 ===
+    m_codecCtx-&gt;width = width;                     // 设置编码输出的视频宽度
+    m_codecCtx-&gt;height = height;                   // 设置编码输出的视频高度
+    m_codecCtx-&gt;time_base = AVRational{1, fps};    // 设置时间基准：每个 tick 为 1/fps 秒
+                                                   // 例如 fps=30 时，time_base = 1/30
+    m_codecCtx-&gt;framerate = AVRational{fps, 1};    // 设置帧率：fps 帧/秒
+    m_codecCtx-&gt;bit_rate = bitrate;                // 设置目标比特率（bps），影响压缩质量与文件大小
+    m_codecCtx-&gt;gop_size = fps * 2;                // 设置 GOP（Group of Pictures）大小
+                                                   // 即每隔 fps*2 = 60 帧产生一个关键帧（I帧）
+                                                   // GOP 越大压缩率越高，但随机访问和抗误码能力越差
+    m_codecCtx-&gt;max_b_frames = 0;                  // 禁用 B 帧（双向预测帧）
+                                                   // 禁用 B 帧可降低编码延迟，适合实时通信场景
+    m_codecCtx-&gt;pix_fmt = AV_PIX_FMT_YUV420P;     // 设置输入像素格式为 YUV420P（4:2:0 色度子采样）
+                                                   // YUV420P 是 H264 编码最常用的像素格式
+
+    // === 设置 x264 特定的编码选项 ===
+    AVDictionary *opts = nullptr;                  // 创建选项字典
+    av_dict_set(&amp;opts, &quot;preset&quot;, &quot;ultrafast&quot;, 0);  // 编码速度预设：ultrafast（最快）
+                                                   // 可选值：ultrafast, superfast, veryfast, faster, fast,
+                                                   //         medium, slow, slower, veryslow
+                                                   // 越慢编码质量越高，但 CPU 占用越大
+    av_dict_set(&amp;opts, &quot;tune&quot;, &quot;zerolatency&quot;, 0);  // 调优选项：zerolatency（零延迟）
+                                                   // 禁用 look-ahead、B帧重排等，将延迟降到最低
+    av_dict_set(&amp;opts, &quot;crf&quot;, &quot;28&quot;, 0);            // 恒定速率因子：28
+                                                   // 范围 0-51，值越小质量越高
+                                                   // 0 = 无损，18 = 视觉无损，23 = 默认，28 = 较低质量
+                                                   // CRF 模式下 bit_rate 设置会被忽略（x264 特性）
+    av_dict_set(&amp;opts, &quot;profile&quot;, &quot;baseline&quot;, 0);  // H264 Profile：baseline（基线档次）
+                                                   // baseline 不支持 CABAC、B帧等高级特性
+                                                   // 但兼容性最好，解码器复杂度最低
+
+    // === 打开编码器 ===
+    int ret = avcodec_open2(m_codecCtx, codec, &amp;opts);  // 使用配置好的上下文和选项打开编码器
+    av_dict_free(&amp;opts);                           // 释放选项字典（编码器已读取完毕，字典不再需要）
+    if (ret &lt; 0) {                                 // 打开失败
+        qCritical() &lt;&lt; &quot;H264Encoder: avcodec_open2 failed, ret =&quot; &lt;&lt; ret;
+        avcodec_free_context(&amp;m_codecCtx);         // 释放已分配的上下文
+        m_codecCtx = nullptr;                      // 置空指针
+        return false;
+    }
+
+    // === 分配帧和数据包结构 ===
+    m_frame = av_frame_alloc();                    // 分配 AVFrame 结构（用于存放待编码的原始图像）
+    m_pkt = av_packet_alloc();                     // 分配 AVPacket 结构（用于接收编码后的压缩数据）
+    if (!m_frame || !m_pkt) {                      // 任一分配失败
+        qCritical() &lt;&lt; &quot;H264Encoder: alloc frame/pkt failed&quot;;
+        freeResources();                           // 释放已分配的所有资源
+        return false;
+    }
+
+    // === 配置帧参数 ===
+    m_frame-&gt;format = AV_PIX_FMT_YUV420P;         // 设置帧的像素格式
+    m_frame-&gt;width = width;                        // 设置帧的宽度
+    m_frame-&gt;height = height;                      // 设置帧的高度
+    ret = av_frame_get_buffer(m_frame, 32);        // 为帧分配图像数据缓冲区
+                                                   // 32 表示内存对齐到 32 字节，有利于 SIMD 指令加速
+    if (ret &lt; 0) {                                 // 分配失败
+        qCritical() &lt;&lt; &quot;H264Encoder: av_frame_get_buffer failed&quot;;
+        freeResources();
+        return false;
+    }
+
+    // === 创建像素格式转换上下文 ===
+    m_swsCtx = sws_getContext(
+        width, height, AV_PIX_FMT_RGB24,          // 源格式：RGB24（每像素 3 字节，与 QImage RGB888 对应）
+        width, height, AV_PIX_FMT_YUV420P,        // 目标格式：YUV420P（H264 编码器要求的输入格式）
+        SWS_BICUBIC,                               // 缩放/转换算法：双三次插值（质量较好）
+        nullptr, nullptr, nullptr                  // 可选的源/目标滤波器和参数（此处不使用）
+    );
+    if (!m_swsCtx) {                               // 创建失败
+        qCritical() &lt;&lt; &quot;H264Encoder: sws_getContext failed&quot;;
+        freeResources();
+        return false;
+    }
+
+    qDebug() &lt;&lt; &quot;H264Encoder: init success,&quot;       // 打印初始化成功日志
+             &lt;&lt; width &lt;&lt; &quot;x&quot; &lt;&lt; height &lt;&lt; &quot;@&quot; &lt;&lt; fps &lt;&lt; &quot;fps&quot;;
+    return true;                                   // 初始化成功
+}
+</code></pre>
+<h4 id="354-编码函数-h264encoderencode">3.5.4 编码函数 <code>H264Encoder::encode</code></h4>
+<pre><code class="language-cpp">QByteArray H264Encoder::encode(const QImage &amp;img) // 编码一帧图像
+{
+    if (!m_codecCtx || !m_frame || !m_swsCtx) {    // 检查编码器是否已正确初始化
+        return QByteArray();                         // 未初始化则返回空字节数组
+    }
+
+    // === 步骤 1：确保图像格式为 RGB888 ===
+    QImage rgbImg;                                   // 声明用于存储 RGB 格式图像的变量
+    if (img.format() == QImage::Format_RGB888) {     // 检查输入图像是否已经是 RGB888 格式
+        rgbImg = img;                                // 已经是，直接使用
+    } else {
+        rgbImg = img.convertToFormat(QImage::Format_RGB888);
+        // 不是 RGB888 格式，进行格式转换
+    }
+
+    // === 步骤 2：确保 AVFrame 可写 ===
+    if (av_frame_make_writable(m_frame) &lt; 0) {      // 确保帧的数据缓冲区是可写的
+        return QByteArray();                         // 如果帧被多个引用持有且不可写，返回空
+    }
+
+    // === 步骤 3：RGB → YUV420P 颜色空间转换 ===
+    const uint8_t *srcData[1] = { rgbImg.constBits() };
+    // 源图像数据指针数组（RGB 平面数据，单平面格式所以只有一个元素）
+    int srcLinesize[1] = { rgbImg.bytesPerLine() };
+    // 源图像每行字节数（可能包含行对齐填充字节）
+    sws_scale(m_swsCtx,                             // 像素格式转换上下文
+              srcData, srcLinesize,                  // 源数据指针和行步长
+              0, m_height,                           // 起始行和处理行数
+              m_frame-&gt;data, m_frame-&gt;linesize);     // 目标数据（AVFrame 内部的 YUV 平面数据）
+
+    // === 步骤 4：设置 PTS 和帧类型 ===
+    m_frame-&gt;pts = m_frameIndex++;                   // 设置当前帧的呈现时间戳（PTS）
+                                                     // PTS 单位为 time_base 的倍数
+                                                     // 即 pts=0 → 0秒, pts=1 → 1/30秒, ...
+
+    if (m_requestKeyFrame) {                         // 如果外部请求了关键帧
+        m_frame-&gt;pict_type = AV_PICTURE_TYPE_I;      // 强制将当前帧设为 I 帧（帧内编码，不依赖其他帧）
+        m_requestKeyFrame = false;                   // 清除请求标志
+    } else {
+        m_frame-&gt;pict_type = AV_PICTURE_TYPE_NONE;   // 使用编码器自动决定帧类型
+                                                     // （根据 GOP 设置在适当时机自动插入 I 帧）
+    }
+
+    // === 步骤 5：送入编码器 ===
+    int ret = avcodec_send_frame(m_codecCtx, m_frame);  // 将原始帧数据送入编码器进行编码
+    if (ret &lt; 0) {                                   // 编码器拒绝接收（可能是参数不匹配等）
+        qWarning() &lt;&lt; &quot;H264Encoder: avcodec_send_frame failed,&quot; &lt;&lt; ret;
+        return QByteArray();
+    }
+
+    // === 步骤 6：从编码器取出编码后的数据 ===
+    QByteArray result;                               // 用于累积本次编码输出的 H264 数据
+    bool isKeyFrame = false;                         // 标记本次输出是否包含关键帧
+    while (ret &gt;= 0) {                               // 循环取出所有可用的编码数据包
+        ret = avcodec_receive_packet(m_codecCtx, m_pkt);
+        // 尝试从编码器取出一个数据包
+        if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) {
+            // EAGAIN：编码器需要更多输入帧才能输出（正常情况）
+            // EOF：编码器已结束，不再有输出
+            break;                                   // 退出循环
+        }
+        if (ret &lt; 0) {                               // 其他错误
+            qWarning() &lt;&lt; &quot;H264Encoder: avcodec_receive_packet failed,&quot; &lt;&lt; ret;
+            break;
+        }
+        result.append(                               // 将数据包中的 H264 裸流数据追加到结果中
+            reinterpret_cast&lt;const char*&gt;(m_pkt-&gt;data),  // 数据包数据指针（强制转换为 char*）
+            m_pkt-&gt;size                              // 数据包大小（字节）
+        );
+        if (m_pkt-&gt;flags &amp; AV_PKT_FLAG_KEY) {        // 检查数据包是否标记为关键帧
+            isKeyFrame = true;                       // 记录存在关键帧
+        }
+        av_packet_unref(m_pkt);                      // 释放数据包的引用，准备接收下一个
+    }
+
+    if (!result.isEmpty()) {                         // 如果有编码输出
+        Q_EMIT SIG_encoded(result, isKeyFrame);      // 发射编码完成信号
+    }
+    return result;                                   // 返回编码后的 H264 数据
+}
+</code></pre>
+<h4 id="355-请求关键帧-h264encoderrequestkeyframe">3.5.5 请求关键帧 <code>H264Encoder::requestKeyFrame</code></h4>
+<pre><code class="language-cpp">void H264Encoder::requestKeyFrame()                // 请求下一帧为关键帧
+{
+    m_requestKeyFrame = true;                        // 设置标志位为 true
+                                                     // 下次调用 encode() 时，会将该帧强制编码为 I 帧
+                                                     // 典型应用场景：
+                                                     //   - 新接收端加入会议，需要立即获得完整画面
+                                                     //   - 画面出现严重花屏/马赛克，需要刷新
+                                                     //   - 网络丢包导致解码端无法恢复
+}
+</code></pre>
+<h4 id="356-关闭编码器-h264encoderclose">3.5.6 关闭编码器 <code>H264Encoder::close</code></h4>
+<pre><code class="language-cpp">void H264Encoder::close()                          // 关闭编码器
+{
+    freeResources();                                 // 委托给 freeResources() 释放所有资源
+}
+</code></pre>
+<h4 id="357-资源释放-h264encoderfreeresources">3.5.7 资源释放 <code>H264Encoder::freeResources</code></h4>
+<pre><code class="language-cpp">void H264Encoder::freeResources()                  // 释放所有 FFmpeg 资源
+{
+    if (m_swsCtx) {                                  // 如果像素格式转换上下文存在
+        sws_freeContext(m_swsCtx);                   // 释放 SwsContext 及其内部缓冲区
+        m_swsCtx = nullptr;                          // 置空指针
+    }
+    if (m_frame) {                                   // 如果帧结构存在
+        av_frame_free(&amp;m_frame);                     // 释放 AVFrame 及其关联的数据缓冲区
+                                                     // 传入二级指针，函数内部会将 m_frame 置为 nullptr
+    }
+    if (m_pkt) {                                     // 如果数据包结构存在
+        av_packet_free(&amp;m_pkt);                      // 释放 AVPacket 及其关联的数据
+    }
+    if (m_codecCtx) {                                // 如果编解码器上下文存在
+        avcodec_free_context(&amp;m_codecCtx);           // 释放编解码器上下文
+    }
+    m_yuvBuffer = nullptr;                           // 置空 YUV 缓冲区指针（备用字段）
+    m_frameIndex = 0;                                // 重置帧序号计数器
+}
+</code></pre>
+<hr>
+<h3 id="36-screenreadh--桌面共享采集声明">3.6 screenread.h —— 桌面共享采集声明</h3>
+<pre><code class="language-cpp">#ifndef SCREENREAD_H                 // 防止头文件被重复包含的宏守卫开始
+#define SCREENREAD_H                 // 定义 SCREENREAD_H 宏
+
+#include &lt;QObject&gt;                   // 引入 Qt 对象基类
+#include &lt;QTimer&gt;                    // 引入 Qt 定时器类
+#include &lt;QApplication&gt;              // 引入 Qt 应用程序类，用于获取主屏幕信息
+#include &lt;QDesktopWidget&gt;            // 引入 Qt 桌面组件类（Qt5），用于获取桌面窗口 ID
+#include &lt;QScreen&gt;                   // 引入 Qt 屏幕类，提供屏幕截图功能
+#include &lt;QImage&gt;                    // 引入 Qt 图像类
+
+class ScreenRead : public QObject    // 定义 ScreenRead 类，继承自 QObject
+{
+    Q_OBJECT                         // Qt 元对象宏
+public:
+    explicit ScreenRead(QObject *parent = nullptr);  // 构造函数
+    ~ScreenRead();                                   // 析构函数
+
+signals:
+    void SIG_getScreenFrame(QImage img);             // 信号：发送一帧桌面画面
+
+public slots:
+    void slot_getScreenFrame();                      // 槽函数：抓取一帧桌面画面
+    void slot_openVideo();                           // 槽函数：启动桌面采集
+    void slot_closeVideo();                          // 槽函数：停止桌面采集
+
+private:
+    QTimer * m_timer;                                // 定时器指针，用于周期性触发屏幕抓取
+};
+
+#endif                                           // 防止头文件被重复包含的宏守卫结束
+</code></pre>
+<hr>
+<h3 id="37-screenreadcpp--桌面共享采集实现">3.7 screenread.cpp —— 桌面共享采集实现</h3>
+<pre><code class="language-cpp">#include &quot;screenread.h&quot;              // 引入 ScreenRead 类声明头文件
+#include &quot;common.h&quot;                  // 引入公共头文件（虽然本文件未直接使用 FRAME_RATE，但保持一致性）
+
+#define DESK_FRAME_RATE (25)         // 桌面采集帧率：25 FPS（低于摄像头的 30 FPS，因为屏幕抓取开销更大）
+#define DESK_IMAGE_WIDTH  (1024)     // 桌面采集输出宽度：1024 像素
+#define DESK_IMAGE_HEIGHT (768)      // 桌面采集输出高度：768 像素
+</code></pre>
+<p><strong>宏常量说明：</strong></p>
+<table>
+<thead>
+<tr>
+<th>宏名称</th>
+<th>值</th>
+<th>类型</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>DESK_FRAME_RATE</code></td>
+<td><code>25</code></td>
+<td><code>int</code></td>
+<td>桌面采集帧率（FPS）。低于摄像头帧率（30），因为屏幕抓取操作涉及系统图形合成，开销更大</td>
+</tr>
+<tr>
+<td><code>DESK_IMAGE_WIDTH</code></td>
+<td><code>1024</code></td>
+<td><code>int</code></td>
+<td>桌面输出图像宽度（像素）。常见桌面分辨率为 1920×1080，缩放到 1024 以减少编码和传输开销</td>
+</tr>
+<tr>
+<td><code>DESK_IMAGE_HEIGHT</code></td>
+<td><code>768</code></td>
+<td><code>int</code></td>
+<td>桌面输出图像高度（像素）。与宽度配合保持 4:3 宽高比</td>
+</tr>
+</tbody></table>
+<h4 id="371-构造函数-screenreadscreenread">3.7.1 构造函数 <code>ScreenRead::ScreenRead</code></h4>
+<pre><code class="language-cpp">ScreenRead::ScreenRead(QObject *parent) : QObject(parent)   // 构造函数实现
+{
+    m_timer = new QTimer(this);          // 创建定时器，传入 this 作为父对象
+                                         // 父对象机制会在 ScreenRead 销毁时自动销毁定时器
+    connect(m_timer, SIGNAL(timeout()),  // 连接定时器的 timeout 信号
+            this, SLOT(slot_getScreenFrame()));  // 到当前对象的屏幕抓取槽函数
+}
+</code></pre>
+<h4 id="372-析构函数-screenreadscreenread">3.7.2 析构函数 <code>ScreenRead::~ScreenRead</code></h4>
+<pre><code class="language-cpp">ScreenRead::~ScreenRead()              // 析构函数实现
+{
+    if( m_timer )                       // 检查定时器指针是否非空
+    {
+        m_timer-&gt;stop();                // 停止定时器
+        delete m_timer;                 // 释放定时器内存
+        m_timer = NULL;                 // 置空指针
+    }
+}
+</code></pre>
+<h4 id="373-屏幕抓取槽函数-screenreadslot_getscreenframe">3.7.3 屏幕抓取槽函数 <code>ScreenRead::slot_getScreenFrame</code></h4>
+<pre><code class="language-cpp">void ScreenRead::slot_getScreenFrame()                   // 抓取一帧桌面画面
+{
+    QScreen *src = QApplication::primaryScreen();          // 获取应用程序的主屏幕对象指针
+    QPixmap map = src-&gt;grabWindow(                         // 调用屏幕对象的窗口抓取方法
+        QApplication::desktop()-&gt;winId()                   // 传入桌面窗口的原生窗口 ID
+                                                           // desktop()-&gt;winId() 获取的是整个虚拟桌面的窗口句柄
+    );                                                     // 返回包含屏幕截图的 QPixmap 对象
+
+    QImage image = map.toImage();                          // 将 QPixmap 转换为 QImage（像素数据可直接访问）
+    image = image.scaled(                                  // 对截图进行缩放
+        DESK_IMAGE_WIDTH,                                  // 目标宽度：1024 像素
+        DESK_IMAGE_HEIGHT,                                 // 目标高度：768 像素
+        Qt::KeepAspectRatio,                               // 保持原始宽高比
+        Qt::FastTransformation                             // 使用快速变换（最近邻插值）
+                                                           // 相比 Qt::SmoothTransformation（双线性插值）
+                                                           // 牺牲质量换取速度，适合屏幕共享场景
+    );
+    Q_EMIT SIG_getScreenFrame(image);                      // 发射信号，将桌面画面发送给下游处理
+}
+</code></pre>
+<h4 id="374-启动采集槽函数-screenreadslot_openvideo">3.7.4 启动采集槽函数 <code>ScreenRead::slot_openVideo</code></h4>
+<pre><code class="language-cpp">void ScreenRead::slot_openVideo()                        // 启动桌面采集
+{
+    m_timer-&gt;start( 1000 / DESK_FRAME_RATE );             // 启动定时器，间隔 = 1000/25 = 40ms
+                                                           // 即每 40ms 抓取一帧桌面画面
+}
+</code></pre>
+<h4 id="375-停止采集槽函数-screenreadslot_closevideo">3.7.5 停止采集槽函数 <code>ScreenRead::slot_closeVideo</code></h4>
+<pre><code class="language-cpp">void ScreenRead::slot_closeVideo()                       // 停止桌面采集
+{
+    m_timer-&gt;stop();                                       // 停止定时器
+}
+</code></pre>
+<hr>
+<h2 id="四、参数说明表格">四、参数说明表格</h2>
+<h3 id="41-全局宏常量">4.1 全局宏常量</h3>
+<table>
+<thead>
+<tr>
+<th>参数名称</th>
+<th>所在文件</th>
+<th>数据类型</th>
+<th>值</th>
+<th>取值范围</th>
+<th>功能作用</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>FRAME_RATE</code></td>
+<td><code>common.h</code></td>
+<td><code>int</code>（宏）</td>
+<td><code>30</code></td>
+<td>1 ~ 60</td>
+<td>摄像头视频采集的目标帧率（FPS），用于定时器间隔计算</td>
+</tr>
+<tr>
+<td><code>IMAGE_WIDTH</code></td>
+<td><code>videoread.h</code></td>
+<td><code>int</code>（宏）</td>
+<td><code>320</code></td>
+<td>16 ~ 3840</td>
+<td>摄像头采集输出图像宽度（像素）</td>
+</tr>
+<tr>
+<td><code>IMAGE_HEIGHT</code></td>
+<td><code>videoread.h</code></td>
+<td><code>int</code>（宏）</td>
+<td><code>240</code></td>
+<td>16 ~ 2160</td>
+<td>摄像头采集输出图像高度（像素）</td>
+</tr>
+<tr>
+<td><code>DESK_FRAME_RATE</code></td>
+<td><code>screenread.cpp</code></td>
+<td><code>int</code>（宏）</td>
+<td><code>25</code></td>
+<td>1 ~ 60</td>
+<td>桌面采集目标帧率（FPS）</td>
+</tr>
+<tr>
+<td><code>DESK_IMAGE_WIDTH</code></td>
+<td><code>screenread.cpp</code></td>
+<td><code>int</code>（宏）</td>
+<td><code>1024</code></td>
+<td>16 ~ 3840</td>
+<td>桌面采集输出图像宽度（像素）</td>
+</tr>
+<tr>
+<td><code>DESK_IMAGE_HEIGHT</code></td>
+<td><code>screenread.cpp</code></td>
+<td><code>int</code>（宏）</td>
+<td><code>768</code></td>
+<td>16 ~ 2160</td>
+<td>桌面采集输出图像高度（像素）</td>
+</tr>
+</tbody></table>
+<h3 id="42-videoread-类成员变量">4.2 VideoRead 类成员变量</h3>
+<table>
+<thead>
+<tr>
+<th>成员名称</th>
+<th>数据类型</th>
+<th>访问权限</th>
+<th>初始值</th>
+<th>功能作用</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>m_timer</code></td>
+<td><code>QTimer*</code></td>
+<td><code>private</code></td>
+<td><code>new QTimer</code>（构造函数中分配）</td>
+<td>周期性定时器，以约 23ms 间隔触发 <code>slot_getVideoFrame()</code> 采集一帧</td>
+</tr>
+<tr>
+<td><code>cap</code></td>
+<td><code>cv::VideoCapture</code></td>
+<td><code>private</code></td>
+<td>默认构造（未打开状态）</td>
+<td>OpenCV 视频捕获对象，管理摄像头设备的打开、读取、释放</td>
+</tr>
+</tbody></table>
+<h3 id="43-h264encoder-类成员变量">4.3 H264Encoder 类成员变量</h3>
+<table>
+<thead>
+<tr>
+<th>成员名称</th>
+<th>数据类型</th>
+<th>访问权限</th>
+<th>初始值</th>
+<th>取值范围</th>
+<th>功能作用</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>m_codecCtx</code></td>
+<td><code>AVCodecContext*</code></td>
+<td><code>private</code></td>
+<td><code>nullptr</code></td>
+<td>有效指针或 <code>nullptr</code></td>
+<td>FFmpeg 编解码器上下文，存储编码器全部配置（分辨率、帧率、比特率、像素格式等）及运行时状态</td>
+</tr>
+<tr>
+<td><code>m_frame</code></td>
+<td><code>AVFrame*</code></td>
+<td><code>private</code></td>
+<td><code>nullptr</code></td>
+<td>有效指针或 <code>nullptr</code></td>
+<td>FFmpeg 帧结构，存放待编码的 YUV420P 格式原始图像数据</td>
+</tr>
+<tr>
+<td><code>m_pkt</code></td>
+<td><code>AVPacket*</code></td>
+<td><code>private</code></td>
+<td><code>nullptr</code></td>
+<td>有效指针或 <code>nullptr</code></td>
+<td>FFmpeg 数据包结构，接收编码输出的 H264 压缩码流</td>
+</tr>
+<tr>
+<td><code>m_swsCtx</code></td>
+<td><code>SwsContext*</code></td>
+<td><code>private</code></td>
+<td><code>nullptr</code></td>
+<td>有效指针或 <code>nullptr</code></td>
+<td>像素格式转换上下文，负责 RGB24 → YUV420P 的实时颜色空间转换</td>
+</tr>
+<tr>
+<td><code>m_yuvBuffer</code></td>
+<td><code>uint8_t*</code></td>
+<td><code>private</code></td>
+<td><code>nullptr</code></td>
+<td>有效指针或 <code>nullptr</code></td>
+<td>YUV 数据缓冲区指针（当前版本由 AVFrame 内部管理，保留备用）</td>
+</tr>
+<tr>
+<td><code>m_width</code></td>
+<td><code>int</code></td>
+<td><code>private</code></td>
+<td><code>0</code></td>
+<td>16 ~ 3840</td>
+<td>视频宽度（像素），由 <code>init()</code> 参数传入</td>
+</tr>
+<tr>
+<td><code>m_height</code></td>
+<td><code>int</code></td>
+<td><code>private</code></td>
+<td><code>0</code></td>
+<td>16 ~ 2160</td>
+<td>视频高度（像素），由 <code>init()</code> 参数传入</td>
+</tr>
+<tr>
+<td><code>m_fps</code></td>
+<td><code>int</code></td>
+<td><code>private</code></td>
+<td><code>30</code></td>
+<td>1 ~ 60</td>
+<td>帧率（FPS），影响 time_base 和 gop_size</td>
+</tr>
+<tr>
+<td><code>m_frameIndex</code></td>
+<td><code>int64_t</code></td>
+<td><code>private</code></td>
+<td><code>0</code></td>
+<td>0 ~ 2^63-1</td>
+<td>帧序号计数器，每次 <code>encode()</code> 调用后自增 1，用于设置帧的 PTS</td>
+</tr>
+<tr>
+<td><code>m_requestKeyFrame</code></td>
+<td><code>bool</code></td>
+<td><code>private</code></td>
+<td><code>false</code></td>
+<td><code>true</code> / <code>false</code></td>
+<td>关键帧请求标志，设为 <code>true</code> 后下一次 <code>encode()</code> 将强制编码为 I 帧</td>
+</tr>
+</tbody></table>
+<h3 id="44-h264-编码器初始化参数">4.4 H264 编码器初始化参数</h3>
+<table>
+<thead>
+<tr>
+<th>参数名称</th>
+<th>数据类型</th>
+<th>默认值</th>
+<th>取值范围</th>
+<th>功能作用</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>width</code></td>
+<td><code>int</code></td>
+<td>无（必须指定）</td>
+<td>16 ~ 3840</td>
+<td>编码输出视频的宽度（像素），应为偶数</td>
+</tr>
+<tr>
+<td><code>height</code></td>
+<td><code>int</code></td>
+<td>无（必须指定）</td>
+<td>16 ~ 2160</td>
+<td>编码输出视频的高度（像素），应为偶数</td>
+</tr>
+<tr>
+<td><code>fps</code></td>
+<td><code>int</code></td>
+<td><code>30</code></td>
+<td>1 ~ 60</td>
+<td>目标帧率，影响 time_base（1/fps）、gop_size（fps*2）和编码延迟</td>
+</tr>
+<tr>
+<td><code>bitrate</code></td>
+<td><code>int</code></td>
+<td><code>200000</code></td>
+<td>50000 ~ 10000000</td>
+<td>目标比特率（bps），默认 200kbps。在 CRF 模式下此值被 x264 忽略</td>
+</tr>
+</tbody></table>
+<h3 id="45-ffmpeg-编码器上下文关键参数">4.5 FFmpeg 编码器上下文关键参数</h3>
+<table>
+<thead>
+<tr>
+<th>参数名称</th>
+<th>数据类型</th>
+<th>设置值</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>width</code></td>
+<td><code>int</code></td>
+<td><code>width</code>（传入值）</td>
+<td>编码输出视频宽度</td>
+</tr>
+<tr>
+<td><code>height</code></td>
+<td><code>int</code></td>
+<td><code>height</code>（传入值）</td>
+<td>编码输出视频高度</td>
+</tr>
+<tr>
+<td><code>time_base</code></td>
+<td><code>AVRational</code></td>
+<td><code>{1, fps}</code></td>
+<td>时间基准，例如 <code>{1, 30}</code> 表示每个 tick 为 1/30 秒</td>
+</tr>
+<tr>
+<td><code>framerate</code></td>
+<td><code>AVRational</code></td>
+<td><code>{fps, 1}</code></td>
+<td>帧率，例如 <code>{30, 1}</code> 表示 30 帧/秒</td>
+</tr>
+<tr>
+<td><code>bit_rate</code></td>
+<td><code>int64_t</code></td>
+<td><code>bitrate</code>（传入值）</td>
+<td>目标比特率（bps），CRF 模式下可能被忽略</td>
+</tr>
+<tr>
+<td><code>gop_size</code></td>
+<td><code>int</code></td>
+<td><code>fps * 2</code></td>
+<td>GOP 大小，即两个 I 帧之间的最大帧数。fps=30 时为 60</td>
+</tr>
+<tr>
+<td><code>max_b_frames</code></td>
+<td><code>int</code></td>
+<td><code>0</code></td>
+<td>最大连续 B 帧数。0 = 不使用 B 帧，降低编码延迟</td>
+</tr>
+<tr>
+<td><code>pix_fmt</code></td>
+<td><code>enum AVPixelFormat</code></td>
+<td><code>AV_PIX_FMT_YUV420P</code></td>
+<td>输入像素格式，H264 编码要求的 YUV420 4:2:0 格式</td>
+</tr>
+</tbody></table>
+<h3 id="46-x264-编码选项参数">4.6 x264 编码选项参数</h3>
+<table>
+<thead>
+<tr>
+<th>选项名称</th>
+<th>设置值</th>
+<th>可选值</th>
+<th>功能作用</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>preset</code></td>
+<td><code>ultrafast</code></td>
+<td><code>ultrafast</code> / <code>superfast</code> / <code>veryfast</code> / <code>faster</code> / <code>fast</code> / <code>medium</code> / <code>slow</code> / <code>slower</code> / <code>veryslow</code></td>
+<td>编码速度与压缩效率的权衡。<code>ultrafast</code> 编码速度最快，CPU 占用最低，但压缩效率最低（码率最高）</td>
+</tr>
+<tr>
+<td><code>tune</code></td>
+<td><code>zerolatency</code></td>
+<td><code>film</code> / <code>animation</code> / <code>grain</code> / <code>stillimage</code> / <code>psnr</code> / <code>ssim</code> / <code>fastdecode</code> / <code>zerolatency</code></td>
+<td>针对特定场景的调优。<code>zerolatency</code> 禁用 look-ahead、B帧重排等，将延迟降到最低</td>
+</tr>
+<tr>
+<td><code>crf</code></td>
+<td><code>28</code></td>
+<td><code>0</code> ~ <code>51</code></td>
+<td>恒定速率因子。0 = 无损，18 ≈ 视觉无损，23 = 默认，28 = 较低质量。每增减 6 大致对应码率减半/翻倍</td>
+</tr>
+<tr>
+<td><code>profile</code></td>
+<td><code>baseline</code></td>
+<td><code>baseline</code> / <code>main</code> / <code>high</code></td>
+<td>H264 Profile。<code>baseline</code> 不支持 CABAC 和 B 帧，兼容性最好；<code>main</code> 支持 CABAC；<code>high</code> 支持更多高级特性</td>
+</tr>
+</tbody></table>
+<h3 id="47-screenread-类成员变量">4.7 ScreenRead 类成员变量</h3>
+<table>
+<thead>
+<tr>
+<th>成员名称</th>
+<th>数据类型</th>
+<th>访问权限</th>
+<th>初始值</th>
+<th>功能作用</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>m_timer</code></td>
+<td><code>QTimer*</code></td>
+<td><code>private</code></td>
+<td><code>new QTimer(this)</code></td>
+<td>周期性定时器，以 40ms 间隔（25 FPS）触发桌面屏幕抓取</td>
+</tr>
+</tbody></table>
+<hr>
+<h2 id="五、h264-编码器硬件回退链说明">五、H264 编码器硬件回退链说明</h2>
+<h3 id="51-回退策略概述">5.1 回退策略概述</h3>
+<p>H264 编码器采用<strong>三级硬件回退链</strong>策略，在初始化时按优先级依次尝试不同的编码器：</p>
+<pre><code>NVIDIA NVENC → Intel QSV → libx264（软件）
+</code></pre>
+<h3 id="52-各级编码器详解">5.2 各级编码器详解</h3>
+<table>
+<thead>
+<tr>
+<th>优先级</th>
+<th>编码器名称</th>
+<th>类型</th>
+<th>依赖条件</th>
+<th>性能特点</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>1（最高）</td>
+<td><code>h264_nvenc</code></td>
+<td>GPU 硬件加速</td>
+<td>NVIDIA 独立显卡 + 最新驱动 + CUDA 支持</td>
+<td>编码速度极快，CPU 占用极低，适合高分辨率/高帧率场景</td>
+</tr>
+<tr>
+<td>2</td>
+<td><code>h264_qsv</code></td>
+<td>GPU 硬件加速</td>
+<td>Intel 集成显卡（HD Graphics 及以上）+ Intel Media SDK</td>
+<td>编码速度快，CPU 占用低，笔记本电脑常见方案</td>
+</tr>
+<tr>
+<td>3（最低）</td>
+<td><code>libx264</code></td>
+<td>软件编码</td>
+<td>无硬件依赖，仅需 CPU</td>
+<td>兼容性最好，但 CPU 占用高，高分辨率下可能成为瓶颈</td>
+</tr>
+</tbody></table>
+<h3 id="53-回退流程">5.3 回退流程</h3>
+<div class="mermaid">flowchart TD
+    A["开始初始化编码器"]
+    B["遍历 encoder_names 数组"]
+    C["avcodec_find_encoder_by_name()"]
+    D{"找到了编码器？"}
+    E["使用该编码器"]
+    F{"已遍历完所有名称？"}
+    G["avcodec_find_encoder(AV_CODEC_ID_H264)"]
+    H{"找到编码器？"}
+    I["分配并配置编码器上下文"]
+    J["avcodec_open2() 打开编码器"]
+    K{"打开成功？"}
+    L["初始化成功"]
+    M["初始化失败"]
+    N["avcodec_free_context 释放"]
+
+    A --> B
+    B --> C
+    C --> D
+    D -- 是 --> E --> I
+    D -- 否 --> F
+    F -- 否 --> C
+    F -- 是 --> G
+    G --> H
+    H -- 是 --> I
+    H -- 否 --> M
+    I --> J
+    J --> K
+    K -- 是 --> L
+    K -- 否 --> N --> M
+</div><h3 id="54-代码实现要点">5.4 代码实现要点</h3>
+<ol>
+<li><strong>名称数组遍历</strong>：使用 <code>avcodec_find_encoder_by_name()</code> 按名称查找，优先尝试硬件编码器</li>
+<li><strong>ID 兜底查找</strong>：如果名称查找全部失败，使用 <code>avcodec_find_encoder(AV_CODEC_ID_H264)</code> 按编解码器 ID 查找</li>
+<li><strong>日志输出</strong>：每次找到编码器时会通过 <code>qDebug()</code> 输出使用的编码器名称，便于调试</li>
+<li><strong>错误处理</strong>：任一步骤失败都会正确释放已分配的资源并返回 <code>false</code></li>
+</ol>
+<hr>
+<h2 id="六、摄像头后端回退策略说明">六、摄像头后端回退策略说明</h2>
+<h3 id="61-回退策略概述">6.1 回退策略概述</h3>
+<p>摄像头采集模块采用<strong>三级后端回退</strong>策略，提高在不同 Windows 系统版本和驱动环境下的兼容性：</p>
+<pre><code>OpenCV 默认后端 → MSMF（Microsoft Media Foundation）→ DirectShow
+</code></pre>
+<h3 id="62-各后端详解">6.2 各后端详解</h3>
+<table>
+<thead>
+<tr>
+<th>优先级</th>
+<th>后端名称</th>
+<th>OpenCV 常量</th>
+<th>适用环境</th>
+<th>特点</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>1（最高）</td>
+<td>默认后端</td>
+<td>无（自动选择）</td>
+<td>通用</td>
+<td>OpenCV 根据编译配置自动选择最佳后端</td>
+</tr>
+<tr>
+<td>2</td>
+<td>MSMF</td>
+<td><code>cv::CAP_MSMF</code></td>
+<td>Windows 7 及以上</td>
+<td>Microsoft Media Foundation，Windows 现代多媒体框架，支持 UWP 应用</td>
+</tr>
+<tr>
+<td>3（最低）</td>
+<td>DirectShow</td>
+<td><code>cv::CAP_DSHOW</code></td>
+<td>Windows XP 及以上</td>
+<td>Windows 传统多媒体框架，兼容性最广，但功能较旧</td>
+</tr>
+</tbody></table>
+<h3 id="63-重试机制">6.3 重试机制</h3>
+<p>每个后端最多<strong>重试 3 次</strong>，每次重试间隔 <strong>100ms</strong>。这种设计考虑了以下场景：</p>
+<ul>
+<li><strong>设备初始化延迟</strong>：某些 USB 摄像头首次打开时需要较长时间完成枚举和初始化</li>
+<li><strong>驱动竞争</strong>：多个应用同时访问摄像头时，重试可等待其他进程释放设备</li>
+<li><strong>即插即用延迟</strong>：刚插入的 USB 设备可能需要短暂的系统识别时间</li>
+</ul>
+<h3 id="64-回退流程">6.4 回退流程</h3>
+<div class="mermaid">flowchart TD
+    A["开始打开摄像头"]
+    B["重试计数器 i = 0"]
+    C{"i < 3？"}
+    D["cap.open(0) 默认后端"]
+    E{"cap.isOpened()？"}
+    F["i++, sleep(100ms)"]
+    G["摄像头打开成功"]
+    H["重试计数器 i = 0"]
+    I{"i < 3？"}
+    J["cap.open(0, CAP_MSMF)"]
+    K{"cap.isOpened()？"}
+    L["i++, sleep(100ms)"]
+    M["重试计数器 i = 0"]
+    N{"i < 3？"}
+    O["cap.open(0, CAP_DSHOW)"]
+    P{"cap.isOpened()？"}
+    Q["i++, sleep(100ms)"]
+    R["弹出错误提示"]
+
+    A --> B --> C
+    C -- 是 --> D --> E
+    E -- 是 --> G
+    E -- 否 --> F --> C
+    C -- 否 --> H --> I
+    I -- 是 --> J --> K
+    K -- 是 --> G
+    K -- 否 --> L --> I
+    I -- 否 --> M --> N
+    N -- 是 --> O --> P
+    P -- 是 --> G
+    P -- 否 --> Q --> N
+    N -- 否 --> R
+</div><h3 id="65-关键设计决策">6.5 关键设计决策</h3>
+<ol>
+<li><strong>设备号固定为 0</strong>：三次尝试均使用设备号 <code>0</code>，即系统默认摄像头。多摄像头场景需扩展为可配置的设备号</li>
+<li><strong>先启动定时器再打开摄像头</strong>：<code>m_timer-&gt;start()</code> 在摄像头打开之前调用，意味着定时器可能在摄像头未就绪时就开始触发。<code>slot_getVideoFrame()</code> 中通过 <code>cap.read()</code> 返回值判断是否读取成功，失败时直接 <code>return</code>，不会崩溃</li>
+<li><strong>异步消息框</strong>：摄像头打开失败时使用 <code>QMessageBox::information()</code> 弹出提示，该调用是阻塞式的</li>
+</ol>
+<hr>
+<h2 id="七、数据流转总览">七、数据流转总览</h2>
+<div class="mermaid">flowchart LR
+    subgraph 摄像头采集
+        A["摄像头硬件"] -->|USB/内置| B["cv::VideoCapture"]
+        B -->|BGR Mat| C["cvtColor BGR→RGB"]
+        C -->|RGB Mat| D["Mat→QImage"]
+        D -->|QImage 320×240| E["SIG_sendVideoFrame"]
+    end
+
+    subgraph 桌面采集
+        F["QScreen::grabWindow"] -->|QPixmap| G["toImage"]
+        G -->|QImage| H["scaled 1024×768"]
+        H -->|QImage| I["SIG_getScreenFrame"]
+    end
+
+    subgraph H264编码
+        J["QImage RGB888"] -->|convertToFormat| K["确保RGB888"]
+        K -->|sws_scale| L["RGB→YUV420P"]
+        L -->|AVFrame| M["avcodec_send_frame"]
+        M -->|AVCodecContext| N["avcodec_receive_packet"]
+        N -->|H264 裸流| O["SIG_encoded"]
+    end
+
+    E --> J
+    I --> J
+</div>
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10.9.1/dist/mermaid.min.js"></script>
+<script>mermaid.initialize({startOnLoad:true, theme:'default', flowchart:{htmlLabels:true, curve:'basis'}, securityLevel:'loose'});</script>
+</body>
+</html>

@@ -1,0 +1,224 @@
+﻿<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>WeChat - 数据流图</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:"Microsoft YaHei",sans-serif;background:#f5f7fa;padding:40px}
+.container{max-width:1400px;margin:0 auto;background:white;border-radius:12px;box-shadow:0 4px 20px rgba(0,0,0,.08);overflow:hidden}
+.header{background:linear-gradient(135deg,#e53935,#c62828);color:white;padding:30px 40px}
+.header h1{font-size:26px;margin-bottom:6px}
+.header p{font-size:13px;opacity:.85}
+.section{padding:30px 40px}
+.section h2{font-size:18px;color:#e53935;margin-bottom:15px;padding-bottom:8px;border-bottom:2px solid #e8eaed}
+.mermaid{display:flex;justify-content:center;overflow-x:auto;margin:20px 0}
+.desc{background:#f8f9fa;border-left:4px solid #e53935;padding:12px 16px;margin:15px 0;font-size:13px;line-height:1.8;border-radius:0 6px 6px 0}
+.footer{text-align:center;padding:15px;color:#999;font-size:11px;border-top:1px solid #eee}
+@media print{body{padding:0;background:white}.container{box-shadow:none}}
+</style>
+</head>
+<body>
+<div class="container">
+<div class="header">
+<h1>WeChat 音视频会议系统 - 数据流图</h1>
+<p>描述系统中数据的完整流转路径，涵盖音频流、视频流、信令流三条独立数据通道</p>
+</div>
+
+<div class="section">
+<h2>一、顶层数据流图（DFD Level 0）</h2>
+<div class="mermaid">
+flowchart LR
+    U1((用户A)) -->|操作指令| SYS[WeChat<br/>音视频会议系统]
+    U2((用户B)) -->|操作指令| SYS
+    SYS -->|音视频画面| U1
+    SYS -->|音视频画面| U2
+    SYS <-->|协议数据包| SRV[服务端]
+    SRV <-->|协议数据包| DB[(MySQL<br/>用户数据库)]
+</div>
+</div>
+
+<div class="section">
+<h2>二、音频数据流图</h2>
+<div class="mermaid">
+flowchart LR
+    subgraph 发送端音频流
+        MIC[麦克风硬件] -->|PCM 48kHz<br/>16bit单声道| SDL_C[SDL采集设备<br/>回调20ms]
+        SDL_C -->|960采样/帧<br/>1920字节| VAD[WebRTC VAD<br/>静音检测]
+        VAD -->|静音帧标记| ENC[Opus编码器<br/>VOIP模式]
+        ENC -->|Opus编码帧<br/>~60-120字节| SER[ckernel序列化]
+        SER -->|协议包<br/>type+uid+rid+ts+data| NET_S[TCP发送<br/>音频连接]
+    end
+
+    subgraph 服务端
+        SRV[服务端转发<br/>不解析数据内容]
+    end
+
+    subgraph 接收端音频流
+        NET_R[TCP接收<br/>音频连接] -->|协议包| DES[ckernel反序列化]
+        DES -->|Opus数据| QUEUE[deque队列<br/>mutex保护]
+        QUEUE -->|Opus帧| DEC[Opus解码器<br/>48kHz]
+        DEC -->|PCM数据| SDL_P[SDL播放设备<br/>回调式]
+        SDL_P -->|混音输出| SPK[扬声器硬件]
+    end
+
+    NET_S --> SRV
+    SRV --> NET_R
+
+    subgraph 数据量统计
+        direction TB
+        STAT1[PCM原始: 96KB/s<br/>=48000×2B×1ch]
+        STAT2[Opus编码: ~4.5KB/s<br/>=76B×60帧/s]
+        STAT3[压缩率: 95.3%]
+    end
+</div>
+<div class="desc">
+<strong>音频数据流关键节点：</strong><br/>
+1. SDL采集回调（20ms周期，SDL线程驱动，替代QTimer轮询）<br/>
+2. WebRTC VAD静音检测（静音帧清零，Opus DTX进一步降低带宽）<br/>
+3. Opus编码（48kHz VOIP模式，DTX+FEC启用，32kbps目标码率）<br/>
+4. SDL回调解码播放（生产者-消费者模型，mutex保护队列）
+</div>
+</div>
+
+<div class="section">
+<h2>三、视频数据流图</h2>
+<div class="mermaid">
+flowchart LR
+    subgraph 发送端视频流
+        CAM[摄像头硬件] -->|BGR帧| OCV[OpenCV采集<br/>30fps/320x240]
+        OCV -->|RGB QImage| FACE{人脸检测}
+        FACE -->|标记后QImage| CHK{H.264可用?}
+
+        CHK -->|是| SWSCALE[sws_scale<br/>RGB→YUV420P]
+        SWSCALE -->|AVFrame| H264E[H264Encoder<br/>硬件回退链]
+        H264E -->|H264数据<br/>~2-5KB/帧| FRAG[分片器<br/>4KB/片]
+        FRAG -->|H264分片| NET_S[TCP发送<br/>视频连接]
+
+        CHK -->|否| JPEG[JPEG编码<br/>qt_image2jpg]
+        JPEG -->|JPEG数据| NET_S
+    end
+
+    subgraph 服务端
+        SRV[服务端转发<br/>透明转发]
+    end
+
+    subgraph 接收端视频流
+        NET_R[TCP接收<br/>视频连接] -->|协议包| DES[ckernel<br/>H264分片重组]
+        DES -->|完整H264帧| H264D[H264Decoder<br/>硬件回退链]
+        H264D -->|AVFrame<br/>YUV420P| SYNC[AVSyncManager<br/>音频主时钟同步]
+        SYNC -->|同步后AVFrame| GL[YuvGLWidget<br/>OpenGL渲染]
+        GL -->|三纹理上传| GPU[GPU渲染<br/>GLSL BT.601<br/>YUV→RGB]
+        GPU -->|像素输出| MON[显示器]
+    end
+
+    NET_S --> SRV
+    SRV --> NET_R
+
+    subgraph 数据量统计
+        direction TB
+        VSTAT1[H264编码: ~120KB/s<br/>=4KB×30fps]
+        VSTAT2[JPEG编码: ~300KB/s<br/>=10KB×30fps]
+        VSTAT3[H264压缩率: ~97%]
+    end
+</div>
+<div class="desc">
+<strong>视频数据流关键节点：</strong><br/>
+1. OpenCV采集（多后端回退：默认→MSMF→DirectShow）<br/>
+2. FFmpeg H.264编码（硬件回退：NVENC→QSV→libx264）<br/>
+3. 4KB分片传输（H264专用协议包头，支持分片重组）<br/>
+4. AVSyncManager同步（音频主时钟，10ms阈值）<br/>
+5. OpenGL YUV渲染（VAO/VBO+GLSL现代管线，GPU端YUV→RGB）
+</div>
+</div>
+
+<div class="section">
+<h2>四、信令数据流图</h2>
+<div class="mermaid">
+flowchart TD
+    subgraph 客户端信令
+        UI[用户界面操作] --> SIG[Qt信号发射]
+        SIG --> CK[ckernel协议序列化]
+        CK --> NET[TCP主连接发送]
+    end
+
+    subgraph 服务端信令处理
+        SRV_NET[epoll接收] --> LOGIC[clogic协议分发<br/>函数指针映射表]
+        LOGIC --> LOGIN{登录/注册}
+        LOGIC --> ROOM{房间管理}
+        LOGIC --> MEDIA{媒体转发}
+
+        LOGIN --> DB[(MySQL查询)]
+        DB --> LOGIN_RS[返回登录/注册结果]
+
+        ROOM --> ROOM_MAP[房间成员映射<br/>roomId→list]
+        ROOM --> BROADCAST[广播成员变更]
+
+        MEDIA --> FORWARD[透明转发<br/>不解析数据]
+    end
+
+    NET --> SRV_NET
+    LOGIN_RS --> |返回结果| NET
+    BROADCAST --> |成员通知| NET
+    FORWARD --> |音视频数据| NET
+</div>
+</div>
+
+<div class="section">
+<h2>五、完整数据流全景图（三通道并行）</h2>
+<div class="mermaid">
+flowchart LR
+    subgraph 客户端A
+        direction TB
+        A_MIC[麦克风] --> A_ENC_A[Opus编码]
+        A_CAM[摄像头] --> A_ENC_V[H264编码]
+        A_SCR[桌面] --> A_ENC_V
+        A_ENC_A --> A_NET1[TCP连接1-信令]
+        A_ENC_V --> A_NET2[TCP连接2-音频]
+        A_NET1 --> A_NET3[TCP连接3-视频]
+    end
+
+    subgraph 服务端集群
+        direction TB
+        S_EPOLL[Epoll事件循环]
+        S_LOGIC[clogic协议分发]
+        S_ROOM[房间管理器]
+        S_DB[(MySQL)]
+        S_EPOLL --> S_LOGIC
+        S_LOGIC --> S_ROOM
+        S_LOGIC --> S_DB
+    end
+
+    subgraph 客户端B
+        direction TB
+        B_NET1[TCP连接1-信令]
+        B_NET2[TCP连接2-音频]
+        B_NET3[TCP连接3-视频]
+        B_DEC_A[Opus解码]
+        B_DEC_V[H264解码]
+        B_SYNC[音视频同步]
+        B_SPK[扬声器]
+        B_MON[显示器]
+        B_NET1 --> B_DEC_A
+        B_NET2 --> B_DEC_A
+        B_DEC_A --> B_SPK
+        B_NET3 --> B_DEC_V
+        B_DEC_V --> B_SYNC
+        B_SYNC --> B_MON
+    end
+
+    A_NET1 <-->|信令| S_EPOLL
+    A_NET2 <-->|音频| S_EPOLL
+    A_NET3 <-->|视频| S_EPOLL
+    S_EPOLL <-->|信令| B_NET1
+    S_EPOLL <-->|音频| B_NET2
+    S_EPOLL <-->|视频| B_NET3
+</div>
+</div>
+
+<div class="footer">WeChat 音视频会议系统 - 数据流图 | 生成时间：2026-07-23</div>
+</div>
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10.9.1/dist/mermaid.min.js"></script>
+<script>mermaid.initialize({startOnLoad:true,theme:'default',securityLevel:'loose',flowchart:{useMaxWidth:false,htmlLabels:true}})</script>
+</body>
+</html>

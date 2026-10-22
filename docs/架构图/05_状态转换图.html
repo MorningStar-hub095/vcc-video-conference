@@ -1,0 +1,210 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>WeChat - 状态转换图</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:"Microsoft YaHei",sans-serif;background:#f5f7fa;padding:40px}
+.container{max-width:1200px;margin:0 auto;background:white;border-radius:12px;box-shadow:0 4px 20px rgba(0,0,0,.08);overflow:hidden}
+.header{background:linear-gradient(135deg,#00897b,#00695c);color:white;padding:30px 40px}
+.header h1{font-size:26px;margin-bottom:6px}
+.header p{font-size:13px;opacity:.85}
+.section{padding:30px 40px}
+.section h2{font-size:18px;color:#00897b;margin-bottom:15px;padding-bottom:8px;border-bottom:2px solid #e8eaed}
+.mermaid{display:flex;justify-content:center;overflow-x:auto;margin:20px 0}
+.desc{background:#f8f9fa;border-left:4px solid #00897b;padding:12px 16px;margin:15px 0;font-size:13px;line-height:1.8;border-radius:0 6px 6px 0}
+.footer{text-align:center;padding:15px;color:#999;font-size:11px;border-top:1px solid #eee}
+@media print{body{padding:0;background:white}.container{box-shadow:none}}
+</style>
+</head>
+<body>
+<div class="container">
+<div class="header">
+<h1>WeChat 音视频会议系统 - 状态转换图</h1>
+<p>描述系统各模块的状态变迁，覆盖音频采集、连接管理、房间生命周期等</p>
+</div>
+
+<div class="section">
+<h2>一、音频采集状态机 (AudioRead)</h2>
+<div class="mermaid">
+stateDiagram-v2
+    [*] --> stopped : 构造函数初始化
+
+    stopped --> playing : start()
+    note right of playing : SDL_OpenAudioDevice打开采集设备<br/>SDL_PauseAudioDevice(dev,0) 开始采集<br/>SDL回调每20ms触发一次<br/>VAD静音检测 → Opus编码
+
+    playing --> pausing : pause()
+    note right of pausing : SDL_PauseAudioDevice(dev,1) 暂停<br/>设备保持打开不释放<br/>回调停止触发
+
+    pausing --> playing : start()
+    note left of playing : 恢复采集<br/>SDL_PauseAudioDevice(dev,0)
+
+    playing --> stopped : ~AudioRead()
+    pausing --> stopped : ~AudioRead()
+    note right of stopped : SDL_CloseAudioDevice释放设备<br/>opus_encoder_destroy释放编码器<br/>WebRtcVad_Free释放VAD实例
+</div>
+</div>
+
+<div class="section">
+<h2>二、TCP 连接状态机</h2>
+<div class="mermaid">
+stateDiagram-v2
+    [*] --> disconnected : 初始状态
+
+    disconnected --> connecting : InitNet()
+    note right of connecting : socket()创建套接字<br/>WSAStartup初始化Winsock<br/>connect()发起连接
+
+    connecting --> connected : connect成功
+    connecting --> disconnected : connect失败/超时
+
+    connected --> receiving : 启动recvThread
+    note right of receiving : 循环recv()接收数据<br/>先读4字节包长nPackSize<br/>再读nPackSize字节数据<br/>防粘包处理
+
+    receiving --> connected : recv返回0(对端关闭)
+    receiving --> disconnected : recv返回-1(错误)
+
+    connected --> sending : SendData()
+    note left of sending : 发送4字节包头(数据长度)<br/>发送实际数据<br/>循环发送确保完整
+
+    sending --> connected : 发送完成
+
+    receiving --> disconnected : UnInitNet()
+    connected --> disconnected : UnInitNet()
+    disconnected --> [*]
+</div>
+</div>
+
+<div class="section">
+<h2>三、房间生命周期状态机</h2>
+<div class="mermaid">
+stateDiagram-v2
+    [*] --> idle : 未登录
+
+    idle --> lobby : 登录成功
+    note right of lobby : 显示主界面<br/>可选择创建或加入房间
+
+    lobby --> creating : 点击创建房间
+    creating --> inRoom : 创建成功(roomId返回)
+    creating --> lobby : 创建失败
+
+    lobby --> joining : 输入房间号+点击加入
+    joining --> inRoom : 加入成功(成员列表返回)
+    joining --> lobby : 房间不存在/加入失败
+
+    state inRoom {
+        [*] --> mediaOff : 初始状态(音视频关闭)
+        mediaOff --> audioOn : 开启麦克风
+        audioOn --> mediaOff : 关闭麦克风
+        mediaOff --> videoOn : 开启摄像头
+        videoOn --> mediaOff : 关闭摄像头
+        audioOn --> audioVideoOn : 开启摄像头
+        audioVideoOn --> audioOn : 关闭摄像头
+        videoOn --> audioVideoOn : 开启麦克风
+        audioVideoOn --> videoOn : 关闭麦克风
+        videoOn --> screenSharing : 开启桌面共享
+        screenSharing --> videoOn : 关闭桌面共享
+    }
+
+    inRoom --> leaving : 点击退出/关闭窗口
+    leaving --> lobby : 退出成功(清理资源)
+    lobby --> idle : 关闭主界面
+</div>
+</div>
+
+<div class="section">
+<h2>四、H.264 编码器状态机</h2>
+<div class="mermaid">
+stateDiagram-v2
+    [*] --> uninitialized : 初始状态
+
+    uninitialized --> initializing : init(width,height,fps,bitrate)
+
+    state initializing {
+        [*] --> tryNvenc : 尝试 h264_nvenc
+        tryNvenc --> tryQsv : 未找到
+        tryQsv --> tryLibx264 : 未找到
+        tryLibx264 --> tryDefault : 未找到
+        tryDefault --> failed : 全部失败
+        tryNvenc --> found : 找到
+        tryQsv --> found : 找到
+        tryLibx264 --> found : 找到
+        tryDefault --> found : 找到
+    }
+
+    initializing --> ready : 编码器打开成功
+    initializing --> failed : 所有编码器都不可用
+
+    ready --> encoding : encode(QImage)
+    note right of encoding : QImage RGB24数据<br/>sws_scale RGB→YUV420P<br/>avcodec_send_frame<br/>avcodec_receive_packet
+
+    encoding --> ready : 编码完成(返回H264数据)
+
+    ready --> ready : requestKeyFrame()
+    note right of ready : 设置AV_FRAME_FLAG_KEY<br/>下一帧强制编码为I帧
+
+    ready --> cleanup : cleanup()
+    encoding --> cleanup : cleanup()
+    failed --> [*]
+    cleanup --> [*]
+    note right of cleanup : sws_freeContext<br/>av_frame_free<br/>av_packet_free<br/>avcodec_free_context
+</div>
+</div>
+
+<div class="section">
+<h2>五、音视频同步状态机 (AVSyncManager)</h2>
+<div class="mermaid">
+stateDiagram-v2
+    [*] --> noClock : 用户未注册
+
+    noClock --> clockInit : addUser(userId)
+    note right of clockInit : 创建SyncContext<br/>audioClockValid=false<br/>videoClockValid=false
+
+    clockInit --> audioReady : updateAudioClock(pts)
+    note right of audioReady : audioClockValid=true<br/>记录音频播放时间戳
+
+    clockInit --> videoReady : updateVideoClock(pts)
+    note left of videoReady : videoClockValid=true<br/>记录视频时间戳
+
+    audioReady --> synchronized : updateVideoClock(pts)
+    videoReady --> synchronized : updateAudioClock(pts)
+    note right of synchronized : 两个时钟都有效<br/>可执行同步计算
+
+    synchronized --> synchronized : computeSyncDelay()
+    state synchronized {
+        [*] --> normal : |diff| <= 10ms
+        normal --> waitVideo : diff > 10ms
+        waitVideo --> normal : 等待完成
+        normal --> dropVideo : diff < -10ms
+        dropVideo --> normal : 立即显示追赶
+    }
+
+    synchronized --> clockTimeout : 5秒无新数据
+    clockTimeout --> noClock : resetAllClocks() / removeUser()
+    synchronized --> noClock : removeUser()
+    audioReady --> noClock : removeUser()
+    videoReady --> noClock : removeUser()
+</div>
+</div>
+
+<div class="section">
+<h2>六、音频静音状态机 (WebRTC VAD)</h2>
+<div class="desc">基于 WebRTC VAD 的静音检测状态机：audioCallback 每帧（20ms）调用 WebRtcVad_Process 判定有声/静音，并通过 calculateRMS 更新噪声能量 m_noiseLevel。采用连续 3 帧（≈60ms）状态平滑确认，避免瞬态抖动误触发。状态切换时 Q_EMIT SIG_muteStateChanged 跨线程通知 ckernel → RoomDialog 联动 UI。另由 QTimer（主线程）每 5 秒触发 slot_adjustVadMode，按 m_noiseLevel 的 EMA（α=0.95）三档动态选择 VAD 模式：RMS &lt; 0.02 → 模式1(宽松)、&lt; 0.10 → 模式2(中等)、≥ 0.10 → 模式3(严格)。</div>
+<div class="mermaid">
+stateDiagram-v2
+    [*] --> 有声 : 构造后默认(m_currentMuteState=false)
+
+    有声 --> 静音 : 连续3帧 VAD=0(≈60ms确认)
+    note right of 静音 : 进入静音伴随动作:<br/>Q_EMIT SIG_muteStateChanged(true)<br/>→ ckernel::slot_muteStateChanged(true)<br/>→ RoomDialog::updateMuteStatus(true)<br/>→ cb_audio 显示“音频(无声)” + 灰色 + tooltip<br/>注: 静音帧仍 memset 清零后送 Opus 编码
+
+    静音 --> 有声 : 连续3帧 VAD=1(≈60ms确认)
+    note left of 有声 : 退出静音伴随动作:<br/>Q_EMIT SIG_muteStateChanged(false)<br/>→ ckernel::slot_muteStateChanged(false)<br/>→ RoomDialog::updateMuteStatus(false)<br/>→ cb_audio 恢复显示“音频”
+</div>
+</div>
+
+<div class="footer">WeChat 音视频会议系统 - 状态转换图 | 生成时间：2026-07-23</div>
+</div>
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10.9.1/dist/mermaid.min.js"></script>
+<script>mermaid.initialize({startOnLoad:true,theme:'default',securityLevel:'loose'})</script>
+</body>
+</html>
