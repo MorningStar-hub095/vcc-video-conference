@@ -1,0 +1,126 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>VCC 视频会议 — Qt/C++ 从零实现的桌面视频会议系统</title>
+<meta name="description" content="Qt + C++ 从零实现的桌面视频会议系统：自定义二进制协议、三级音频处理、H.264 视频链路、Docker 一键部署。">
+<style>
+  :root { --bg:#f6f8fa; --card:#fff; --ink:#1f2328; --muted:#59636e; --line:#d1d9e0; --accent:#0969da; --chip:#ddf4ff; }
+  * { box-sizing:border-box; margin:0; padding:0; }
+  body { font-family:"Segoe UI","Microsoft YaHei",system-ui,sans-serif; background:var(--bg); color:var(--ink); line-height:1.7; }
+  .wrap { max-width:960px; margin:0 auto; padding:32px 20px 64px; }
+  header.hero { text-align:center; padding:36px 0 24px; }
+  header.hero h1 { font-size:2.2em; letter-spacing:.02em; }
+  header.hero .sub { color:var(--muted); margin-top:10px; font-size:1.05em; }
+  .badges { margin-top:16px; display:flex; gap:8px; justify-content:center; flex-wrap:wrap; }
+  .badge { background:var(--chip); color:var(--accent); border-radius:20px; padding:3px 14px; font-size:.85em; font-weight:600; }
+  .links { margin-top:18px; display:flex; gap:12px; justify-content:center; flex-wrap:wrap; }
+  .btn { display:inline-block; background:var(--accent); color:#fff; text-decoration:none; padding:9px 22px; border-radius:8px; font-weight:600; }
+  .btn.ghost { background:transparent; color:var(--accent); border:1.5px solid var(--accent); }
+  section { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:26px 28px; margin-top:22px; }
+  h2 { font-size:1.3em; margin-bottom:14px; border-bottom:2px solid var(--chip); padding-bottom:8px; }
+  table { width:100%; border-collapse:collapse; margin-top:6px; }
+  th,td { border:1px solid var(--line); padding:8px 12px; text-align:left; vertical-align:top; font-size:.95em; }
+  th { background:var(--bg); }
+  ol,ul { padding-left:1.4em; }
+  li { margin:6px 0; }
+  code { background:var(--bg); border:1px solid var(--line); border-radius:4px; padding:1px 6px; font-size:.9em; }
+  pre { background:#0d1117; color:#e6edf3; border-radius:8px; padding:14px 16px; overflow-x:auto; margin-top:10px; font-size:.9em; }
+  .imgblock { margin-top:14px; text-align:center; }
+  .imgblock img { max-width:100%; border:1px solid var(--line); border-radius:8px; }
+  .imgblock .cap { color:var(--muted); font-size:.85em; margin-top:6px; }
+  .warn { background:#fff8c5; border:1px solid #d4a72c66; border-radius:8px; padding:10px 14px; margin-top:12px; font-size:.92em; }
+  footer { text-align:center; color:var(--muted); font-size:.88em; margin-top:36px; }
+  footer a { color:var(--accent); }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header class="hero">
+  <h1>VCC 视频会议</h1>
+  <div class="sub">Qt + C++ 从零实现的桌面视频会议系统<br>自定义二进制协议 · 三级音频处理 · H.264 视频链路 · Docker 一键部署</div>
+  <div class="badges">
+    <span class="badge">MIT License</span>
+    <span class="badge">Windows</span>
+    <span class="badge">Qt 5.12</span>
+    <span class="badge">C++11</span>
+  </div>
+  <div class="links">
+    <a class="btn" href="https://github.com/MorningStar-hub095/vcc-video-conference">GitHub 仓库</a>
+    <a class="btn ghost" href="https://github.com/MorningStar-hub095/vcc-video-conference/releases/latest">下载客户端</a>
+  </div>
+</header>
+
+<section>
+  <h2>它是什么 / 不是什么</h2>
+  <table>
+    <tr><th>✅ 它是</th><th>❌ 它不是</th></tr>
+    <tr>
+      <td>一套可运行的桌面 C/S 视频会议系统（注册登录、房间、语音、视频、桌面共享）</td>
+      <td>网页应用 —— 没有在线 demo，客户端是 Windows 桌面程序</td>
+    </tr>
+    <tr>
+      <td>约 20k 行、单人从协议设计到部署运维独立完成的学习作品</td>
+      <td>生产级软件 —— 未做并发压测，请勿商用</td>
+    </tr>
+    <tr>
+      <td>带完整工程化：Docker 部署、健康探针、隔离冒烟、SQL 注入回归、版本化迁移与回滚</td>
+      <td>腾讯产品的仿制品 —— 与腾讯公司无任何关联</td>
+    </tr>
+  </table>
+</section>
+
+<section>
+  <h2>技术亮点</h2>
+  <ol>
+    <li><strong>自定义二进制应用层协议</strong>：13 类包、帧格式 <code>[int32 小端长度][包体]</code>，双端补齐包长合法性校验（≤0 或 &gt;1MB 直接丢弃），修复"异常包长可被未认证客户端耗尽内存"的缺陷。</li>
+    <li><strong>三级音频处理链路</strong>：SDL2 采集 → WebRTC VAD 静音断流 → Opus 48kHz/VOIP 编码，另集成 Speex AEC 回声消除。</li>
+    <li><strong>视频链路</strong>：摄像头/屏幕采集 → OpenCV 处理（含人脸检测）→ H.264 硬编码优先 + PLI 关键帧请求重传。</li>
+    <li><strong>工程化门禁</strong>：本地 <code>ci-local.sh</code> 四步门禁与 CI 同源、隔离冒烟栈（生产库零污染）、bcrypt 口令散列、mTLS 双向认证 + CRL 吊销体系。</li>
+  </ol>
+</section>
+
+<section>
+  <h2>架构一图看懂</h2>
+  <div class="imgblock">
+    <img src="架构图/图JPG/00_系统全景总图_图1.jpg" alt="系统全景总图">
+    <div class="cap">系统全景总图</div>
+  </div>
+  <div class="imgblock">
+    <img src="架构图/图JPG/07_部署图_图1.jpg" alt="部署图">
+    <div class="cap">部署图</div>
+  </div>
+  <p style="margin-top:12px;color:var(--muted);font-size:.92em">更多架构图（业务流程、时序、ER、状态机、数据流等 12 类 80+ 张）见
+  <a href="https://github.com/MorningStar-hub095/vcc-video-conference/tree/main/docs/%E6%9E%B6%E6%9E%84%E5%9B%BE">仓库 docs/架构图/</a>。</p>
+</section>
+
+<section>
+  <h2>30 秒了解</h2>
+  <ul>
+    <li><strong>快速体验</strong>：下载 <a href="https://github.com/MorningStar-hub095/vcc-video-conference/releases/latest">Release</a> 中的客户端 zip → 解压 → 改 <code>config.ini</code> 的 <code>ip</code> 为你部署的服务端地址 → 双击 <code>vcc-client.exe</code></li>
+    <li><strong>服务端部署</strong>：</li>
+  </ul>
+  <pre>cd deploy
+cp .env.example .env    # 填写数据库口令
+./deploy.sh             # 一键部署：MySQL + 服务端 + 健康检查</pre>
+  <div class="warn">📌 演示视频待录制：将展示双端注册登录 → 建房进房 → 音频互通 → 视频互通 → 桌面共享的完整 60~90 秒流程。</div>
+</section>
+
+<section>
+  <h2>我做了什么</h2>
+  <p>从协议设计、客户端音视频链路、服务端 epoll 转发、数据库安全，到容器化部署、冒烟门禁与回滚体系，全部独立完成（约 20k 行自研代码 + 2.5 万行 BSD 第三方源码集成）。完整技术细节见
+  <a href="https://github.com/MorningStar-hub095/vcc-video-conference#readme">仓库 README</a> 与
+  <a href="https://github.com/MorningStar-hub095/vcc-video-conference/blob/main/NOTICE">NOTICE</a>。</p>
+</section>
+
+<footer>
+  本页由 GitHub Pages 从仓库 <code>docs/</code> 目录构建 ·
+  <a href="https://github.com/MorningStar-hub095/vcc-video-conference/blob/main/LICENSE">MIT License</a> ·
+  <a href="https://github.com/MorningStar-hub095/vcc-video-conference/blob/main/NOTICE">免责声明</a>
+</footer>
+
+</div>
+</body>
+</html>
