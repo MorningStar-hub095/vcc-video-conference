@@ -6,8 +6,21 @@ TCP/UDP 双通道传输、音频采集编码、视频编解码与屏幕共享。
 > 早期版本代号 `WeChat`，**与腾讯公司无关**，未使用其任何代码或素材，现已完成更名。
 
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+![Platform](https://img.shields.io/badge/platform-Windows-lightgrey.svg)
+![Qt](https://img.shields.io/badge/Qt-5.12-green.svg)
+
+**项目展示页**（GitHub Pages）：https://morningstar-hub095.github.io/vcc-video-conference/
+**客户端下载**：[Releases](https://github.com/MorningStar-hub095/vcc-video-conference/releases/latest)
 
 ---
+
+## 技术亮点
+
+- **自定义二进制协议**：13 类包、帧格式 `[int32 长度][包体]`，双端补齐包长合法性校验（≤0 或 >1MB 直接丢弃），修复"异常包长可被未认证客户端耗尽内存"的缺陷
+- **三级音频处理**：SDL2 采集 → WebRTC VAD 静音断流 → Opus 48kHz/VOIP 编码，另有 Speex AEC 回声消除
+- **视频链路**：摄像头/屏幕采集 → OpenCV 处理（含人脸检测）→ H.264 硬编优先 + PLI 关键帧请求重传
+- **音视频同步**：自研 AVSync 模块（当前以本地到达时刻对齐，切换包内时间戳为待修项，见下方"项目状态"）
+- **工程化门禁**：`ci-local.sh` 四步门禁与 CI 同源、隔离冒烟栈（生产库零污染）、bcrypt 口令散列、mTLS 双向认证 + CRL 吊销
 
 ## 功能一览
 
@@ -42,6 +55,10 @@ TCP/UDP 双通道传输、音频采集编码、视频编解码与屏幕共享。
 │  账号鉴权 → 房间管理 → 媒体转发中继                        │
 └──────────────────────────────────────────────────────────┘
 ```
+
+> 更直观的版本：[系统全景总图](docs/架构图/图JPG/00_系统全景总图_图1.jpg) ·
+> [部署图](docs/架构图/图JPG/07_部署图_图1.jpg) ·
+> [数据库 ER 图](docs/架构图/图JPG/04_数据库ER图_图1.jpg)（12 类 80+ 张见 [docs/架构图/](docs/架构图/)）
 
 ### 自定义二进制协议
 
