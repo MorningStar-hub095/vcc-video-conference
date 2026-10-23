@@ -100,11 +100,16 @@
   <h2>30 秒了解</h2>
   <ul>
     <li><strong>快速体验</strong>：下载 <a href="https://github.com/MorningStar-hub095/vcc-video-conference/releases/latest">Release</a> 中的客户端 zip → 解压 → 改 <code>config.ini</code> 的 <code>ip</code> 为你部署的服务端地址 → 双击 <code>vcc-client.exe</code></li>
-    <li><strong>服务端部署</strong>：</li>
+    <li><strong>服务端部署（方式一：源码编译，推荐）</strong>：</li>
   </ul>
-  <pre>cd deploy
-cp .env.example .env    # 填写数据库口令
-./deploy.sh             # 一键部署：MySQL + 服务端 + 健康检查</pre>
+  <pre>sudo apt-get install build-essential libmysqlclient-dev
+cd server
+~/Qt5.9.9/5.9.9/gcc_64/bin/qmake PlayerHallServer.pro
+make -j4
+mysql -h127.0.0.1 -u用户名 -p &lt; deploy/schema.sql   # 建库建表
+export DB_IP=127.0.0.1 DB_USER=用户名 DB_PWD=口令 DB_NAME=vcc
+./PlayerHallServer      # 监听 TCP 8000 + UDP 1234</pre>
+  <p style="margin-top:8px;color:var(--muted);font-size:.92em">也有 Docker Compose 一键部署（<code>deploy/deploy.sh</code>，可选 mTLS 网关），适合有 Docker 环境的服务器场景，详见 <a href="https://github.com/MorningStar-hub095/vcc-video-conference#部署">README · 部署</a>。</p>
   <div class="warn">📌 演示视频待录制：将展示双端注册登录 → 建房进房 → 音频互通 → 视频互通 → 桌面共享的完整 60~90 秒流程。</div>
 </section>
 

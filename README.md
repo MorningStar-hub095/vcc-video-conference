@@ -247,7 +247,34 @@ deploy/
 └── monitoring/               Prometheus 告警规则
 ```
 
-### 快速开始
+### 方式一：源码编译部署（Linux / 虚拟机，推荐）
+
+无需 Docker，适合 Linux 服务器或虚拟机直接跑（已在 Ubuntu 16.04 + Qt 5.9.9 + MySQL 5.7 实测）：
+
+```bash
+# 1. 编译依赖（Ubuntu/Debian）
+sudo apt-get install build-essential libmysqlclient-dev
+
+# 2. 编译（qmake 路径按你的 Qt 安装位置调整，需 Qt 5.x gcc_64）
+cd server
+~/Qt5.9.9/5.9.9/gcc_64/bin/qmake PlayerHallServer.pro
+make -j4
+# 产物 PlayerHallServer 生成在当前目录
+
+# 3. 建库建表（脚本自动创建数据库 vcc 与 t_user 表；密码按提示输入）
+mysql -h127.0.0.1 -u<用户名> -p < deploy/schema.sql
+
+# 4. 注入数据库配置并启动（敏感信息不进源码，靠环境变量）
+export DB_IP=127.0.0.1 DB_USER=<用户名> DB_PWD=<口令> DB_NAME=vcc
+./PlayerHallServer
+# 启动后监听 TCP 8000（控制信令）+ UDP 1234（音视频流）
+```
+
+> - **库名大小写**：MySQL `lower_case_table_names=0` 时库名区分大小写，`DB_NAME` 必须与实际库一字不差；
+> - **虚拟机部署**：客户端 `config.ini` 填 VM 的 IP（如 `192.168.126.x`），并确认宿主机与 VM 网络互通；
+> - 服务端无日志输出属正常（打印被刻意注释），可用 `ss -tlnp | grep 8000` 确认在监听。
+
+### 方式二：Docker Compose 一键部署（备选，需要 Docker 环境）
 
 ```bash
 cd deploy
