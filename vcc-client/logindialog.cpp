@@ -151,6 +151,13 @@ void LoginDialog::on_pb_commit_register_clicked()
         QMessageBox::about(this, "提示", "邮箱格式错误");
         return;
     }
+    //【修复-P1：邮箱长度校验】登录缓冲区 m_tel[_MAX_SIZE=40] 只能容纳 39 字符，
+    // 超长邮箱虽能注册成功，却永远无法用于邮箱登录（登录时被截断、查库必不匹配）。
+    if( strEmail.length() > 39 )
+    {
+        QMessageBox::about(this, "提示", "邮箱过长，不能超过39个字符");
+        return;
+    }
     //注册信号新增 email 参数
     Q_EMIT SIG_registerCommit( strTel , strPassword , strName , strEmail );
     qDebug()<<__func__;

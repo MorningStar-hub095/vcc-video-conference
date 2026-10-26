@@ -1355,6 +1355,13 @@ void ckernel::slot_dealLoginRS(uint sock, char *buf, int nlen)
                 QMessageBox::about(m_pLoginDlg, "提示", "邮箱格式错误，请重新输入");
                 continue;
             }
+            //【修复-P1：邮箱长度校验】与注册口径一致：登录缓冲区 m_tel[40] 只能
+            // 容纳 39 字符，超长邮箱提交后同样无法用于邮箱登录。
+            if( email.length() > 39 )
+            {
+                QMessageBox::about(m_pLoginDlg, "提示", "邮箱过长，不能超过39个字符，请重新输入");
+                continue;
+            }
             //发送补全邮箱请求到服务端
             STRU_UPDATE_EMAIL_RQ rq;
             rq.m_userid = m_id;

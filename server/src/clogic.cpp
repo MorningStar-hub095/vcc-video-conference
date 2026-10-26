@@ -113,6 +113,69 @@ void CLogic::setNetPackMap()
 
 }
 
+//【修复-P1/P2：格式校验服务端兜底】与客户端注册/登录正则对齐的校验（纯 std 实现）。
+// 背景：原 RegisterRq 完全信任客户端校验，直连协议可写入 tel="abc"、email="x" 等脏数据；
+//       UpdateEmailRq 仅查 '@' 和 '.' 是否存在，"a@."、"@x.com"、".@." 均可放行入库。
+// 口径：总长 <= 39（登录缓冲区 m_tel[40] 上限，超长邮箱将无法用于邮箱登录）。
+static bool is_valid_tel( const std::string & tel )
+{
+    if( tel.size() != 11 ) return false;          // 11 位定长
+    if( tel[0] != '1' ) return false;             // 1 号段
+    if( tel[1] < '3' || tel[1] > '9' ) return false; // 13-19 现行号段
+    for( size_t i = 2; i < tel.size(); ++i )
+        if( tel[i] < '0' || tel[i] > '9' ) return false;
+    return true;
+}
+
+static bool is_valid_email( const std::string & email )
+{
+    if( email.empty() || email.size() > 39 ) return false;
+    size_t at = email.find('@');
+    // 恰好一个 '@'，且 local / domain 均非空
+    if( at == std::string::npos || at == 0
+            || email.find('@', at + 1) != std::string::npos ) return false;
+    std::string local  = email.substr( 0, at );
+    std::string domain = email.substr( at + 1 );
+    // local：[A-Za-z0-9._%+-]+，且不以 '.' 开头/结尾、无连续 '.'
+    for( size_t i = 0; i < local.size(); ++i )
+    {
+        char c = local[i];
+        if( !( (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9')
+               || c == '.' || c == '_' || c == '%' || c == '+' || c == '-' ) ) return false;
+    }
+    if( local[0] == '.' || local[local.size() - 1] == '.' ) return false;
+    if( local.find("..") != std::string::npos ) return false;
+    // domain：[A-Za-z0-9.-]+，不以 '.' 开头/结尾、无连续 '.'（分段即非空）
+    for( size_t i = 0; i < domain.size(); ++i )
+    {
+        char c = domain[i];
+        if( !( (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z')
+               || (c >= '0' && c <= '9') || c == '.' || c == '-' ) ) return false;
+    }
+    if( domain[0] == '.' || domain[domain.size() - 1] == '.' ) return false;
+    if( domain.find("..") != std::string::npos ) return false;
+    // 逐段检查：标签不得以 '-' 开头/结尾（禁 "@-x.com"、"@x-.com"）
+    size_t start = 0;
+    for( size_t i = 0; i <= domain.size(); ++i )
+    {
+        if( i == domain.size() || domain[i] == '.' )
+        {
+            if( domain[start] == '-' || domain[i - 1] == '-' ) return false;
+            start = i + 1;
+        }
+    }
+    // TLD：最后一个 '.' 之后须为 2 位以上纯字母
+    size_t lastDot = domain.rfind('.');
+    if( lastDot == std::string::npos ) return false;
+    if( domain.size() - lastDot - 1 < 2 ) return false;
+    for( size_t i = lastDot + 1; i < domain.size(); ++i )
+    {
+        char c = domain[i];
+        if( !( (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ) ) return false;
+    }
+    return true;
+}
+
 //register
 void CLogic::RegisterRq(int clientfd, char * szbuf, int nlen)
 {
@@ -139,6 +202,21 @@ void CLogic::RegisterRq(int clientfd, char * szbuf, int nlen)
    std::string strSafeTel   = m_sql->EscapeMysql( rq->m_tel   , sizeof(rq->m_tel)   );
    std::string strSafeName  = m_sql->EscapeMysql( rq->m_name  , sizeof(rq->m_name)  );
    std::string strSafeEmail = m_sql->EscapeMysql( rq->m_email , sizeof(rq->m_email) );
+
+   //【修复-P2：注册格式服务端校验】原代码完全信任客户端校验，直连协议可写入
+   //  tel="abc"、email="x" 等脏数据入库。此处按与客户端一致的口径复核
+   //  （is_valid_tel / is_valid_email，实现见文件头部）；不合格式返回
+   //  register_failed（枚举 3=通用失败，客户端已有对应提示），不写库。
+   //  注：合法 tel/email 均不含 EscapeMysql 会转义的字符，对转义后字符串
+   //  校验与对原文校验等价。
+   if( !is_valid_tel( strSafeTel ) || !is_valid_email( strSafeEmail ) )
+   {
+       fprintf(stderr, "[RegisterRq] 格式校验未通过：tel长度=%d email长度=%d\n",
+               (int)strSafeTel.size(), (int)strSafeEmail.size());
+       rs.m_lresult = register_failed;
+       m_tcp->SendData(clientfd, (char*)&rs, sizeof(rs));
+       return;
+   }
 
    //查表t_user 根據tel 查tel
    char sqlStr[1024] = {0}/*""*/;
@@ -825,7 +903,7 @@ void CLogic::VideoRegister(int clientfd, char *szbuf, int nlen)
 //用户提交后通过此函数更新数据库中的 email 字段
 //流程：
 //  1. 拆包获取 userid 和 email
-//  2. 校验邮箱格式（简单校验：包含 @ 和 .）
+//  2. 校验邮箱格式（is_valid_email：与客户端注册/登录同口径）
 //  3. 检查邮箱是否已被其他用户使用
 //  4. 更新 t_user 表中该 userid 的 email 字段
 //  5. 返回补全结果
@@ -853,9 +931,12 @@ void CLogic::UpdateEmailRq(int clientfd, char * szbuf, int nlen)
         return;
     }
 
-    //2.简单校验邮箱格式（包含 @ 和 .）
+    //2.校验邮箱格式
+    //【修复-P1：格式口径升级】原代码仅查 '@' 和 '.' 是否存在，
+    //  "a@."、"@x.com"、".@." 均可放行入库。现改为与客户端注册/登录
+    //  同一口径的完整校验（is_valid_email，实现见文件头部）。
     string strEmail = rq->m_email;
-    if( strEmail.find('@') == string::npos || strEmail.find('.') == string::npos )
+    if( !is_valid_email( strEmail ) )
     {
         rs.m_lresult = 0; //失败：邮箱格式错误
         SendData(clientfd, (char*)&rs, sizeof(rs));
