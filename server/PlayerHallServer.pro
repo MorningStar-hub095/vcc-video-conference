@@ -11,9 +11,13 @@ SOURCES += \
     src/clogic.cpp \
     src/err_str.cpp \
     src/main.cpp \
-    src/bcrypt_wrapper.cpp
+    src/bcrypt_wrapper.cpp \
+    src/bcrypt/crypt_blowfish.c \
+    src/bcrypt/crypt_gensalt.c
 
-DISTFILES +=
+DISTFILES += \
+    src/bcrypt/crypt_blowfish.h \
+    src/bcrypt/crypt_gensalt.h
 
 HEADERS += \
     include/Mysql.h \
@@ -22,7 +26,8 @@ HEADERS += \
     include/block_epoll_net.h \
     include/clogic.h \
     include/err_str.h \
-    include/packdef.h
+    include/packdef.h \
+    include/bcrypt_wrapper.h
 
 INCLUDEPATH += ./include
 
