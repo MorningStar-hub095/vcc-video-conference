@@ -638,6 +638,28 @@ void CLogic::JoinRoomRq(int clientfd, char *szbuf, int nlen)
         //           互相覆盖成员列表（lost update），可能出现“人已离开却仍在列表里收帧”。
         // 修改效果: 该序列由 m_roomLock 串行化；SendData 仅发送小包，持锁发送风险可控。
         // 原代码保留备查：下方 find/遍历/push_back/insert 语句原样，仅外包 m_roomLock
+        //【2026-11-18 审查修复-C3：发送移出 m_roomLock】
+        // 修改原因: 持房间锁期间逐个 SendData，慢客户端会让发送长时间占用（修复前
+        //           为无限重试），单个慢成员即可让所有进/退房操作永久停摆（DoS 放大器）。
+        // 修改方式: 锁内只做成员快照（sock/id/name 拷贝入 lstTargets）与列表更新，
+        //           发送移到解锁后；发送顺序与原实现一致（先 joinrq 给成员，再 memrq 给自己）。
+        // 原代码（发送在锁内，保留备查）：
+        //     for( auto ite = lstRoomMem.begin() ; ite!=lstRoomMem.end() ; ++ite)
+        //     {
+        //         int Memid = *ite;
+        //         if( !m_mapIDToUserInfo.IsExist(Memid)) continue;
+        //         UserInfo * memInfo = m_mapIDToUserInfo.find(Memid);
+        //         STRU_ROOM_MEMBER_RQ memrq;
+        //         memrq.m_UserID = memInfo->m_id;
+        //         strncpy(memrq.m_szUser , memInfo->m_userName , sizeof(memrq.m_szUser) - 1);
+        //         memrq.m_szUser[sizeof(memrq.m_szUser) - 1] = '\0';
+        //         SendData(memInfo->m_sock , (char*)&joinrq ,sizeof (joinrq));
+        //         SendData(clientfd , (char*)&memrq, sizeof (memrq));
+        //     }
+        // 语义差异说明: 通知包从"边遍历边发"变为"快照后统一发"；成员在快照与发送之间
+        //   退房时 SendData 的 fd 归属校验会拒绝已关 fd，客户端按包内 userid 处理，无状态错乱。
+        struct SendTarget { int sock; int id; char name[MAX_SIZE]; };
+        list<SendTarget> lstTargets;
         pthread_mutex_lock( &m_roomLock );
         list<int> lstRoomMem = m_mapIDToRoomid.find(rq->m_RoomID);
         //互換信息
@@ -649,21 +671,36 @@ void CLogic::JoinRoomRq(int clientfd, char *szbuf, int nlen)
             //修复：改为 continue，跳过不在线的成员，继续处理其他成员
             if( !m_mapIDToUserInfo.IsExist(Memid)) continue;
             UserInfo * memInfo = m_mapIDToUserInfo.find(Memid);
-
-            STRU_ROOM_MEMBER_RQ memrq;
-            memrq.m_UserID = memInfo->m_id;
-            strncpy(memrq.m_szUser , memInfo->m_userName , sizeof(memrq.m_szUser) - 1);
-            memrq.m_szUser[sizeof(memrq.m_szUser) - 1] = '\0';
-
-            //把加入人的信息發送給每一個房間內成員
-            SendData(memInfo->m_sock , (char*)&joinrq ,sizeof (joinrq));
-            //房間內成員每個人信息發給加入人
-            SendData(clientfd , (char*)&memrq, sizeof (memrq));
+            //【2026-11-18 审查修复-C4：find 结果判空】
+            // 修改原因: IsExist 与 find 两把锁之间/之后的并发断线窗口可能已把该用户
+            //           删除，find 返回 NULL，直接解引用 memInfo 即空指针崩溃
+            //           （UserInfo* 裸指针跨线程共享的 use-after-free 家族）。
+            // 修改效果: 极端并发下安全跳过该成员，不再崩溃。原代码: （无判空，直接解引用）
+            if( NULL == memInfo ) continue;
+            SendTarget tgt;
+            tgt.sock = memInfo->m_sock;
+            tgt.id = memInfo->m_id;
+            memset( tgt.name , 0 , sizeof(tgt.name) );
+            strncpy( tgt.name , memInfo->m_userName , sizeof(tgt.name) - 1 );
+            lstTargets.push_back( tgt );
         }
         //加入人，添加到房間列表
         lstRoomMem.push_back( rq->m_UserID);
         m_mapIDToRoomid.insert(rq->m_RoomID , lstRoomMem);
         pthread_mutex_unlock( &m_roomLock );//【P2修复】配对解锁，见上
+
+        //【2026-11-18 审查修复-C3】发送移到锁外（基于快照），包构造与发送逻辑同原实现
+        for( auto ite = lstTargets.begin() ; ite != lstTargets.end() ; ++ite)
+        {
+            STRU_ROOM_MEMBER_RQ memrq;
+            memrq.m_UserID = ite->id;
+            strncpy(memrq.m_szUser , ite->name , sizeof(memrq.m_szUser) - 1);
+            memrq.m_szUser[sizeof(memrq.m_szUser) - 1] = '\0';
+            //把加入人的信息發送給每一個房間內成員
+            SendData(ite->sock , (char*)&joinrq ,sizeof (joinrq));
+            //房間內成員每個人信息發給加入人
+            SendData(clientfd , (char*)&memrq, sizeof (memrq));
+        }
 
 
 }
@@ -696,6 +733,19 @@ void CLogic::LeaveRoomRq(int clientfd, char *szbuf, int nlen)
     }
     //如果房间存在。可以获得用户列表
     list< int > lst = m_mapIDToRoomid.find( rq->m_RoomID );
+    //【2026-11-18 审查修复-C3：发送移出 m_roomLock】
+    // 修改原因: 同 JoinRoomRq——持房间锁逐个 SendData，慢客户端会拖住全部进/退房操作。
+    // 修改方式: 锁内完成"移除自己 + 收集需通知成员 sock 快照 + 空房处理"，
+    //           解锁后统一发送通知包（内容同为 szbuf 原包转发，语义不变）。
+    // 原代码（发送在锁内，保留备查）：
+    //     if( m_mapIDToUserInfo.IsExist(userid))
+    //     {
+    //         UserInfo *info = m_mapIDToUserInfo.find( userid );
+    //         SendData( info->m_sock , szbuf , nlen);
+    //     }
+    // 语义差异说明: 通知包从"边遍历边发"变为"列表更新后统一发"；成员在窗口期退房时
+    //   SendData 的 fd 归属校验会拒绝已关 fd，客户端按包内 userid 处理，无状态错乱。
+    list<int> lstTargets;
     for( auto ite = lst.begin(); ite != lst.end();)
     {
         int userid = *ite;
@@ -709,25 +759,33 @@ void CLogic::LeaveRoomRq(int clientfd, char *szbuf, int nlen)
             if( m_mapIDToUserInfo.IsExist(userid))
             {
                 UserInfo *info = m_mapIDToUserInfo.find( userid );
-                SendData( info->m_sock , szbuf , nlen);
+                //【2026-11-18 审查修复-C4：find 结果判空】
+                // 修改原因: IsExist 与 find 之间的并发断线窗口可致 find 返回 NULL，
+                //           info->m_sock 即空指针解引用（UserInfo* 跨线程共享 UAF 家族）。
+                // 修改效果: 极端并发下跳过该成员，不再崩溃。原代码: （无判空，直接发送）
+                if( NULL != info )
+                    lstTargets.push_back( info->m_sock );
             }
             ++ite;
         }
     }
-
-
-
     //列表是否节点数为0->map项去掉
     if( lst.size() == 0)
     {
         m_mapIDToRoomid.erase( rq->m_RoomID );
         pthread_mutex_unlock( &m_roomLock );//【P2修复】提前返回前解锁
-        return;
     }
-
-    //更新房间成员列表
-    m_mapIDToRoomid.insert( rq->m_RoomID , lst);
-    pthread_mutex_unlock( &m_roomLock );//【P2修复】配对解锁，见上
+    else
+    {
+        //更新房间成员列表
+        m_mapIDToRoomid.insert( rq->m_RoomID , lst);
+        pthread_mutex_unlock( &m_roomLock );//【P2修复】配对解锁，见上
+    }
+    //【2026-11-18 审查修复-C3】通知发送移到锁外（基于快照）
+    for( auto ite = lstTargets.begin(); ite != lstTargets.end(); ++ite)
+    {
+        SendData( *ite , szbuf , nlen);
+    }
 }
 
 //處理音頻幀
@@ -783,8 +841,13 @@ void CLogic::AudioFrameRq(int clientfd, char *szbuf, int nlen)
         //修复：应该检查 m_mapIDToUserInfo 中是否存在该用户
         if( !m_mapIDToUserInfo.IsExist(userid)) continue;
         UserInfo * userinfo = m_mapIDToUserInfo.find(userid);
-        //原樣轉發
-        SendData( userinfo->m_sock , szbuf , nlen);
+        //【2026-11-18 审查修复-C4：find 结果判空】
+        // 修改原因: IsExist 与 find 之间/之后的并发断线窗口可致 find 返回 NULL，
+        //           userinfo->m_sock 即空指针解引用（UserInfo* 跨线程共享 UAF 家族）。
+        // 修改效果: 极端并发下安全跳过该成员，不再崩溃。原代码: （无判空，直接解引用）
+        // 原樣轉發
+        if( NULL != userinfo )
+            SendData( userinfo->m_sock , szbuf , nlen);
 
     }
 }
@@ -835,6 +898,13 @@ void CLogic::VideoFrameRq(int clientfd, char *szbuf, int nlen)
         //修复：应该检查 m_mapIDToUserInfo 中是否存在该用户
         if( !m_mapIDToUserInfo.IsExist(userid)) continue;
         UserInfo * userinfo = m_mapIDToUserInfo.find(userid);
+        //【2026-11-18 审查修复-C4：find 结果判空】
+        // 修改原因: 并发断线窗口下 find 可能返回 NULL，直接读 userinfo->m_videofd
+        //           即空指针解引用（UserInfo* 跨线程共享 UAF 家族）。
+        // 修改效果: 极端并发下安全跳过该成员，不再崩溃。
+        // 原代码: （无判空，直接 if( userinfo->m_videofd != 0 ) ...）
+        if( NULL != userinfo )
+        {
         //【Bug修复】原代码 SendData( userinfo->m_audiofd , szbuf , nlen);
         //视频帧发送到了音频fd（m_audiofd），而不是视频fd（m_videofd）！
         //客户端的视频接收线程监听的是m_videofd，发到m_audiofd自然收不到视频帧，
@@ -844,6 +914,7 @@ void CLogic::VideoFrameRq(int clientfd, char *szbuf, int nlen)
             SendData( userinfo->m_videofd , szbuf , nlen);
         else
             SendData( userinfo->m_sock , szbuf , nlen);
+        }
 
     }
 }
@@ -1041,11 +1112,19 @@ void CLogic::VideoFrameH264Rq(int clientfd, char *szbuf, int nlen)
         if(!m_mapIDToUserInfo.IsExist(userid)) continue;
         UserInfo * userinfo = m_mapIDToUserInfo.find(userid);
 
+        //【2026-11-18 审查修复-C4：find 结果判空】
+        // 修改原因: 并发断线窗口下 find 可能返回 NULL，直接读 userinfo->m_videofd
+        //           即空指针解引用（UserInfo* 跨线程共享 UAF 家族）。
+        // 修改效果: 极端并发下安全跳过该成员，不再崩溃。
+        // 原代码: （无判空，直接 if( userinfo->m_videofd != 0 ) ...）
+        if( NULL != userinfo )
+        {
         // 优先发送到视频fd，如果未注册则回退到主fd
         if(userinfo->m_videofd != 0)
             SendData(userinfo->m_videofd, szbuf, nlen);
         else
             SendData(userinfo->m_sock, szbuf, nlen);
+        }
     }
 }
 
@@ -1096,11 +1175,19 @@ void CLogic::PliRequestRq(int clientfd, char *szbuf, int nlen)
         if(!m_mapIDToUserInfo.IsExist(userid)) continue;
         UserInfo * userinfo = m_mapIDToUserInfo.find(userid);
 
+        //【2026-11-18 审查修复-C4：find 结果判空】
+        // 修改原因: 并发断线窗口下 find 可能返回 NULL，直接读 userinfo->m_videofd
+        //           即空指针解引用（UserInfo* 跨线程共享 UAF 家族）。
+        // 修改效果: 极端并发下安全跳过该成员，不再崩溃。
+        // 原代码: （无判空，直接 if( userinfo->m_videofd != 0 ) ...）
+        if( NULL != userinfo )
+        {
         // 转发PLI请求
         if(userinfo->m_videofd != 0)
             SendData(userinfo->m_videofd, szbuf, nlen);
         else
             SendData(userinfo->m_sock, szbuf, nlen);
+        }
     }
 }
 

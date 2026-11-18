@@ -217,8 +217,31 @@ public:
           m_listenfd( -1 ),
           m_epoll_fd( -1 ),
           m_threadpool( NULL )
-    {}
-    ~Block_Epoll_Net(){}
+    {
+        //【2026-11-18 审查修复-C2】发送互斥表专用锁初始化
+        pthread_mutex_init( &m_sendLockMapLock , NULL );
+    }
+    //【2026-11-18 审查修复-C2】原析构为空（~Block_Epoll_Net(){}，注释保留）：
+    // 补齐发送互斥量回收（进程级单例，退出时统一销毁，防泄漏告警与工具误报）
+    // 原代码: ~Block_Epoll_Net(){}
+    ~Block_Epoll_Net()
+    {
+        std::map<int, pthread_mutex_t*>::iterator it = m_mapSendLock.begin();
+        while( it != m_mapSendLock.end() )
+        {
+            pthread_mutex_destroy( it->second );
+            delete it->second;
+            ++it;
+        }
+        std::list<pthread_mutex_t*>::iterator itR = m_lstRetiredSendLocks.begin();
+        while( itR != m_lstRetiredSendLocks.end() )
+        {
+            pthread_mutex_destroy( *itR );
+            delete *itR;
+            ++itR;
+        }
+        pthread_mutex_destroy( &m_sendLockMapLock );
+    }
     //由于服务器 不会主动关闭, 没有写回收
 public:
 
@@ -264,6 +287,12 @@ private:
     //线程函数 接收数据
     static void *recv_task(void *arg);
 
+    //【2026-11-18 审查修复-C2】发送数据（不加锁的原始实现，由 SendData 包装调用）
+    int SendData_Locked(int fd, char* szbuf , int nlen );
+    //【2026-11-18 审查修复-C2】per-fd 发送互斥的获取/回收
+    pthread_mutex_t* GetSendLock( int fd );
+    void RemoveSendLock( int fd );
+
     //epoll事件处理
     void accept_event();
     void recv_event(myevent_s *ev); //接收: 事件到来recv_event --> 接收数据 recv_task -> 处理 Buffer_Deal
@@ -277,6 +306,15 @@ private:
 
     //每一个套接字 对应一个事件结构
     /*map*/MyMap< int , myevent_s*> m_mapSockfdToEvent;
+    //【2026-11-18 审查修复-C2】per-fd 发送互斥表：保证同一连接的整包原子发送，
+    // 防止多线程并发写同一 fd 时字节流交错导致协议永久错位（C2）。
+    // 说明: 不复用 MyMap 是因为需要"查找不存在则创建"的原子语义，
+    //       MyMap 的 find/insert 是两次加锁，并发首建会各持不同互斥量、互斥失效。
+    std::map< int , pthread_mutex_t* > m_mapSendLock;
+    //保护 m_mapSendLock 的专用锁
+    pthread_mutex_t m_sendLockMapLock;
+    //RemoveSendLock 时仍有发送者持有、无法立即销毁的互斥量，进程退出时统一销毁
+    std::list< pthread_mutex_t* > m_lstRetiredSendLocks;
     /* 事件循环使用 */
     struct epoll_event events[MAX_EVENTS+1];
     //线程池相关

@@ -358,6 +358,8 @@ void* Block_Epoll_Net::recv_task(void* arg)
     //     close(ev->fd);
     //     pthis->m_mapSockfdToEvent.erase( ev->fd );
     pthis->m_mapSockfdToEvent.erase( ev->fd );
+    //【2026-11-18 审查修复-C2】同步回收该 fd 的发送互斥量，防止发送锁表随连接数无界增长
+    pthis->RemoveSendLock( ev->fd );
     close(ev->fd);
     delete ev;
     return NULL;
@@ -391,6 +393,37 @@ void Block_Epoll_Net::epollout_event( myevent_s *ev )
 int Block_Epoll_Net::SendData(int fd, char *szbuf, int nlen)
 {
     // 发送不可分割 避免多线程并发
+    //【2026-11-18 审查修复-C2：per-fd 发送互斥】
+    // 修改原因: 原注释声称"发送不可分割"但整个函数没有任何锁。房间广播会让多个
+    //           线程池线程同时向同一成员 fd 发包，TCP 字节流在部分写入/重试间隙
+    //           交错后，接收端按 [int32 长度][包体] 解析彻底错位，连接报废。
+    // 修改方式: 原函数体原样移入 SendData_Locked（仅 EAGAIN 重试加总超时，见该函数）；
+    //           本函数负责：fd 归属校验 → per-fd 加锁 → 调用 → 解锁。
+    // 修改效果: 同一 fd 的整包发送原子化；对已关闭/未知 fd 直接拒绝发送。
+    // 回滚: 删除本包装与 SendData_Locked 包装说明，恢复原函数体（语句全部保留）。
+
+    //【2026-11-18 审查修复-M4 缓解：发送前 fd 归属校验】
+    // 修改原因: 业务层持有的 fd 可能在发送前已被清理、fd 号被新连接复用，
+    //           数据会发到毫不相干的新连接（串线）。发送前确认 fd 仍是在册连接。
+    // 修改效果: 已关闭 fd 的发送直接拒绝（返回 -1）；残余复用窗口见 onClientClosed 注释。
+    // 原代码: （无校验，直接发送）
+    if( !m_mapSockfdToEvent.IsExist( fd ) )
+        return -1;
+
+    pthread_mutex_t* pSendLock = GetSendLock( fd );
+    if( NULL == pSendLock )
+        return -1;
+
+    pthread_mutex_lock( pSendLock );
+    int nRet = SendData_Locked( fd , szbuf , nlen );
+    pthread_mutex_unlock( pSendLock );
+    return nRet;
+}
+
+//【2026-11-18 审查修复-C2】原 SendData 函数体原样移入本函数（重构非重写），
+// 仅"EAGAIN 无限重试"改为 3 秒总超时（见循环内标注）。
+int Block_Epoll_Net::SendData_Locked(int fd, char *szbuf, int nlen)
+{
     // 先包大小, 再数据包 , 一次放入缓冲区
 
     /*
@@ -428,6 +461,19 @@ int Block_Epoll_Net::SendData(int fd, char *szbuf, int nlen)
     //        数据静默丢失后，接收端收到不完整的包，后续所有包的长度解析全部错位，
     //        导致连接永久损坏，视频数据无法正确传输。
     // 修复: 循环发送直到所有数据发送完毕或发生真正错误。
+    //【2026-11-18 审查修复-C3：EAGAIN 无限重试 → 3 秒总超时】
+    // 修改原因: 对端收而不读时 send 持续返回 EAGAIN，原循环无退出条件，
+    //           线程池线程被无限占用；配合 JoinRoom/LeaveRoom 持房间锁发送，
+    //           单个慢客户端即可冻结全部进/退房操作（认证后低成本 DoS）。
+    // 修改方式: 新增 nEagainMs 计数，累计等待超过 3000ms 放弃发送（返回 -1）。
+    // 修改效果: 单个慢客户端最多占用发送线程 3 秒，不再无限占用。
+    // 原代码（无限重试，保留备查）：
+    //     if( errno == EAGAIN || errno == EWOULDBLOCK )
+    //     {
+    //         usleep(1000);  // 1ms
+    //         continue;
+    //     }
+    int nEagainMs = 0;
     int totalSent = 0;
     while( totalSent < nPackSize )
     {
@@ -440,6 +486,14 @@ int Block_Epoll_Net::SendData(int fd, char *szbuf, int nlen)
         {
             if( errno == EAGAIN || errno == EWOULDBLOCK )
             {
+                nEagainMs += 1;
+                if( nEagainMs > 3000 )
+                {
+                    fprintf(stderr, "[Block_Epoll_Net::SendData_Locked] send timeout(3s) fd=%d sent=%d/%d, give up\n",
+                            fd, totalSent, nPackSize);
+                    fflush(stderr);
+                    return -1;
+                }
                 // 发送缓冲区满，短暂等待后重试
                 usleep(1000);  // 1ms
                 continue;
@@ -461,6 +515,61 @@ void Block_Epoll_Net::setNonBlockFd(int fd)
     int flags = 0;
     flags = fcntl(fd, F_GETFL, 0);
     int ret = fcntl(fd, F_SETFL, flags|O_NONBLOCK);
+}
+
+//【2026-11-18 审查修复-C2】获取（或首次创建）fd 对应的发送互斥量。
+// 查找与创建在同一把 m_sendLockMapLock 下原子完成，保证并发首包不会各持不同锁。
+pthread_mutex_t* Block_Epoll_Net::GetSendLock( int fd )
+{
+    pthread_mutex_lock( &m_sendLockMapLock );
+    std::map<int, pthread_mutex_t*>::iterator it = m_mapSendLock.find( fd );
+    pthread_mutex_t* pLock = NULL;
+    if( it == m_mapSendLock.end() )
+    {
+        pLock = new pthread_mutex_t;
+        pthread_mutex_init( pLock , NULL );
+        m_mapSendLock[ fd ] = pLock;
+    }
+    else
+    {
+        pLock = it->second;
+    }
+    pthread_mutex_unlock( &m_sendLockMapLock );
+    return pLock;
+}
+
+//【2026-11-18 审查修复-C2】连接清理时回收发送互斥量。
+// 一律挂入退役表延迟销毁：若现场销毁（trylock 成功即 destroy），与
+// "发送者已拿到指针、尚未 lock"的窗口并发时会 destroy 后被 lock —— use-after-free，
+// 实测洪泛慢客户端 + 连接清理并发时进程 segfault（dmesg: segfault at 7f8f00000012）。
+// 退役量 = 连接数级别（每个 40 字节），进程退出时统一销毁；正确性优先。
+// 原代码（首版实现，trylock 现场销毁，保留备查）：
+//     if( 0 == pthread_mutex_trylock( pLock ) )
+//     {
+//         pthread_mutex_unlock( pLock );
+//         pthread_mutex_destroy( pLock );
+//         delete pLock;
+//     }
+//     else
+//     {
+//         m_lstRetiredSendLocks.push_back( pLock );
+//     }
+void Block_Epoll_Net::RemoveSendLock( int fd )
+{
+    pthread_mutex_lock( &m_sendLockMapLock );
+    std::map<int, pthread_mutex_t*>::iterator it = m_mapSendLock.find( fd );
+    pthread_mutex_t* pLock = NULL;
+    if( it != m_mapSendLock.end() )
+    {
+        pLock = it->second;
+        m_mapSendLock.erase( it );
+    }
+    pthread_mutex_unlock( &m_sendLockMapLock );
+
+    if( NULL != pLock )
+    {
+        m_lstRetiredSendLocks.push_back( pLock );
+    }
 }
 
 void Block_Epoll_Net::setRecvBufSize( int fd)
