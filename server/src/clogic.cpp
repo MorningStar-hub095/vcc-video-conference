@@ -1,5 +1,6 @@
 #include "clogic.h"
 #include "bcrypt_wrapper.h"  // [P0新增] bcrypt 密码哈希封装
+#include "md5_util.h"        //【2026-11-18 审查修复-C1】challenge 应答比对用 MD5
 #include <fcntl.h>
 #include <unistd.h>
 
@@ -67,6 +68,47 @@ void CLogic::RecordLoginFail(const std::string& key)
 {
     time_t now = time(NULL);
     pthread_mutex_lock( &m_loginLock );
+    //【2026-11-18 审查修复-H3：失败记录表无界增长】写入前先保证容量有界。
+    // 修改原因: 原表只增不减，攻击者用海量随机标识刷失败可把 m_loginAttempts
+    //           撑到任意大（远程内存 DoS，且条目永不清扫）。
+    // 修改效果: 达到 LOGIN_ATTEMPT_MAX_ENTRIES 时先清扫"锁定期已过且窗口已过"
+    //           的死条目；清扫后仍满则逐出 tWindowStart 最早（最陈旧）的条目，
+    //           表大小恒有界。正常用户的活跃失败记录不受影响。
+    // 原代码: （无容量控制，直接 m_loginAttempts[ key ] 进入写逻辑）
+    if( (int)m_loginAttempts.size() >= LOGIN_ATTEMPT_MAX_ENTRIES )
+    {
+        // 第一轮：清扫已失效条目（不在锁定期且失败窗口已过期）
+        for( std::map<std::string, LoginAttempt>::iterator itD = m_loginAttempts.begin();
+             itD != m_loginAttempts.end(); )
+        {
+            if( itD->second.tLockUntil <= now
+                    && itD->second.nFails > 0
+                    && now - itD->second.tWindowStart > LOGIN_WINDOW_SECS )
+            {
+                m_loginAttempts.erase( itD++ );
+            }
+            else if( itD->second.tLockUntil <= now && itD->second.nFails == 0 )
+            {
+                m_loginAttempts.erase( itD++ );
+            }
+            else
+            {
+                ++itD;
+            }
+        }
+        // 第二轮：仍满则逐出最陈旧条目（按窗口起点最早），每次逐出一个直到有余量
+        while( (int)m_loginAttempts.size() >= LOGIN_ATTEMPT_MAX_ENTRIES )
+        {
+            std::map<std::string, LoginAttempt>::iterator itOldest = m_loginAttempts.begin();
+            for( std::map<std::string, LoginAttempt>::iterator itD2 = m_loginAttempts.begin();
+                 itD2 != m_loginAttempts.end(); ++itD2 )
+            {
+                if( itD2->second.tWindowStart < itOldest->second.tWindowStart )
+                    itOldest = itD2;
+            }
+            m_loginAttempts.erase( itOldest );
+        }
+    }
     LoginAttempt& a = m_loginAttempts[ key ];
     if( a.nFails == 0 || now - a.tWindowStart > LOGIN_WINDOW_SECS )
     {
@@ -76,9 +118,14 @@ void CLogic::RecordLoginFail(const std::string& key)
     ++a.nFails;
     if( a.nFails >= LOGIN_MAX_FAILS )
     {
-        a.tLockUntil = now + LOGIN_LOCK_SECS;
+        //【2026-11-18 审查修复-H3：锁定时长抖动】
+        // 修改原因: 固定 300 秒锁定可被攻击者精确计时、循环续锁（锁定 DoS）。
+        // 修改效果: 锁定时长 = 300 + urandom32()%61 秒（300~360 随机），攻击者无法
+        //           精确踩点解锁瞬间继续爆破；正常用户多等至多 1 分钟无感知。
+        // 原代码: a.tLockUntil = now + LOGIN_LOCK_SECS;
+        a.tLockUntil = now + LOGIN_LOCK_SECS + (time_t)( urandom32() % 61u );
         a.nFails = 0;   // 进入锁定期后重新计数
-        fprintf(stderr, "[LoginRq] 登录标识连续失败达阈值，锁定300秒\n");
+        fprintf(stderr, "[LoginRq] 登录标识连续失败达阈值，锁定300~360秒\n");
     }
     pthread_mutex_unlock( &m_loginLock );
 }
@@ -104,6 +151,10 @@ void CLogic::setNetPackMap()
     NetPackMap(DEF_PACK_VIDEO_REGISTER)      =&CLogic::VideoRegister;
     //【拓展优化-新增】注册补全邮箱协议映射
     NetPackMap(DEF_PACK_UPDATE_EMAIL_RQ)     =&CLogic::UpdateEmailRq;
+    //【2026-11-18 审查修复-C1】登录 challenge-response 协议映射
+    // CHALLENGE_RS / VERIFY_RS 是服务端→客户端方向的回复包，不需要注册处理函数
+    NetPackMap(DEF_PACK_LOGIN_CHALLENGE_RQ)  =&CLogic::LoginChallengeRq;
+    NetPackMap(DEF_PACK_LOGIN_VERIFY_RQ)     =&CLogic::LoginVerifyRq;
     // [新增] H.264视频帧处理映射
     // 功能：转发H.264编码的视频帧给房间内其他成员
     NetPackMap(DEF_PACK_VIDEO_FRAME_H264)  =&CLogic::VideoFrameH264Rq;
@@ -298,7 +349,21 @@ void CLogic::RegisterRq(int clientfd, char * szbuf, int nlen)
                //  password 是服务端自己算的 bcrypt 串（字符集 ./0-9A-Za-z$），天然安全，
                //  feeling 是常量，两者无需转义；tel / name / email 复用函数开头已转义的值。
                sprintf(sqlStr , "insert into t_user( tel, password , name , email , icon , feeling) values('%s', '%s' , '%s' , '%s' , '%d' , '%s');"
-                       ,strSafeTel.c_str(),strPwdBcrypt.c_str(),strSafeName.c_str(), strSafeEmail.c_str(), 1 ,"比較懶，什麼也沒寫");
+                      ,strSafeTel.c_str(),strPwdBcrypt.c_str(),strSafeName.c_str(), strSafeEmail.c_str(), 1 ,"比較懶，什麼也沒寫");
+              //【2026-11-18 审查修复-C1】注册即写入 challenge 校验凭据 verify_hash（在原 INSERT
+              // 之上追加第 7 列；上句保留为无凭据形态的备查原代码，实际生效的是下方新语句）。
+              // 说明: h = 客户端固定盐 MD5(口令+盐)（strPwdCliReg）。challenge 应答比对要求
+              //       服务端能取到 h 本身；为避免明文落库，用 MySQL 内置 AES_ENCRYPT 以
+              //       _DEF_DB_AES_KEY 静态加密后存入 verify_hash（VARBINARY），库文件泄露
+              //       且未拿到密钥时无法还原 h。密钥经 EscapeMysql 转义后嵌入 SQL。
+              // 修改效果: 新注册用户直接具备 challenge 登录能力，无需走迁移路径。
+              {
+                  const char* szAesKeyReg = _DEF_DB_AES_KEY;
+                  std::string strSafeAesKeyReg = m_sql->EscapeMysql( szAesKeyReg, strlen(szAesKeyReg) );
+                  std::string strSafeRegH = m_sql->EscapeMysql( strPwdCliReg.c_str(), strPwdCliReg.size() );
+                  sprintf(sqlStr , "insert into t_user( tel, password , name , email , icon , feeling , verify_hash) values('%s', '%s' , '%s' , '%s' , '%d' , '%s' , AES_ENCRYPT('%s','%s'));"
+                          ,strSafeTel.c_str(),strPwdBcrypt.c_str(),strSafeName.c_str(), strSafeEmail.c_str(), 1 ,"比較懶，什麼也沒寫", strSafeRegH.c_str(), strSafeAesKeyReg.c_str());
+              }
                //【修复-注册静默失败】原来这里是空实现 {}：
                //  写库失败照样把上面预置的 register_success 发回客户端，
               //  用户看到"注册成功"，账号却根本不存在（随后登录必失败），
@@ -385,21 +450,30 @@ void CLogic::LoginRq(int clientfd, char * szbuf, int nlen)
    //    1) 三条分支各自写死整段 SQL，标识符永远由服务端常量决定，不接受任何输入；
    //    2) 登录标识走 EscapeMysql 转义。
    std::string strSafeLoginId = m_sql->EscapeMysql( rq->m_tel , sizeof(rq->m_tel) );
+   //【2026-11-18 审查修复-C1】SELECT 从 4 列扩为 5 列：追加 AES_DECRYPT(verify_hash,key)。
+   // 修改原因: C1 闸门需要知道该用户是否已具备 challenge 凭据（verify_hash 非空=已迁移）。
+   // 修改效果: 第 5 列为解密后的 h（列不存在/密钥不符时 MySQL 返回 NULL，SelectMysql
+   //           统一转空串），其余 4 列语义不变。三处分支只改列清单，条件不变。
+   // 原代码保留备查（以 email 分支为例，tel/name 分支同构）：
+   //   sprintf( strsql , "select password,id,name,email from t_user where email = '%s';", strSafeLoginId.c_str() );
+   const char* szAesKeyLogin = _DEF_DB_AES_KEY;
+   std::string strSafeAesKey = m_sql->EscapeMysql( szAesKeyLogin, strlen(szAesKeyLogin) );
+   std::string strColList = std::string("password,id,name,email,AES_DECRYPT(verify_hash,'") + strSafeAesKey + "')";
    if( strField == "email" )
    {
-       sprintf( strsql , "select password,id,name,email from t_user where email = '%s';", strSafeLoginId.c_str() );
+       sprintf( strsql , "select %s from t_user where email = '%s';", strColList.c_str(), strSafeLoginId.c_str() );
    }
    else if( strField == "tel" )
    {
-       sprintf( strsql , "select password,id,name,email from t_user where tel = '%s';", strSafeLoginId.c_str() );
+       sprintf( strsql , "select %s from t_user where tel = '%s';", strColList.c_str(), strSafeLoginId.c_str() );
    }
    else
    {
        //默认按用户名（昵称）查询
-       sprintf( strsql , "select password,id,name,email from t_user where name = '%s';", strSafeLoginId.c_str() );
+       sprintf( strsql , "select %s from t_user where name = '%s';", strColList.c_str(), strSafeLoginId.c_str() );
    }
 
-   if(!m_sql->SelectMysql(strsql , 4 , lstRes))
+   if(!m_sql->SelectMysql(strsql , 5 , lstRes))
    {
        return;
    }
@@ -422,6 +496,23 @@ void CLogic::LoginRq(int clientfd, char * szbuf, int nlen)
        string strName = lstRes.front(); lstRes.pop_front();
        //【拓展优化-新增】取出 email 字段
        string strEmail = lstRes.front(); lstRes.pop_front();
+       //【2026-11-18 审查修复-C1】取出第 5 列：verify_hash 解密结果（SQL NULL/缺列 → 空串）
+       string strVerify = lstRes.front(); lstRes.pop_front();
+
+       //【2026-11-18 审查修复-C1：旧格式登录闸门】
+       // 已迁移用户（verify_hash 非空）的口令凭据 h 不应再出现在线上；
+       // 放行旧格式等于给嗅探重放留永久后门，故直接拒绝（同码 password_error，
+       // 不泄露"已迁移"状态；同时按既有口径计入失败记录，防旧格式爆破）。
+       // 未迁移用户（strVerify 为空）放行本次旧格式登录，成功后立即写入凭据完成迁移。
+       // 原代码: （无闸门，旧格式永久放行 —— C1 修复点）
+       if( !strVerify.empty() )
+       {
+           fprintf(stderr, "[LoginRq] 已迁移用户尝试旧格式登录，已按 C1 闸门拒绝\n");
+           RecordLoginFail( strAttemptKey );
+           rs.m_lresult = password_error;
+           SendData(clientfd, (char*)&rs, sizeof rs);
+           return;
+       }
 
        // [P0改进] 密码验证从 strcmp 明文比较升级为 bcrypt_verify，含旧密码自动迁移
        // 原代码(SD):
@@ -468,6 +559,18 @@ void CLogic::LoginRq(int clientfd, char * szbuf, int nlen)
       } else {
            //密码正确
            int id = atoi(strId.c_str());
+           //【2026-11-18 审查修复-C1】旧格式登录成功即完成迁移：把本次验证通过的 h
+           // 经 AES_ENCRYPT 写入 verify_hash。此后该用户被闸门保护（旧格式永久拒绝），
+           // 本次是线上最后一次出现明文 h。
+           // 原代码: （无迁移写入，C1 之前不存在 verify_hash 列）
+           if( id > 0 )
+           {
+               std::string strSafeH = m_sql->EscapeMysql( strPwdCli.c_str(), strPwdCli.size() );
+               char strMig[512] = {0};
+               sprintf( strMig, "update t_user set verify_hash=AES_ENCRYPT('%s','%s') where id=%d;",
+                        strSafeH.c_str(), strSafeAesKey.c_str(), id );
+               m_sql->UpdataMysql( strMig );
+           }
            //sock要保存起來 id->sock映射（爲了通信）
            UserInfo * pInfo = new UserInfo;
            pInfo->m_id = id;
@@ -533,6 +636,268 @@ void CLogic::LoginRq(int clientfd, char * szbuf, int nlen)
 
 }
 
+/*===============【2026-11-18 审查修复-C1】登录 challenge-response 实现（新增）===============*/
+//签名一个挑战：生成 128 位随机数（urandom32 四次取值拼 32 hex 字符，与房间号/令牌同熵源），
+//覆盖写入该 fd 的会话（同 fd 重复挑战以最后一次为准，旧会话作废）。
+//容量回收（同 H3 思路）: 会话数达上限先清过期（TTL 30 秒），仍超限逐出最早签发的会话。
+std::string CLogic::SignLoginChallenge(int clientfd, const std::string& strLoginId, int nUserId, bool bHasVerifier)
+{
+    char szNonce[33] = {0};
+    unsigned int v[4];
+    for( int i = 0; i < 4; ++i ) v[i] = urandom32();
+    snprintf( szNonce, sizeof(szNonce), "%08x%08x%08x%08x", v[0], v[1], v[2], v[3] );
+
+    time_t now = time(NULL);
+    pthread_mutex_lock( &m_chalLock );
+    if( (int)m_mapLoginChallenge.size() >= LOGIN_CHALLENGE_MAX_ENTRIES )
+    {
+        for( std::map<int, LoginChallenge>::iterator itD = m_mapLoginChallenge.begin();
+             itD != m_mapLoginChallenge.end(); )
+        {
+            if( now - itD->second.tCreate > LOGIN_CHALLENGE_TTL_SECS )
+                m_mapLoginChallenge.erase( itD++ );
+            else
+                ++itD;
+        }
+        while( (int)m_mapLoginChallenge.size() >= LOGIN_CHALLENGE_MAX_ENTRIES )
+        {
+            std::map<int, LoginChallenge>::iterator itOldest = m_mapLoginChallenge.begin();
+            for( std::map<int, LoginChallenge>::iterator itD2 = m_mapLoginChallenge.begin();
+                 itD2 != m_mapLoginChallenge.end(); ++itD2 )
+            {
+                if( itD2->second.tCreate < itOldest->second.tCreate )
+                    itOldest = itD2;
+            }
+            m_mapLoginChallenge.erase( itOldest );
+        }
+    }
+    LoginChallenge& ch = m_mapLoginChallenge[ clientfd ];
+    ch.strLoginId = strLoginId;
+    ch.strNonce = szNonce;
+    ch.nUserId = nUserId;
+    ch.bHasVerifier = bHasVerifier;
+    ch.tCreate = now;
+    pthread_mutex_unlock( &m_chalLock );
+    return std::string( szNonce );
+}
+
+//步骤 1：客户端发来挑战请求（只带登录标识，不带任何凭据）。
+//无论标识是否存在都照发 nonce（防账号枚举）；区别仅在于：标识不存在时签发的会话
+//nUserId=0，verify 阶段必然失败（与口令错误同码返回）。
+void CLogic::LoginChallengeRq(int clientfd, char * szbuf, int nlen)
+{
+    if( nlen < (int)sizeof(STRU_LOGIN_CHALLENGE_RQ) ) return;
+    STRU_LOGIN_CHALLENGE_RQ * rq = (STRU_LOGIN_CHALLENGE_RQ *)szbuf;
+    string strLoginId( rq->m_tel, strnlen(rq->m_tel, sizeof(rq->m_tel)) );
+    if( strLoginId.empty() ) return;
+
+    //登录标识类型识别（与 LoginRq 内联三分支同口径；LoginRq 原代码保持不动，此处独立实现）
+    string strField = "tel";
+    if( strLoginId.find('@') != string::npos )
+    {
+        strField = "email";
+    }
+    else if( strLoginId.find_first_not_of("0123456789") == string::npos && strLoginId.length() == 11 )
+    {
+        strField = "tel";
+    }
+    else
+    {
+        strField = "name";
+    }
+
+    std::string strSafeLoginId = m_sql->EscapeMysql( rq->m_tel, sizeof(rq->m_tel) );
+    const char* szAesKeyC = _DEF_DB_AES_KEY;
+    std::string strSafeAesKey = m_sql->EscapeMysql( szAesKeyC, strlen(szAesKeyC) );
+
+    char strsql[1024] = "";
+    sprintf( strsql, "select id, AES_DECRYPT(verify_hash,'%s') from t_user where %s = '%s';",
+             strSafeAesKey.c_str(), strField.c_str(), strSafeLoginId.c_str() );
+    list<string> lstRes;
+    if(!m_sql->SelectMysql(strsql , 2 , lstRes))
+    {
+        return; // 数据库故障：不发挑战（客户端收不到 RS 自然失败，与连接失败同观感）
+    }
+
+    int nUserId = 0;
+    bool bHasVerifier = false;
+    if( lstRes.size() >= 2 )
+    {
+        string strIdC = lstRes.front(); lstRes.pop_front();
+        string strVerifyC = lstRes.front(); lstRes.pop_front();
+        nUserId = atoi( strIdC.c_str() );
+        bHasVerifier = !strVerifyC.empty();
+    }
+
+    std::string strNonce = SignLoginChallenge( clientfd, strLoginId, nUserId, bHasVerifier );
+
+    STRU_LOGIN_CHALLENGE_RS rs;
+    strncpy( rs.m_nonce, strNonce.c_str(), sizeof(rs.m_nonce) - 1 );
+    rs.m_nonce[sizeof(rs.m_nonce) - 1] = '\0';
+    SendData( clientfd, (char*)&rs, sizeof rs );
+}
+
+//步骤 2：客户端回传应答 resp = MD5( ASCII(h_hex + nonce_hex) )。
+//服务端取库里 AES 解密后的 h 按同式计算期望应答比对；通过后复用登录成功路径
+//（建 UserInfo、重复登录踢下线、签发会话令牌、回 VERIFY_RS）。
+//说明: 成功路径与 LoginRq 的成功分支同构（该分支代码保持原样未动，此处为 C1 新流程
+//      独立实现，仅结构体换成 STRU_LOGIN_VERIFY_RS）；这是刻意为之，避免重构触碰旧路径。
+void CLogic::LoginVerifyRq(int clientfd, char * szbuf, int nlen)
+{
+    if( nlen < (int)sizeof(STRU_LOGIN_VERIFY_RQ) ) return;
+    STRU_LOGIN_VERIFY_RQ * rq = (STRU_LOGIN_VERIFY_RQ *)szbuf;
+    STRU_LOGIN_VERIFY_RS rs;
+
+    string strLoginId( rq->m_tel, strnlen(rq->m_tel, sizeof(rq->m_tel)) );
+    string strResp( rq->m_resp, strnlen(rq->m_resp, sizeof(rq->m_resp)) );
+
+    //防爆破：verify 失败同样计入既有失败记录（与 LoginRq 同 key 口径）
+    std::string strAttemptKey = strLoginId;
+    if( IsLoginLocked( strAttemptKey ) )
+    {
+        rs.m_lresult = password_error;
+        SendData( clientfd, (char*)&rs, sizeof rs );
+        return;
+    }
+
+    //取挑战会话（一次性：取出即从表中移除；TTL 30 秒；登录标识必须与挑战时一致）
+    string strNonce;
+    int nUserId = 0;
+    bool bHasVerifier = false;
+    bool bSessionValid = false;
+    pthread_mutex_lock( &m_chalLock );
+    std::map<int, LoginChallenge>::iterator itCh = m_mapLoginChallenge.find( clientfd );
+    if( itCh != m_mapLoginChallenge.end() )
+    {
+        if( time(NULL) - itCh->second.tCreate <= LOGIN_CHALLENGE_TTL_SECS
+                && itCh->second.strLoginId == strLoginId )
+        {
+            strNonce = itCh->second.strNonce;
+            nUserId = itCh->second.nUserId;
+            bHasVerifier = itCh->second.bHasVerifier;
+            bSessionValid = true;
+        }
+        //无论成败，会话用掉即作废（一次性，防重放同 nonce 多次尝试）
+        m_mapLoginChallenge.erase( itCh );
+    }
+    pthread_mutex_unlock( &m_chalLock );
+
+    if( !bSessionValid || strNonce.empty() )
+    {
+        rs.m_lresult = password_error;
+        SendData( clientfd, (char*)&rs, sizeof rs );
+        return;
+    }
+
+    if( !bHasVerifier || nUserId <= 0 )
+    {
+        if( !bHasVerifier && nUserId > 0 )
+        {
+            //老账号尚未迁移（verify_hash 为空）：通知客户端退回一次旧格式登录
+            rs.m_lresult = login_need_legacy;
+            SendData( clientfd, (char*)&rs, sizeof rs );
+            return;
+        }
+        //标识不存在：与口令错误同码，防账号枚举
+        RecordLoginFail( strAttemptKey );
+        rs.m_lresult = password_error;
+        SendData( clientfd, (char*)&rs, sizeof rs );
+        return;
+    }
+
+    //从库中取解密后的 h，计算期望应答并比对
+    const char* szAesKeyV = _DEF_DB_AES_KEY;
+    std::string strSafeAesKey = m_sql->EscapeMysql( szAesKeyV, strlen(szAesKeyV) );
+    std::string strSafeLoginId = m_sql->EscapeMysql( strLoginId.c_str(), strLoginId.size() );
+    string strField = "tel";
+    if( strLoginId.find('@') != string::npos )
+    {
+        strField = "email";
+    }
+    else if( strLoginId.find_first_not_of("0123456789") == string::npos && strLoginId.length() == 11 )
+    {
+        strField = "tel";
+    }
+    else
+    {
+        strField = "name";
+    }
+
+    char strsql[1024] = "";
+    sprintf( strsql, "select password,id,name,email,AES_DECRYPT(verify_hash,'%s') from t_user where %s = '%s';",
+             strSafeAesKey.c_str(), strField.c_str(), strSafeLoginId.c_str() );
+    list<string> lstRes;
+    if(!m_sql->SelectMysql(strsql , 5 , lstRes))
+    {
+        return;
+    }
+    if( lstRes.size() < 5 )
+    {
+        RecordLoginFail( strAttemptKey );
+        rs.m_lresult = password_error;
+        SendData( clientfd, (char*)&rs, sizeof rs );
+        return;
+    }
+    string strPwdBc = lstRes.front(); lstRes.pop_front();
+    string strId = lstRes.front(); lstRes.pop_front();
+    string strName = lstRes.front(); lstRes.pop_front();
+    string strEmail = lstRes.front(); lstRes.pop_front();
+    string strH = lstRes.front(); lstRes.pop_front();
+    (void)strPwdBc; //bcrypt 列本流程不使用（challenge 已用 h 比对），取出仅为列对齐
+
+    //期望应答 = MD5( ASCII(h_hex + nonce_hex) )。h 为 32 字符小写十六进制，
+    //nonce 同为 32 字符小写十六进制，拼接后共 64 字符 ASCII —— 与客户端拼接口径一致。
+    std::string strExpect = md5_hex( strH + strNonce );
+    //【诊断日志】仅输出长度与前 6 位（h/resp 均为凭据相关，不落完整值）
+    fprintf(stderr, "[LoginVerifyRq] fd=%d hLen=%zu hHead=%.6s nonce=%.32s respLen=%zu respHead=%.6s expHead=%.6s\n",
+            clientfd, strH.size(), strH.c_str(), strNonce.c_str(),
+            strResp.size(), strResp.c_str(), strExpect.c_str());
+    if( strH.empty() || strExpect != strResp )
+    {
+        RecordLoginFail( strAttemptKey );
+        rs.m_lresult = password_error;
+        SendData( clientfd, (char*)&rs, sizeof rs );
+        return;
+    }
+
+    //应答正确 → 登录成功路径（与 LoginRq 成功分支同构）
+    int id = atoi(strId.c_str());
+    UserInfo * pInfo = new UserInfo;
+    pInfo->m_id = id;
+    pInfo->m_roomid = 0;
+    pInfo->m_sock = clientfd;
+    pInfo->m_token = gen_session_token();
+    strncpy(pInfo->m_userName , strName.c_str() , sizeof(pInfo->m_userName) - 1);
+    pInfo->m_userName[sizeof(pInfo->m_userName) - 1] = '\0';
+
+    //判斷id是否在線，在線強制下線，不在線添加（与 LoginRq 同逻辑）
+    if(m_mapIDToUserInfo.IsExist(pInfo->m_id))
+    {
+        UserInfo * pOld = m_mapIDToUserInfo.find( pInfo->m_id );
+        if( NULL != pOld )
+        {
+            if( pOld->m_sock    > 0 ) ::close( pOld->m_sock );
+            if( pOld->m_audiofd > 0 ) ::close( pOld->m_audiofd );
+            if( pOld->m_videofd > 0 ) ::close( pOld->m_videofd );
+            delete pOld;
+            fprintf(stderr, "[LoginVerifyRq] userid=%d 重复登录，旧连接已强制下线\n", pInfo->m_id);
+        }
+        m_mapIDToUserInfo.erase(pInfo->m_id);
+    }
+    m_mapIDToUserInfo.insert(pInfo->m_id , pInfo);
+    ClearLoginFail( strAttemptKey );
+    rs.m_userid = id;
+    rs.m_token = pInfo->m_token;
+    strncpy(rs.m_name , pInfo->m_userName , sizeof(rs.m_name) - 1);
+    rs.m_name[sizeof(rs.m_name) - 1] = '\0';
+    if( strEmail.empty() )
+        rs.m_lresult = login_success_no_email;
+    else
+        rs.m_lresult = login_success;
+    SendData(clientfd, (char*)&rs, sizeof rs);
+}
+/*===============【C1 实现结束】===============*/
+
 //創建房間
 void CLogic::CreateRoomRq(int clientfd, char *szbuf, int nlen)
 {
@@ -555,6 +920,41 @@ void CLogic::CreateRoomRq(int clientfd, char *szbuf, int nlen)
     // 修改效果: 查重与插入原子化，房间号不再撞号
     // 原代码保留备查：下方 do-while 与 insert 原样，仅外包 m_roomLock
     pthread_mutex_lock( &m_roomLock );
+    //【2026-11-18 审查修复-H5：房间数量无上限】双重限额（追加在既有查重锁段开头）。
+    // 修改原因: 原代码任何登录用户可无限 CreateRoom，m_mapIDToRoomid 无界增长（远程内存 DoS）。
+    // 修改效果: 1) 单用户已在任一房间成员列表中 → 拒绝建房（一人一房，与客户端
+    //              slot_createroom 的"在房间内禁止建房"口径一致）;
+    //           2) 全局房间数达 MAX_ROOMS_GLOBAL → 拒绝。
+    //           拒绝时回 rs.m_RoomID=0 / rs.m_lresult=0（与"房间号撞号失败"同一口径，
+    //           客户端按建房失败提示处理，无需新增结果码）。
+    // 原代码: （无限额，直接进入下方 do-while 随机房间号流程）
+    {
+        bool bAlreadyInRoom = false;
+        // 锁序约定: 先 m_roomLock 再 MyMap 内部锁（for_each_locked / size 均内部自持锁）
+        m_mapIDToRoomid.for_each_locked(
+            [ rq, &bAlreadyInRoom ]( int , const list<int>& lstMembers ) -> void
+            {
+                for( list<int>::const_iterator itU = lstMembers.begin(); itU != lstMembers.end(); ++itU )
+                {
+                    if( *itU == rq->m_UserID )
+                    {
+                        bAlreadyInRoom = true;
+                        return; // 仅结束本轮回调，外层遍历继续，标志位不会被覆盖
+                    }
+                }
+            } );
+        if( bAlreadyInRoom || m_mapIDToRoomid.size() >= MAX_ROOMS_GLOBAL )
+        {
+            pthread_mutex_unlock( &m_roomLock );
+            fprintf(stderr, "[CreateRoomRq] 建房被拒（H5 限额：%s）\n",
+                    bAlreadyInRoom ? "用户已在房间中" : "全局房间数达上限");
+            STRU_CREATEROOM_RS rsLimit;
+            rsLimit.m_RoomID = 0;
+            rsLimit.m_lresult = 0;
+            SendData( clientfd , (char*)&rsLimit , sizeof (rsLimit));
+            return;
+        }
+    }
     //房間號 1-8位隨機數
     //【安全修复-P1：房间号可预测】原 rand()+srand(time) 播种可被预测，
     // 攻击者可枚举他人房间号后强行加入窃听。改用 /dev/urandom 真随机。
@@ -1017,7 +1417,7 @@ void CLogic::UpdateEmailRq(int clientfd, char * szbuf, int nlen)
     // string strEmail = rq->m_email;
     // m_email 是 char[60] 定长字段，位于按包长 new 的精确堆块末尾；客户端填满
     // 60 字节不含 '\0' 时，string 构造内部 strlen 越过堆块边界（heap 越界读）。
-    // 修改方式：改为 strnlen 截取（与文件内其他定长字段口径一致）。
+    // 修改方式：改为 strnlen 截取（与 278/351/431 行其他定长字段口径一致）。
     // 修改原因：审查报告 H1 —— 远程可触发越界读，此处是全文件唯一漏项。
     // 修改效果：超长无终止符邮箱按 60 字节截取后正常走格式校验。回滚：还原下行即可。
     string strEmail( rq->m_email, strnlen( rq->m_email, sizeof(rq->m_email) ) );
@@ -1206,6 +1606,13 @@ void CLogic::PliRequestRq(int clientfd, char *szbuf, int nlen)
 //           相比旧行为（永不清理），本修复净收益为正。
 void CLogic::onClientClosed(int fd)
 {
+    //【2026-11-18 审查修复-C1】连接断开即回收该 fd 的登录挑战会话（一次性中间态，
+    // 连接没了就作废；否则 fd 被新连接复用时旧 nonce 会残留在 m_mapLoginChallenge 里）
+    // 原代码: （无此清理，C1 之前不存在挑战会话表）
+    pthread_mutex_lock( &m_chalLock );
+    m_mapLoginChallenge.erase( fd );
+    pthread_mutex_unlock( &m_chalLock );
+
     // 1. 找到并删除挂在该 fd 上的 UserInfo（erase_if 在 MyMap 锁内完成条件判断与删除）
     list<int> lstRemoved = m_mapIDToUserInfo.erase_if(
         [fd]( int /*id*/, UserInfo* pInfo ) -> bool

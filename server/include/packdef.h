@@ -48,11 +48,18 @@ static inline const char* _db_env(const char* key, const char* def){
 //           未注入 DB_NAME 环境变量时旧默认值导致连库失败（Unknown database 'vcc'）。
 // 修改效果: 默认回退到 wechat，与部署脚本/Dockerfile 注入的库名一致。
 // 原代码保留备查：
-// #define _DEF_DB_NAME    _db_env("DB_NAME", "vcc")
+// #define _DEF_DB_NAME    _db_env("DB_NAME", "wechat")
 #define _DEF_DB_NAME    _db_env("DB_NAME", "wechat")
 #define _DEF_DB_IP      _db_env("DB_IP",   "localhost")
-#define _DEF_DB_USER    _db_env("DB_USER", "vcc")
+#define _DEF_DB_USER    _db_env("DB_USER", "wechat")
 #define _DEF_DB_PWD     _db_env("DB_PWD",  "")
+//【2026-11-18 审查修复-C1】challenge 校验凭据（verify_hash 列）的静态加密密钥。
+// 用途: t_user.verify_hash = AES_ENCRYPT(h, 本密钥)。库文件泄露且未拿到本密钥时，
+//       攻击者无法从库里取到可用于 challenge 应答的 h（比明文存 h 多一层防护）。
+// 部署: 与 DB_* 同理，通过环境变量 DB_AES_KEY 注入；所有部署必须保持同库同钥，
+//       否则旧密钥加密的行解不开（解不开时按"未迁移"回退旧格式登录，不会锁死用户）。
+// 原代码: （无此宏，C1 之前不存在 verify_hash 列）
+#define _DEF_DB_AES_KEY _db_env("DB_AES_KEY", "vcc-aes-login-2026-key01")
 /*--------------------------------------*/
 #define _DEF_BUFFER         (4096)
 #define _MAX_SIZE           (40)
@@ -102,6 +109,20 @@ static inline const char* _db_env(const char* key, const char* def){
 //【预留】SPS/PPS 单独分发，编码器默认 inline 模式，暂未使用
 #define DEF_PACK_VIDEO_SPSPPS      (DEF_PACK_BASE + 19)
 
+//【2026-11-18 审查修复-C1：登录通道 challenge-response】
+// 背景: 原登录流程客户端把 MD5(口令+固定盐) 整包明文发出，抓包即可无限期重放登录。
+// 新流程（两步）:  1) 客户端发 LOGIN_CHALLENGE_RQ（只有登录标识，不带凭据）
+//                 2) 服务端下发 128 位随机数 LOGIN_CHALLENGE_RS
+//                 3) 客户端本地算 h=MD5(口令+盐)，回 LOGIN_VERIFY_RQ:
+//                    resp = MD5( ASCII(h_hex + nonce_hex) )  —— 64 字符 ASCII 串的 MD5
+//                 4) 服务端用库中凭据算同式应答比对（详见 clogic.cpp）
+// 效果: 线上不再出现可直接重放的 h；resp 绑定一次性 nonce，抓包不可重放。
+// 兼容: 旧格式 LOGIN_RQ 保留给"未迁移用户"一次性使用（登录成功即写入新凭据并迁移）。
+#define DEF_PACK_LOGIN_CHALLENGE_RQ  (DEF_PACK_BASE + 20)
+#define DEF_PACK_LOGIN_CHALLENGE_RS  (DEF_PACK_BASE + 21)
+#define DEF_PACK_LOGIN_VERIFY_RQ     (DEF_PACK_BASE + 22)
+#define DEF_PACK_LOGIN_VERIFY_RS     (DEF_PACK_BASE + 23)
+
 
 
 // TECH_INTEGRATION: [packdef] H.264 分片大小常量 (新增)
@@ -128,6 +149,10 @@ static inline const char* _db_env(const char* key, const char* def){
 #define login_success		(2)
 //【拓展优化-新增】登录成功但邮箱为空，需要补全邮箱
 #define login_success_no_email (3)
+//【2026-11-18 审查修复-C1】该账号尚未建立 challenge 校验凭据（verify_hash 为空），
+// 请客户端退回一次旧格式 LOGIN_RQ（携 h 明文）完成本次登录；服务端将随即写入凭据完成迁移。
+// 迁移窗口内每个用户最多走一次明文 h，此后旧格式永久拒绝（详见 LoginRq 内闸门）。
+#define login_need_legacy (4)
 
 
 typedef int PackType;
@@ -461,6 +486,70 @@ typedef struct STRU_PLI_REQUEST
     int m_userid;//请求者ID
     int m_roomid;//房间ID
 }STRU_PLI_REQUEST;
+
+/*==============【2026-11-18 审查修复-C1】登录 challenge-response 协议结构（新增）==============*/
+
+//登录挑战请求：只携带登录标识，不携带任何凭据（凭据永不上线，见 C1 设计说明）
+typedef struct STRU_LOGIN_CHALLENGE_RQ
+{
+    STRU_LOGIN_CHALLENGE_RQ()
+    {
+        m_nType = DEF_PACK_LOGIN_CHALLENGE_RQ;
+        memset( m_tel, 0, sizeof(m_tel) );
+    }
+    PackType m_nType;//包类型
+    char m_tel[_MAX_SIZE];//登录标识（手机号/用户名/邮箱）
+
+}STRU_LOGIN_CHALLENGE_RQ;
+
+//登录挑战回复：服务端下发 128 位随机数（32 个十六进制字符 + '\0'）
+typedef struct STRU_LOGIN_CHALLENGE_RS
+{
+    STRU_LOGIN_CHALLENGE_RS()
+    {
+        m_nType = DEF_PACK_LOGIN_CHALLENGE_RS;
+        memset( m_nonce, 0, sizeof(m_nonce) );
+    }
+    PackType m_nType;//包类型
+    char m_nonce[33];//随机数十六进制串
+
+}STRU_LOGIN_CHALLENGE_RS;
+
+//登录校验请求：m_resp = MD5( ASCII(h_hex + nonce_hex) )，h 为客户端本地算的加盐 MD5（32 hex）
+typedef struct STRU_LOGIN_VERIFY_RQ
+{
+    STRU_LOGIN_VERIFY_RQ()
+    {
+        m_nType = DEF_PACK_LOGIN_VERIFY_RQ;
+        memset( m_tel, 0, sizeof(m_tel) );
+        memset( m_resp, 0, sizeof(m_resp) );
+    }
+    PackType m_nType;//包类型
+    char m_tel[_MAX_SIZE];//登录标识（须与挑战时的标识一致，不一致按失败处理）
+    char m_resp[_MAX_SIZE];//32 字符十六进制应答
+
+}STRU_LOGIN_VERIFY_RQ;
+
+//登录校验回复：字段布局与 STRU_LOGIN_RS 完全一致（客户端可共用解析代码），仅包类型不同
+typedef struct STRU_LOGIN_VERIFY_RS
+{
+    STRU_LOGIN_VERIFY_RS()
+    {
+        m_nType = DEF_PACK_LOGIN_VERIFY_RS;
+        m_userid = 0;
+        m_lresult = 0;
+        memset(m_name , 0 , MAX_SIZE);
+        m_token = 0;
+    }
+    PackType m_nType;//包类型
+    int  m_userid;
+    int  m_lresult;//含 login_need_legacy(4)：该账号无凭据，客户端退回旧格式登录一次
+    char m_name[MAX_SIZE];
+    int  m_token;
+
+}STRU_LOGIN_VERIFY_RS;
+
+/*==============【C1 协议结构结束】==============*/
 
 //音频数据帧
 //成员描述

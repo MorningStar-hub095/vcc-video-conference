@@ -13,7 +13,8 @@ SOURCES += \
     src/main.cpp \
     src/bcrypt_wrapper.cpp \
     src/bcrypt/crypt_blowfish.c \
-    src/bcrypt/crypt_gensalt.c
+    src/bcrypt/crypt_gensalt.c \
+    src/md5_util.cpp
 
 DISTFILES += \
     src/bcrypt/crypt_blowfish.h \
@@ -27,7 +28,8 @@ HEADERS += \
     include/clogic.h \
     include/err_str.h \
     include/packdef.h \
-    include/bcrypt_wrapper.h
+    include/bcrypt_wrapper.h \
+    include/md5_util.h
 
 INCLUDEPATH += ./include
 

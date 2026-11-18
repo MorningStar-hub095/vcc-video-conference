@@ -128,6 +128,14 @@ public:
         pthread_mutex_unlock(&m_lock );
         return flag;
     }
+    //【2026-11-18 审查修复-H5】条目数查询（加锁读取 size，供资源上限判定使用）
+    int size()
+    {
+        pthread_mutex_lock(&m_lock );
+        int n = (int)m_map.size();
+        pthread_mutex_unlock(&m_lock );
+        return n;
+    }
 private:
     pthread_mutex_t m_lock;
     //**map<K , V> m_map;
@@ -143,15 +151,31 @@ struct myevent_s {
     int status;/* status:1表示在监听事件中，0表示不在 */
     Block_Epoll_Net* pNet;
 
+    //【2026-11-18 审查修复-H4：空闲连接无超时】
+    // tLastActive: 最近一次完整收包时间（recv_task 收满一包后刷新）。
+    //              EventLoop 周期扫描，超过 _DEF_IDLE_CONN_SECS 无完整包的连接回收。
+    // bInTask    : 1=该事件已投递 recv_task（排队或执行中），0=无任务在飞。
+    //              语义: recv_event（主线程）置 1，recv_task 收尾置 0；
+    //              扫描线程与 recv_event 同在 EventLoop 主线程，靠该标志区分
+    //              "是否有 recv_task 正持有 ev"，在飞者跳过本轮扫描，避免 UAF。
+    time_t tLastActive;
+    int    bInTask;
+
     myevent_s(Block_Epoll_Net* _pNet)
     {
         this->pNet = _pNet;
+        //【2026-11-18 审查修复-H4】构造即给默认值，未走 eventset 也不出现随机值
+        this->tLastActive = time(NULL);
+        this->bInTask = 0;
     }
     void eventset(int fd ,int efd/*epoll_create返回的句柄*/)
     {
         this->fd = fd;
         this->events = 0;
         this->status = 0;
+        //【2026-11-18 审查修复-H4】接入即视为活跃
+        this->tLastActive = time(NULL);
+        this->bInTask = 0;
         epoll_fd = efd;
     }
     //上监听树
@@ -297,6 +321,8 @@ private:
     void accept_event();
     void recv_event(myevent_s *ev); //接收: 事件到来recv_event --> 接收数据 recv_task -> 处理 Buffer_Deal
     void epollout_event(myevent_s *ev);
+    //【2026-11-18 审查修复-H4】空闲连接周期回收（EventLoop 内调用，主线程执行）
+    void SweepIdleConnections();
     //监听套接字对应的是事件
     myevent_s * m_listenEv;
     //监听套接字
@@ -317,6 +343,9 @@ private:
     std::list< pthread_mutex_t* > m_lstRetiredSendLocks;
     /* 事件循环使用 */
     struct epoll_event events[MAX_EVENTS+1];
+    //【2026-11-18 审查修复-H4】空闲回收参数
+    #define _DEF_IDLE_CONN_SECS  (600)   //空闲上限（秒）：600 秒无完整包即回收
+    #define _DEF_IDLE_SWEEP_LOOPS (30)   //扫描周期：EventLoop 每 30 轮（epoll_wait 1s 超时 × 30 ≈ 30s）扫一次
     //线程池相关
     thread_pool *m_threadpool;
 

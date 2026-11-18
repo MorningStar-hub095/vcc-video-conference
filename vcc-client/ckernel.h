@@ -51,7 +51,7 @@ public:
     {
         static ckernel kernel;
         return & kernel;
-    }//此版本有局限性，无法回收
+    }//面试不建议写此版本，有局限性，无法回收
 
 signals:
     void SIG_SendVideo( char* buf , int nlen );
@@ -104,6 +104,8 @@ public slots:
     void slot_dealData(uint sock,char* buf,int nlen);
     //登录回复
     void slot_dealLoginRS(uint sock,char* buf,int nlen);
+    //【2026-11-18 审查修复-C1】登录挑战回复：收到服务端随机数后本地算应答并回 VERIFY_RQ
+    void slot_dealLoginChallengeRS(uint sock,char* buf,int nlen);
     //注册回复
     void slot_dealRegisterRS(uint sock,char* buf,int nlen);
     //创建房间回复
@@ -171,6 +173,15 @@ private:
     //添加 m_UserName 成员保存当前登录用户名
     //原代码未保存用户名，导致创建房间时无法正确设置自己的 UserShow 信息
     QString m_UserName;
+
+    //【2026-11-18 审查修复-C1】challenge-response 登录的中间态（新增）。
+    // 流程: slot_loginCommit 只发挑战请求 → 收到 CHALLENGE_RS 后用这里暂存的
+    //       登录标识与加盐 MD5(h) 计算应答 → 回 VERIFY_RQ。
+    //       h 只留在本进程内存，永不上线（这是 C1 的核心改造点）；
+    //       服务端回 login_need_legacy 时同样用这两个成员退回一次旧格式登录。
+    // 原代码: （无此成员，旧流程在 slot_loginCommit 中直接把 h 放进 LOGIN_RQ 发出）
+    QString m_strLoginId;    //本次登录标识（手机号/用户名/邮箱）
+    QString m_strLoginMD5;   //h = MD5(口令_盐) 的 32 字符十六进制串
 
     ///音频 1个采集 多个播放 每一个房间成员 1:1 map映射
     AudioRead * m_pAudioRead;

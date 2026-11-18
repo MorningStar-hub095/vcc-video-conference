@@ -22,6 +22,8 @@ public:
         pthread_mutex_init( &m_roomLock , NULL );
         //【安全加固-P1：登录防暴力破解】初始化尝试记录锁
         pthread_mutex_init( &m_loginLock , NULL );
+        //【2026-11-18 审查修复-C1】初始化登录挑战会话锁
+        pthread_mutex_init( &m_chalLock , NULL );
     }
 public:
     //设置协议映射
@@ -36,6 +38,10 @@ public:
     void RegisterRq(sock_fd clientfd, char*szbuf, int nlen);
     //登录
     void LoginRq(sock_fd clientfd, char*szbuf, int nlen);
+    //【2026-11-18 审查修复-C1】登录挑战：下发一次性随机数，凭据不上线
+    void LoginChallengeRq(sock_fd clientfd, char*szbuf, int nlen);
+    //【2026-11-18 审查修复-C1】登录校验：比对 MD5(h+nonce)，通过后走登录成功路径
+    void LoginVerifyRq(sock_fd clientfd, char*szbuf, int nlen);
     //創建房間
     void CreateRoomRq(int clientfd, char * szbuf, int nlen);
     //加入房間
@@ -82,6 +88,13 @@ private:
     MyMap< int , UserInfo*> m_mapIDToUserInfo;
     MyMap< int , list<int>> m_mapIDToRoomid;
 
+    //【2026-11-18 审查修复-H5：房间数量无上限】全局房间数上限。
+    // 修改原因: 原代码任何登录用户可无限 CreateRoom，内存无界增长（远程内存 DoS）。
+    // 修改效果: 建房时全局房间数达上限即拒绝（rs.m_lresult=0）；另有单用户限 1 房，
+    //           空房间在 LeaveRoomRq 已有回收，本宏只封顶总量。
+    // 原代码: （无上限）
+    #define MAX_ROOMS_GLOBAL (256)
+
     //【P2修复：房间成员列表非原子读改写】保护「find拷贝->修改->insert写回」整体原子性的锁
     // 加锁顺序约定：先 m_roomLock 再 MyMap 内部锁（与 onClientClosed 一致），避免死锁
     pthread_mutex_t m_roomLock;
@@ -97,6 +110,13 @@ private:
         time_t tLockUntil;
         LoginAttempt() : nFails(0), tWindowStart(0), tLockUntil(0) {}
     };
+    //【2026-11-18 审查修复-H3：失败记录表无界增长】条目总数上限。
+    // 修改原因: 原表只增不减（仅登录成功 ClearLoginFail 单键删除），攻击者伪造海量
+    //           标识刷失败即可撑爆内存（远程内存 DoS）。
+    // 修改效果: 达到上限先清扫过期条目（锁定期已过且窗口已过），仍超限则逐出最早
+    //           窗口的条目，表大小恒有界；正常用户失败记录不受影响。
+    // 原代码: （无上限）
+    #define LOGIN_ATTEMPT_MAX_ENTRIES (10000)
     std::map<std::string, LoginAttempt> m_loginAttempts;
     pthread_mutex_t m_loginLock;
     // 锁定中返回 true；同时惰性清理过期窗口
@@ -105,6 +125,28 @@ private:
     void RecordLoginFail(const std::string& key);
     // 登录成功后清空该标识的失败记录
     void ClearLoginFail(const std::string& key);
+
+    /*===============【2026-11-18 审查修复-C1】登录 challenge-response 状态（新增）===============*/
+    //挑战会话：challenge→verify 两步登录的中间态，按连接 fd 一对一。
+    //生命周期: LoginChallengeRq 创建 → LoginVerifyRq 消费（一次性）/ 30 秒超时 /
+    //          连接断开(onClientClosed)回收。
+    struct LoginChallenge
+    {
+        std::string strLoginId;   //挑战对应的登录标识（校验阶段必须与其一致）
+        std::string strNonce;     //32 字符十六进制随机数（128 位）
+        int         nUserId;      //挑战时查到的用户 id；查不到置 0（防枚举：照发 nonce）
+        bool        bHasVerifier; //该用户是否已有 challenge 凭据（t_user.verify_hash 非空）
+        time_t      tCreate;      //签发时间，用于 TTL 与容量回收
+        LoginChallenge() : nUserId(0), bHasVerifier(false), tCreate(0) {}
+    };
+    std::map<int, LoginChallenge> m_mapLoginChallenge;
+    pthread_mutex_t m_chalLock;
+    //挑战 TTL（秒）与内存上限（超限先清过期，仍超限则逐出最早签发的会话）
+    #define LOGIN_CHALLENGE_TTL_SECS   (30)
+    #define LOGIN_CHALLENGE_MAX_ENTRIES (2048)
+    //签名一个挑战会话（LoginChallengeRq 内部用），返回写入的 nonce 十六进制串
+    std::string SignLoginChallenge(int clientfd, const std::string& strLoginId, int nUserId, bool bHasVerifier);
+    /*===============【C1 状态结束】===============*/
 
 };
 

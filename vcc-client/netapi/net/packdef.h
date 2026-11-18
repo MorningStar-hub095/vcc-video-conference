@@ -58,6 +58,19 @@
 //【预留】SPS/PPS 单独分发，编码器默认 inline 模式，暂未使用
 #define DEF_PACK_VIDEO_SPSPPS      (DEF_PACK_BASE + 19)
 
+//【2026-11-18 审查修复-C1：登录通道 challenge-response】（与服务端 packdef.h 严格对齐）
+// 新登录流程:  1) 客户端发 LOGIN_CHALLENGE_RQ（只有登录标识，不带凭据）
+//             2) 服务端下发 128 位随机数 LOGIN_CHALLENGE_RS
+//             3) 客户端本地算 h=MD5(口令+盐)，回 LOGIN_VERIFY_RQ:
+//                resp = MD5( ASCII(h_hex + nonce_hex) ) —— 64 字符 ASCII 串的 MD5
+//             4) 服务端比对通过回 LOGIN_VERIFY_RS（布局与 LOGIN_RS 一致）
+// 效果: 线上不再出现可直接重放的 h，抓包不可重放。
+// 兼容: 服务端若回 login_need_legacy(4)，客户端退回一次旧格式 LOGIN_RQ 完成迁移。
+#define DEF_PACK_LOGIN_CHALLENGE_RQ  (DEF_PACK_BASE + 20)
+#define DEF_PACK_LOGIN_CHALLENGE_RS  (DEF_PACK_BASE + 21)
+#define DEF_PACK_LOGIN_VERIFY_RQ     (DEF_PACK_BASE + 22)
+#define DEF_PACK_LOGIN_VERIFY_RS     (DEF_PACK_BASE + 23)
+
 
 
 //  H.264分片大小常量
@@ -96,6 +109,9 @@
 #define login_success		(2)
 //登录成功但邮箱为空，需要补全邮箱
 #define login_success_no_email (3)
+//【2026-11-18 审查修复-C1】账号尚无 challenge 凭据（老账号未迁移），
+// 客户端收到此码后退回一次旧格式 LOGIN_RQ（携 h 明文）完成登录，服务端随即完成迁移。
+#define login_need_legacy (4)
 
 
 typedef int PackType;
@@ -183,6 +199,70 @@ typedef struct STRU_LOGIN_RS
     int m_token;
 
 }STRU_LOGIN_RS;
+
+/*==============【2026-11-18 审查修复-C1】登录 challenge-response 协议结构（新增，与服务端严格对齐）==============*/
+
+//登录挑战请求：只携带登录标识，不携带任何凭据
+typedef struct STRU_LOGIN_CHALLENGE_RQ
+{
+    STRU_LOGIN_CHALLENGE_RQ()
+    {
+        m_nType = DEF_PACK_LOGIN_CHALLENGE_RQ;
+        memset( m_tel, 0, sizeof(m_tel) );
+    }
+    PackType m_nType;//包类型
+    char m_tel[_MAX_SIZE];//登录标识（手机号/用户名/邮箱）
+
+}STRU_LOGIN_CHALLENGE_RQ;
+
+//登录挑战回复：服务端下发 128 位随机数（32 个十六进制字符 + '\0'）
+typedef struct STRU_LOGIN_CHALLENGE_RS
+{
+    STRU_LOGIN_CHALLENGE_RS()
+    {
+        m_nType = DEF_PACK_LOGIN_CHALLENGE_RS;
+        memset( m_nonce, 0, sizeof(m_nonce) );
+    }
+    PackType m_nType;//包类型
+    char m_nonce[33];//随机数十六进制串
+
+}STRU_LOGIN_CHALLENGE_RS;
+
+//登录校验请求：m_resp = MD5( ASCII(h_hex + nonce_hex) )，h 为客户端本地算的加盐 MD5（32 hex）
+typedef struct STRU_LOGIN_VERIFY_RQ
+{
+    STRU_LOGIN_VERIFY_RQ()
+    {
+        m_nType = DEF_PACK_LOGIN_VERIFY_RQ;
+        memset( m_tel, 0, sizeof(m_tel) );
+        memset( m_resp, 0, sizeof(m_resp) );
+    }
+    PackType m_nType;//包类型
+    char m_tel[_MAX_SIZE];//登录标识（须与挑战时一致）
+    char m_resp[_MAX_SIZE];//32 字符十六进制应答
+
+}STRU_LOGIN_VERIFY_RQ;
+
+//登录校验回复：字段布局与 STRU_LOGIN_RS 完全一致（可复用 slot_dealLoginRS 解析），仅包类型不同
+typedef struct STRU_LOGIN_VERIFY_RS
+{
+    STRU_LOGIN_VERIFY_RS()
+    {
+        m_nType = DEF_PACK_LOGIN_VERIFY_RS;
+        m_userid = 0;
+        m_lresult = 0;
+        memset(m_name , 0 , MAX_SIZE);
+        m_token = 0;
+    }
+    PackType m_nType;//包类型
+    int  m_userid;
+    int  m_lresult;//含 login_need_legacy(4)：退回一次旧格式登录完成迁移
+    char m_name[MAX_SIZE];
+    int  m_token;
+
+}STRU_LOGIN_VERIFY_RS;
+
+/*==============【C1 协议结构结束】==============*/
 
 //创建房间请求
 typedef struct STRU_CREATEROOM_RQ

@@ -3,6 +3,7 @@
 #include "packdef.h"
 #include "md5.h"
 #include <QMessageBox>
+#include <QCryptographicHash>  //【2026-11-18 审查修复-C1】challenge 应答用标准 MD5（QCryptographicHash::Md5）
 #include <QTime>
 #include <QBuffer>
 #include <QThread>
@@ -26,6 +27,11 @@ void ckernel::setNetPackMap()
     memset(m_netPackMap, 0, sizeof(m_netPackMap));
     //m_netPackMap = &ckernel::slot_dealLoginRS;
     NetPackMap(DEF_PACK_LOGIN_RS)         = &ckernel::slot_dealLoginRS;
+    //【2026-11-18 审查修复-C1】challenge-response 登录协议映射（新增）。
+    // VERIFY_RS 与 LOGIN_RS 布局完全一致，复用 slot_dealLoginRS 解析；
+    // login_need_legacy 分支在该槽内新增 case 处理。
+    NetPackMap(DEF_PACK_LOGIN_CHALLENGE_RS) = &ckernel::slot_dealLoginChallengeRS;
+    NetPackMap(DEF_PACK_LOGIN_VERIFY_RS)    = &ckernel::slot_dealLoginRS;
     NetPackMap(DEF_PACK_REGISTER_RS)      = &ckernel::slot_dealRegisterRS;
     NetPackMap(DEF_PACK_CREATEROOM_RS)    = &ckernel::slot_dealCreateRoomRS;
     NetPackMap(DEF_PACK_JOINROOM_RS)      = &ckernel::slot_dealJoinRoomRS;
@@ -423,25 +429,72 @@ void ckernel::slot_loginCommit(QString tel, QString pass)
            return;
        }
        qDebug() << "网络已连接，准备发送登录请求";
-    std::string strTel = tel.toStdString();
+    //【2026-11-18 审查修复-C1：登录通道 challenge-response 改造】
+    // 修改原因: 原流程把 MD5(口令+固定盐)（即凭据 h）整包明文发出，抓包即可无限期
+    //           重放登录。新流程两步走：先只发登录标识向服务端要一次性随机数，
+    //           再回 MD5(h+nonce) 应答 —— h 永不上线，抓包不可重放。
+    // 修改方式: 暂存登录标识与 h 到 m_strLoginId / m_strLoginMD5，发送
+    //           LOGIN_CHALLENGE_RQ；收到 CHALLENGE_RS 后由 slot_dealLoginChallengeRS
+    //           计算应答并发送 LOGIN_VERIFY_RQ。
+    // 原代码保留备查（一次性发出 h 的旧流程，已被上述两步取代）：
+    //     std::string strPassMD5 = GetMD5(pass);
+    //     qDebug()<<strPassMD5.c_str();
+    //     STRU_LOGIN_RQ rq;
+    //     strncpy(rq.m_tel , strTel.c_str() , sizeof(rq.m_tel) - 1);
+    //     rq.m_tel[sizeof(rq.m_tel) - 1] = '\0';
+    //     strncpy(rq.m_password , strPassMD5.c_str() , sizeof(rq.m_password) - 1);
+    //     rq.m_password[sizeof(rq.m_password) - 1] = '\0';
+    //     m_pClient->SendData(0 , (char*)&rq, sizeof(rq));
+    // （后续服务端回 login_need_legacy 时会走一次上面的旧格式完成迁移，
+    //   实现在 slot_dealLoginRS 的 login_need_legacy 分支）
+    m_strLoginId = tel;
+    m_strLoginMD5 = QString::fromStdString( GetMD5(pass) ); // h 只留在本进程内存
 
-    STRU_LOGIN_RQ rq;
-    //原代码使用 strcpy 存在缓冲区溢出风险：
-    //若 tel 长度超过 _MAX_SIZE(40)，会越界写入 rq.m_tel 后的内存区域。
-    //修复：使用 strncpy 限制拷贝长度，并手动确保字符串以 '\0' 结尾
-    strncpy(rq.m_tel , strTel.c_str() , sizeof(rq.m_tel) - 1);
-    rq.m_tel[sizeof(rq.m_tel) - 1] = '\0';
+    STRU_LOGIN_CHALLENGE_RQ rqChal;
+    std::string strTelNew = m_strLoginId.toStdString();
+    strncpy(rqChal.m_tel , strTelNew.c_str() , sizeof(rqChal.m_tel) - 1);
+    rqChal.m_tel[sizeof(rqChal.m_tel) - 1] = '\0';
+    m_pClient->SendData(0 , (char*)&rqChal, sizeof(rqChal));
 
-    std::string strPassMD5 = GetMD5(pass);
-    qDebug()<<strPassMD5.c_str();
-    //同样使用 strncpy 防止密码字段溢出
-    strncpy(rq.m_password , strPassMD5.c_str() , sizeof(rq.m_password) - 1);
-    rq.m_password[sizeof(rq.m_password) - 1] = '\0';
+}
 
-    /*先转换std，后转换char**/
-    /*发送*/
-    m_pClient->SendData(0 , (char*)&rq, sizeof(rq));
+//【2026-11-18 审查修复-C1】登录挑战回复处理（新增）。
+// 服务端下发 128 位随机数后，本地计算应答 resp = MD5( ASCII(h_hex + nonce_hex) )
+// 并发送 LOGIN_VERIFY_RQ。h（m_strLoginMD5）全程不出本进程 —— 线上只有绑定
+// 一次性 nonce 的应答，嗅探不可重放。
+void ckernel::slot_dealLoginChallengeRS(uint sock, char *buf, int nlen)
+{
+    qDebug()<<__func__;
+    //【P2修复同口径：槽入口包长校验】畸形短包直接强转会越界读
+    if( nlen < (int)sizeof(STRU_LOGIN_CHALLENGE_RS) ) return;
+    STRU_LOGIN_CHALLENGE_RS * rs = (STRU_LOGIN_CHALLENGE_RS*)buf;
+    QString strNonce = QString::fromLatin1( rs->m_nonce );
+    if( strNonce.isEmpty() || m_strLoginId.isEmpty() || m_strLoginMD5.isEmpty() )
+    {
+        qDebug() << "挑战应答数据不完整，放弃本次登录";
+        return;
+    }
+    //应答口径与服务端 LoginVerifyRq 一致：对 64 字符 ASCII（h_hex + nonce_hex）取【标准 MD5】。
+    //【2026-11-18 审查修复-C1 附带发现】仓库自带的 MD5 类（vcc-client/md5/）经 RFC 1321
+    // 标准向量验证【不是标准 MD5】（"abc" 输出 7999dc75...，应为 90015098...）——
+    // 两端此前从未独立验证过。因此本应答改用 Qt 自带的标准实现
+    // QCryptographicHash::Md5（与服务端 md5_util.cpp 标准 RFC1321 实现结果一致）。
+    // 注意: GetMD5()（口令加盐哈希 h 的定义）仍沿用仓库 MD5 类【保持存量账号兼容】，
+    // 其非标准性已作为遗留问题记录（见审查报告/工作日志），勿在此"顺手修复"。
+    // 原代码: MD5 md5obj(strSrcResp); strResp = md5obj.toString();（非标准实现，注释保留）
+    QByteArray baResp = QCryptographicHash::hash(
+                (m_strLoginMD5 + strNonce).toUtf8(), QCryptographicHash::Md5).toHex();
+    std::string strResp( baResp.constData(), (size_t)baResp.size() );
+    // std::string strSrcResp = (m_strLoginMD5 + strNonce).toStdString();
+    // MD5 md5obj(strSrcResp);
+    // std::string strResp = md5obj.toString();
 
+    STRU_LOGIN_VERIFY_RQ rqVerify;
+    strncpy(rqVerify.m_tel , m_strLoginId.toStdString().c_str() , sizeof(rqVerify.m_tel) - 1);
+    rqVerify.m_tel[sizeof(rqVerify.m_tel) - 1] = '\0';
+    strncpy(rqVerify.m_resp , strResp.c_str() , sizeof(rqVerify.m_resp) - 1);
+    rqVerify.m_resp[sizeof(rqVerify.m_resp) - 1] = '\0';
+    m_pClient->SendData(0 , (char*)&rqVerify, sizeof(rqVerify));
 }
 
 //发送注册信息
@@ -1275,6 +1328,27 @@ void ckernel::slot_dealLoginRS(uint sock, char *buf, int nlen)
     case password_error:
         QMessageBox::about(m_pLoginDlg , "提示" , "密码错误，登录失败");
         break;
+    case login_need_legacy:
+    {
+        //【2026-11-18 审查修复-C1】老账号尚未迁移（服务端无 challenge 凭据）：
+        // 退回一次旧格式 LOGIN_RQ（携 h 明文）完成本次登录，服务端验证通过后
+        // 会把 h 加密写入 verify_hash 完成迁移；此后本账号只能走 challenge 流程。
+        // 这是迁移窗口内的最后一次 h 上线（服务端 C1 闸门保证），属预期过渡路径。
+        // 原代码: （无此分支，旧客户端恒走旧格式）
+        qDebug() << "账号未迁移，按服务端指示退回旧格式登录一次";
+        if( !m_strLoginId.isEmpty() && !m_strLoginMD5.isEmpty() )
+        {
+            STRU_LOGIN_RQ rqLegacy;
+            std::string strTelLg = m_strLoginId.toStdString();
+            std::string strMd5Lg = m_strLoginMD5.toStdString();
+            strncpy(rqLegacy.m_tel , strTelLg.c_str() , sizeof(rqLegacy.m_tel) - 1);
+            rqLegacy.m_tel[sizeof(rqLegacy.m_tel) - 1] = '\0';
+            strncpy(rqLegacy.m_password , strMd5Lg.c_str() , sizeof(rqLegacy.m_password) - 1);
+            rqLegacy.m_password[sizeof(rqLegacy.m_password) - 1] = '\0';
+            m_pClient->SendData(0 , (char*)&rqLegacy, sizeof(rqLegacy));
+        }
+        break;
+    }
     case login_success:
     {
         //原代码 QString("用户登录成功").arg(rs->m_name)

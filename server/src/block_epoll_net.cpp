@@ -85,10 +85,19 @@ bool Block_Epoll_Net::InitThreadPool()
 void Block_Epoll_Net::EventLoop()
 {
     int  i = 0;
+    //【2026-11-18 审查修复-H4】空闲连接扫描计数器：epoll_wait 已带 1 秒超时，
+    // 每过 _DEF_IDLE_SWEEP_LOOPS 轮（约 30 秒）做一次空闲连接回收
+    int nLoopCount = 0;
     while (1) {
 
         /* 等待事件发生 */
         int nfd = epoll_wait( m_epoll_fd, events, MAX_EVENTS+1, 1000);
+        //【2026-11-18 审查修复-H4】每 30 轮扫描一次空闲连接（nfd==0 即超时轮次也计入）
+        if( ++nLoopCount >= _DEF_IDLE_SWEEP_LOOPS )
+        {
+            nLoopCount = 0;
+            SweepIdleConnections();
+        }
         if (nfd < 0) {
 //            break;
             //【修复-P1：epoll_wait 持续失败时 100% CPU 忙等】
@@ -186,6 +195,11 @@ void Block_Epoll_Net::accept_event()
 
 void Block_Epoll_Net::recv_event( myevent_s *ev)
 {
+    //【2026-11-18 审查修复-H4】标记"recv_task 已在飞"。
+    // 本函数与 SweepIdleConnections 同在 EventLoop 主线程串行执行：先置 1 再入队，
+    // 扫描据此跳过在飞事件，避免回收正被 recv_task 持有的 ev（UAF）。
+    // 原代码: （无标志，H4 之前不存在空闲扫描）
+    ev->bInTask = 1;
     //接收事件采用线程池 多线程处理, 由于使用EPOLLONESHOT , 避免同一套机字的线程并发问题
     //【安全修复-P0：主循环阻塞】改用非阻塞入队
     // 修改原因: 原阻塞版 Producer_add 在任务队列满（50000）时卡死在条件变量上，
@@ -272,7 +286,7 @@ void* Block_Epoll_Net::recv_task(void* arg)
             // ::close(ev->fd);
             // 此处提前 close 后 break 进入下方统一清理路径，清理段会再次 close 同一 fd；
             // 两次 close 之间若 accept 复用同一 fd 号，eventdel/第二次 close 会误杀新连接
-            // （与既有"先 erase 后 close"修复同类窗口，属该修复的回归路径）。
+            // （与 343-350 行已修复的"先 erase 后 close"同类窗口，属该修复的回归路径）。
             // 修改方式：删除提前 close，统一交由末尾清理路径负责 close
             //           （erase→eventdel→close→delete 顺序保持不变）。
             // 修改原因：审查报告 C6 —— 恶意非法包长可偶发误杀无辜新连接，double-close 亦属 UB。
@@ -316,6 +330,12 @@ void* Block_Epoll_Net::recv_task(void* arg)
         int recvType = *(int*)pSzBuf;
         (void)recvType;
 
+        //【2026-11-18 审查修复-H4】完整收包即刷新活跃时间（供空闲扫描判定）。
+        // 线程池线程写、主线程读：4/8 字节对齐赋值在 x86 上实际原子，工程上可接受，
+        // 语义上只影响扫描时机（最多晚一个扫描周期），无正确性风险。
+        // 原代码: （无刷新，H4 之前不存在空闲扫描）
+        ev->tLastActive = time(NULL);
+
         //接收和处理分离 跑线程池里其他线程处理 , 避免处理影响接收
         DataBuffer * buffer = new DataBuffer(ev->pNet , ev->fd , pSzBuf , nOffSet );
         //【安全修复-P0：主循环阻塞配套】recv_task 虽在线程池线程，同样改非阻塞入队：
@@ -336,6 +356,11 @@ void* Block_Epoll_Net::recv_task(void* arg)
         // 这次接收完 要重新注册事件  此时 EPOLL MODE -> EPOLLIN|EPOLLONESHOT 没有修改, 使用重复值
         ev->eventadd(  ev->events );
 
+        //【2026-11-18 审查修复-H4】成功路径收尾：清除"在飞"标志。
+        // 必须是本函数对 ev 的最后一次访问（此后 ev 归 EventLoop 主线程管辖，
+        // 空闲扫描可安全回收）；错误路径在下方统一清理并 delete ev，无需清标志。
+        // 原代码: （无标志维护，H4 之前不存在空闲扫描）
+        ev->bInTask = 0;
         return 0;
 
     }while(0);
@@ -364,6 +389,53 @@ void* Block_Epoll_Net::recv_task(void* arg)
     delete ev;
     return NULL;
 
+}
+
+//【2026-11-18 审查修复-H4：空闲连接无超时】周期回收实现（EventLoop 主线程调用）。
+// 修改原因: 原代码连接一旦建立，除对端主动断开外永不回收；恶意/异常客户端静默挂线
+//           即可耗尽 fd 与 epoll 槽位（SO_RCVTIMEO 只约束"已在读"的 recv，救不了
+//           根本不来数据的静默连接）。
+// 修改效果: 距最近一次完整收包超过 _DEF_IDLE_CONN_SECS(600s) 的连接被统一回收：
+//           eventdel → close_callback（业务层清理）→ erase → RemoveSendLock → close → delete ev。
+// 安全性说明:
+//   1) 本函数与 recv_event/accept_event 同在 EventLoop 主线程串行执行；
+//   2) 只回收 bInTask==0 的事件 —— bInTask 由 recv_event（主线程）置 1、
+//      recv_task 成功收尾置 0，为 0 即"没有任何 recv_task 排队或执行中持有 ev"，
+//      回收不会造成 use-after-free；
+//   3) tLastActive/bInTask 跨线程读写为对齐整型赋值，x86 上实际原子，
+//      最坏只影响回收时机（晚一个周期），无正确性风险；
+//   4) 监听 fd 的 m_listenEv 不在 m_mapSockfdToEvent 中，天然不受影响。
+// 原代码: （无空闲回收机制）
+void Block_Epoll_Net::SweepIdleConnections()
+{
+    time_t now = time(NULL);
+    std::list< myevent_s* > lstIdle;
+
+    // 收集空闲且无在飞任务的事件（for_each_locked 在 MyMap 锁内遍历，只读不改）
+    m_mapSockfdToEvent.for_each_locked(
+        [ now, &lstIdle ]( int /*fd*/, myevent_s* ev ) -> void
+        {
+            if( NULL != ev && ev->bInTask == 0
+                    && now - ev->tLastActive > _DEF_IDLE_CONN_SECS )
+            {
+                lstIdle.push_back( ev );
+            }
+        } );
+
+    for( std::list< myevent_s* >::iterator it = lstIdle.begin(); it != lstIdle.end(); ++it )
+    {
+        myevent_s* ev = *it;
+        fprintf(stderr, "[Block_Epoll_Net::SweepIdleConnections] idle fd=%d over %ds, close\n",
+                ev->fd, (int)( now - ev->tLastActive ));
+        // 与 recv_task 错误路径相同的清理顺序：先下树，再业务回调，再摘表/锁/fd/内存
+        ev->eventdel();
+        if( m_close_callback )
+            m_close_callback( ev->fd );
+        m_mapSockfdToEvent.erase( ev->fd );
+        RemoveSendLock( ev->fd );
+        close( ev->fd );
+        delete ev;
+    }
 }
 
 void * Block_Epoll_Net::Buffer_Deal( void * arg )
@@ -539,21 +611,8 @@ pthread_mutex_t* Block_Epoll_Net::GetSendLock( int fd )
 }
 
 //【2026-11-18 审查修复-C2】连接清理时回收发送互斥量。
-// 一律挂入退役表延迟销毁：若现场销毁（trylock 成功即 destroy），与
-// "发送者已拿到指针、尚未 lock"的窗口并发时会 destroy 后被 lock —— use-after-free，
-// 实测洪泛慢客户端 + 连接清理并发时进程 segfault（dmesg: segfault at 7f8f00000012）。
-// 退役量 = 连接数级别（每个 40 字节），进程退出时统一销毁；正确性优先。
-// 原代码（首版实现，trylock 现场销毁，保留备查）：
-//     if( 0 == pthread_mutex_trylock( pLock ) )
-//     {
-//         pthread_mutex_unlock( pLock );
-//         pthread_mutex_destroy( pLock );
-//         delete pLock;
-//     }
-//     else
-//     {
-//         m_lstRetiredSendLocks.push_back( pLock );
-//     }
+// 若此刻仍有发送者持有该锁（trylock 失败），挂入退役表延迟销毁，
+// 避免"持有者还在用、互斥量已被 destroy"的未定义行为；进程退出时统一销毁。
 void Block_Epoll_Net::RemoveSendLock( int fd )
 {
     pthread_mutex_lock( &m_sendLockMapLock );
@@ -568,6 +627,26 @@ void Block_Epoll_Net::RemoveSendLock( int fd )
 
     if( NULL != pLock )
     {
+        //【2026-11-18 修复加固：一律延迟销毁】
+        // 修改原因: 原实现（trylock 成功即销毁）存在竞态窗口——发送者在
+        //           GetSendLock 拿到指针后、pthread_mutex_lock 之前，
+        //           RemoveSendLock 的 trylock 同样会成功（此刻锁尚未被持有），
+        //           随即 destroy+delete；发送者接着 lock 一块已释放的内存 → segfault
+        //           （dmesg 实证：segfault at 7f8f00000012，洪泛慢客户端 +
+        //            连接清理并发时进程崩溃退出）。
+        // 修改方式: 全部挂入退役表，由进程退出时统一销毁——退役量 = 连接数级别
+        //           （每个 40 字节），进程常驻场景可接受；正确性优先。
+        // 原代码（保留备查）：
+        //     if( 0 == pthread_mutex_trylock( pLock ) )
+        //     {
+        //         pthread_mutex_unlock( pLock );
+        //         pthread_mutex_destroy( pLock );
+        //         delete pLock;
+        //     }
+        //     else
+        //     {
+        //         m_lstRetiredSendLocks.push_back( pLock );
+        //     }
         m_lstRetiredSendLocks.push_back( pLock );
     }
 }
