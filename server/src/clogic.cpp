@@ -152,6 +152,13 @@ static bool is_valid_email( const std::string & email )
         if( !( (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z')
                || (c >= '0' && c <= '9') || c == '.' || c == '-' ) ) return false;
     }
+    if( domain.empty() ) return false;
+    //【2026-11-18 审查修复-H2：空 domain 越界】原代码（下一行，无空串保护）：
+    // 输入 "a@" 时 domain 为空串，domain[domain.size()-1] 即 domain[-1]，
+    // 下标回绕为极大值，属未定义行为（std::string 仅保证 s[s.size()] 合法）。
+    // 修改方式：新增空串前置判断（上方一行），原判断逻辑保持不变。
+    // 修改原因：审查报告 H2 —— 任何客户端发 "a@" 即可远程触发 UB/潜在崩溃。
+    // 修改效果：空域名直接判非法，合法邮箱行为完全不变。回滚：删新增行即恢复。
     if( domain[0] == '.' || domain[domain.size() - 1] == '.' ) return false;
     if( domain.find("..") != std::string::npos ) return false;
     // 逐段检查：标签不得以 '-' 开头/结尾（禁 "@-x.com"、"@x-.com"）
@@ -935,7 +942,14 @@ void CLogic::UpdateEmailRq(int clientfd, char * szbuf, int nlen)
     //【修复-P1：格式口径升级】原代码仅查 '@' 和 '.' 是否存在，
     //  "a@."、"@x.com"、".@." 均可放行入库。现改为与客户端注册/登录
     //  同一口径的完整校验（is_valid_email，实现见文件头部）。
-    string strEmail = rq->m_email;
+    //【2026-11-18 审查修复-H1：定长字段堆越界读】原代码（下一行，已注释保留）：
+    // string strEmail = rq->m_email;
+    // m_email 是 char[60] 定长字段，位于按包长 new 的精确堆块末尾；客户端填满
+    // 60 字节不含 '\0' 时，string 构造内部 strlen 越过堆块边界（heap 越界读）。
+    // 修改方式：改为 strnlen 截取（与文件内其他定长字段口径一致）。
+    // 修改原因：审查报告 H1 —— 远程可触发越界读，此处是全文件唯一漏项。
+    // 修改效果：超长无终止符邮箱按 60 字节截取后正常走格式校验。回滚：还原下行即可。
+    string strEmail( rq->m_email, strnlen( rq->m_email, sizeof(rq->m_email) ) );
     if( !is_valid_email( strEmail ) )
     {
         rs.m_lresult = 0; //失败：邮箱格式错误

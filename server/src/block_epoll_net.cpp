@@ -268,7 +268,16 @@ void* Block_Epoll_Net::recv_task(void* arg)
         {
             printf("[Block_Epoll_Net::recv_task] Invalid pack size=%d, close fd=%d\n", nPackSize, ev->fd);
             fflush(stdout);
-            ::close(ev->fd);
+            //【2026-11-18 审查修复-C6：提前 close 致 double-close】原代码（下一行，已注释保留）：
+            // ::close(ev->fd);
+            // 此处提前 close 后 break 进入下方统一清理路径，清理段会再次 close 同一 fd；
+            // 两次 close 之间若 accept 复用同一 fd 号，eventdel/第二次 close 会误杀新连接
+            // （与既有"先 erase 后 close"修复同类窗口，属该修复的回归路径）。
+            // 修改方式：删除提前 close，统一交由末尾清理路径负责 close
+            //           （erase→eventdel→close→delete 顺序保持不变）。
+            // 修改原因：审查报告 C6 —— 恶意非法包长可偶发误杀无辜新连接，double-close 亦属 UB。
+            // 修改效果：无效包长连接仍会被清理路径正常关闭，新连接不受影响。回滚：取消下行注释。
+            // ::close(ev->fd);
             break;
         }
 
